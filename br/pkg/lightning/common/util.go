@@ -51,6 +51,9 @@ const (
 	retryTimeout = 3 * time.Second
 
 	defaultMaxRetry = 3
+
+	// DefaultMaxIdleConns is the default value for sql.DB's MaxIdleConns.
+	defaultMaxIdleConns = 128
 )
 
 // MySQLConnectParam records the parameters needed to connect to a MySQL database.
@@ -142,6 +145,7 @@ func (param *MySQLConnectParam) Connect() (*sql.DB, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	db.SetMaxIdleConns(defaultMaxIdleConns)
 	return db, nil
 }
 
