@@ -44,10 +44,8 @@ import (
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
-	"github.com/pingcap/tidb/pkg/util/dbutil"
 	"github.com/pingcap/tidb/pkg/util/hack"
 	"github.com/pingcap/tidb/pkg/util/kvcache"
-	"github.com/pingcap/tidb/pkg/util/redact"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -318,9 +316,10 @@ var _ backend.Backend = (*tidbBackend)(nil)
 func NewTiDBBackend(
 	ctx context.Context,
 	db *sql.DB,
-	conflict config.Conflict,
+	cfg *config.Config,
 	errorMgr *errormanager.ErrorManager,
 ) backend.Backend {
+	conflict := cfg.Conflict
 	var onDuplicate string
 	switch conflict.Strategy {
 	case config.ErrorOnDup:
@@ -802,6 +801,8 @@ stmtLoop:
 		)
 		for i := 0; i < writeRowsMaxRetryTimes; i++ {
 			query := stmtTask.stmt
+			// fmt.printf the query
+			fmt.Printf("query: %s\n", query)
 			if be.cachePrepStmts {
 				var prepStmt *sql.Stmt
 				// how to impletement the interface kvcache.Key interface for string query?
