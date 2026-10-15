@@ -167,6 +167,8 @@ type Executor interface {
 	AddResourceGroup(ctx sessionctx.Context, stmt *ast.CreateResourceGroupStmt) error
 	AlterResourceGroup(ctx sessionctx.Context, stmt *ast.AlterResourceGroupStmt) error
 	DropResourceGroup(ctx sessionctx.Context, stmt *ast.DropResourceGroupStmt) error
+	CreatePartitionGroup(ctx sessionctx.Context, stmt *ast.CreatePartitionGroupStmt) error
+	DropPartitionGroup(ctx sessionctx.Context, stmt *ast.DropPartitionGroupStmt) error
 	FlashbackCluster(ctx sessionctx.Context, flashbackTS uint64) error
 	// RefreshMeta can only be called by BR during the log restore phase.
 	RefreshMeta(ctx sessionctx.Context, args *model.RefreshMetaArgs) error
@@ -702,6 +704,9 @@ func (e *executor) AlterTablePlacement(ctx sessionctx.Context, ident ast.Ident, 
 	if tblInfo.TempTableType != model.TempTableNone {
 		return errors.Trace(dbterror.ErrOptOnTemporaryTable.GenWithStackByArgs("placement"))
 	}
+	if err = rejectPartitionGroupMember(tblInfo, "ALTER TABLE ... PLACEMENT POLICY"); err != nil {
+		return err
+	}
 
 	placementPolicyRef, err = checkAndNormalizePlacementPolicy(ctx, placementPolicyRef)
 	if err != nil {
@@ -1090,6 +1095,9 @@ func (e *executor) CreateTable(ctx sessionctx.Context, s *ast.CreateTableStmt) (
 	metaBuildCtx := NewMetaBuildContextWithSctx(ctx)
 	var tbInfo *model.TableInfo
 	if s.ReferTable != nil {
+		if err = rejectPartitionGroupMember(referTbl.Meta(), "CREATE TABLE ... LIKE"); err != nil {
+			return err
+		}
 		tbInfo, err = BuildTableInfoWithLike(ident, referTbl.Meta(), s)
 	} else {
 		tbInfo, err = BuildTableInfoWithStmt(metaBuildCtx, s, schema.Charset, schema.Collate, schema.PlacementPolicyRef)
@@ -1106,6 +1114,10 @@ func (e *executor) CreateTable(ctx sessionctx.Context, s *ast.CreateTableStmt) (
 		return err
 	}
 	if err = checkStorageClassAdmission(tbInfo.EngineAttribute, tbInfo); err != nil {
+		return err
+	}
+
+	if err = checkPartitionGroupMember(e.store, tbInfo); err != nil {
 		return err
 	}
 
@@ -1134,7 +1146,11 @@ func (e *executor) CreateTable(ctx sessionctx.Context, s *ast.CreateTableStmt) (
 		onExist = OnExistIgnore
 	}
 
-	return e.CreateTableWithInfo(ctx, schema.Name, tbInfo, involvingRef, WithOnExist(onExist))
+	if err = e.CreateTableWithInfo(ctx, schema.Name, tbInfo, involvingRef, WithOnExist(onExist)); err != nil {
+		return err
+	}
+	warnPartitionGroupLowSlots(ctx, e.store, tbInfo)
+	return nil
 }
 
 // createTableWithInfoJob returns the table creation job.
@@ -1252,6 +1268,12 @@ func getSharedInvolvingSchemaInfo(info *model.TableInfo) []model.InvolvingSchema
 		ret = append(ret, model.InvolvingSchemaInfo{
 			Policy: ref.Name.L,
 			Mode:   model.SharedInvolving,
+		})
+	}
+	if ref := info.PartitionGroup; ref != nil {
+		ret = append(ret, model.InvolvingSchemaInfo{
+			PartitionGroup: ref.Name.L,
+			Mode:           model.SharedInvolving,
 		})
 	}
 	return ret
@@ -1468,6 +1490,11 @@ func (e *executor) CreatePlacementPolicyWithInfo(ctx sessionctx.Context, policy 
 func preSplitAndScatter(ctx sessionctx.Context, store kv.Storage, tbInfo *model.TableInfo, parts []model.PartitionDefinition, scatterScope string) {
 	failpoint.InjectCall("preSplitAndScatter", scatterScope)
 	if tbInfo.TempTableType != model.TempTableNone {
+		return
+	}
+	// The partitions of a partition group member are merged with the other
+	// members by PD; splitting them first only creates Regions to merge back.
+	if tbInfo.PartitionGroup != nil {
 		return
 	}
 	sp, ok := store.(kv.SplittableStore)
@@ -2410,6 +2437,8 @@ func (e *executor) alterTable(ctx context.Context, sctx sessionctx.Context, stmt
 					ttlOptionsHandled = true
 				case ast.TableOptionAffinity:
 					err = e.AlterTableAffinity(sctx, ident, opt.StrValue)
+				case ast.TableOptionPartitionGroup:
+					err = dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("ALTER TABLE ... PARTITION_GROUP")
 				default:
 					err = dbterror.ErrUnsupportedAlterTableOption
 				}
@@ -2758,6 +2787,9 @@ func (e *executor) AddTablePartitions(ctx sessionctx.Context, ident ast.Ident, s
 	if meta.Affinity != nil {
 		return dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("ADD PARTITION of a table with AFFINITY option")
 	}
+	if err := rejectPartitionGroupMember(meta, "ADD PARTITION"); err != nil {
+		return err
+	}
 
 	if pi.Type == ast.PartitionTypeHash || pi.Type == ast.PartitionTypeKey {
 		// Add partition for hash/key is actually a reorganize partition
@@ -2939,6 +2971,9 @@ func (e *executor) AlterTablePartitioning(ctx sessionctx.Context, ident ast.Iden
 	if t.Meta().Affinity != nil {
 		return dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("ALTER TABLE PARTITIONING of a table with AFFINITY option")
 	}
+	if err := rejectPartitionGroupMember(t.Meta(), "ALTER TABLE PARTITIONING"); err != nil {
+		return err
+	}
 
 	piOld := meta.GetPartitionInfo()
 	var partNames []string
@@ -3013,6 +3048,9 @@ func (e *executor) ReorganizePartitions(ctx sessionctx.Context, ident ast.Ident,
 
 	if t.Meta().Affinity != nil {
 		return dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("REORGANIZE PARTITION of a table with AFFINITY option")
+	}
+	if err := rejectPartitionGroupMember(t.Meta(), "REORGANIZE PARTITION"); err != nil {
+		return err
 	}
 
 	switch pi.Type {
@@ -3093,6 +3131,9 @@ func (e *executor) RemovePartitioning(ctx sessionctx.Context, ident ast.Ident, s
 
 	if t.Meta().Affinity != nil {
 		return dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("REMOVE PARTITIONING of a table with AFFINITY option")
+	}
+	if err := rejectPartitionGroupMember(t.Meta(), "REMOVE PARTITIONING"); err != nil {
+		return err
 	}
 
 	// TODO: Optimize for remove partitioning with a single partition
@@ -3245,6 +3286,9 @@ func (e *executor) CoalescePartitions(sctx sessionctx.Context, ident ast.Ident, 
 
 	if t.Meta().Affinity != nil {
 		return dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("COALESCE PARTITION of a table with AFFINITY option")
+	}
+	if err := rejectPartitionGroupMember(t.Meta(), "COALESCE PARTITION"); err != nil {
+		return err
 	}
 
 	switch pi.Type {
@@ -3623,6 +3667,9 @@ func checkExchangePartition(pt *model.TableInfo, nt *model.TableInfo) error {
 
 	if nt.Affinity != nil || pt.Affinity != nil {
 		return dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("EXCHANGE PARTITION of a table with AFFINITY option")
+	}
+	if nt.PartitionGroup != nil || pt.PartitionGroup != nil {
+		return dbterror.ErrGeneralUnsupportedDDL.GenWithStackByArgs("EXCHANGE PARTITION of a partition group member table")
 	}
 
 	if len(nt.ForeignKeys) > 0 {
@@ -4470,6 +4517,9 @@ func (e *executor) AlterTableAffinity(ctx sessionctx.Context, ident ast.Ident, a
 	}
 
 	tblInfo := tb.Meta()
+	if err = rejectPartitionGroupMember(tblInfo, "ALTER TABLE ... AFFINITY"); err != nil {
+		return err
+	}
 	if err = validateTableAffinity(tblInfo, affinity); err != nil {
 		return err
 	}
@@ -7156,6 +7206,9 @@ func (e *executor) AlterTablePartitionPlacement(ctx sessionctx.Context, tableIde
 	tblInfo := tb.Meta()
 	if tblInfo.Partition == nil {
 		return errors.Trace(dbterror.ErrPartitionMgmtOnNonpartitioned)
+	}
+	if err = rejectPartitionGroupMember(tblInfo, "ALTER TABLE ... PARTITION ... PLACEMENT POLICY"); err != nil {
+		return err
 	}
 
 	partitionID, err := tables.FindPartitionByName(tblInfo, spec.PartitionNames[0].L)

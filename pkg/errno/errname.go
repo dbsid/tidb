@@ -1213,6 +1213,7 @@ var MySQLErrName = map[uint16]*mysql.ErrMessage{
 	ErrWarnGlobalIndexNeedManuallyAnalyze: mysql.Message("Auto analyze is not effective for index '%-.192s', need analyze manually", nil),
 	ErrTimeStampInDSTTransition:           mysql.Message("Timestamp is not valid, since it is in Daylight Saving Time transition '%s' for time zone '%s'", nil),
 	ErrInvalidAffinityOption:              mysql.Message("Invalid AFFINITY %s", nil),
+	ErrPartitionGroup:                     mysql.Message("Partition group error: %s", nil),
 	ErrUserPrefixMismatch:                 mysql.Message("User name prefix does not match the assigned keyspace.", nil),
 	ErrMVAdvisoryLockConflict:             mysql.Message("materialized view advisory lock conflict: %s", nil),
 	ErrMVRefreshLogBaselineChanged:        mysql.Message("refresh materialized view %s.%s fast: input log baseline has changed; run COMPLETE refresh to rebuild it", nil),
