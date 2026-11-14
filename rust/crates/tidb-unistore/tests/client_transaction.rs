@@ -125,6 +125,29 @@ impl Store {
     }
 }
 
+/// Every commit builds its future on the caller's stack and moves it to the
+/// heap. Tracing wrappers that held the commit future several times over
+/// made it 627 KB (1.25 MB under a statement's trace context).
+#[test]
+fn a_commit_future_stays_within_its_size_budget() {
+    let store = Store::new();
+    let mut transaction = store
+        .tikv_store
+        .block_on(
+            store
+                .tikv_store
+                .store()
+                .begin_with_options(tikv_client::TransactionOptions::new_optimistic()),
+        )
+        .unwrap();
+    let commit_size = std::mem::size_of_val(&transaction.commit());
+    assert!(
+        commit_size <= 4 * 1024,
+        "the commit future is {commit_size} bytes"
+    );
+    store.tikv_store.block_on(transaction.rollback()).unwrap();
+}
+
 #[test]
 fn shared_engine_commits_and_rolls_back_staged_statements() {
     let store = Store::new();
