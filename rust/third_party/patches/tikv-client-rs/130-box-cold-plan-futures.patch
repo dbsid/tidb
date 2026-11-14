@@ -1,0 +1,109 @@
+diff --git a/src/request/plan.rs b/src/request/plan.rs
+index 9bab4041..4c9b3652 100644
+--- a/src/request/plan.rs
++++ b/src/request/plan.rs
+@@ -1628,7 +1628,9 @@ where
+                 backoff,
+                 region_miss,
+             } => {
+-                crate::trace::with_bo_span_slot(
++                // Boxed: the re-split is the cold path, and inline it would
++                // triple the size of every request's future.
++                Box::pin(crate::trace::with_bo_span_slot(
+                     slot,
+                     Self::resplit(
+                         pd_client,
+@@ -1640,7 +1642,7 @@ where
+                         one_region,
+                         batch_region,
+                     ),
+-                )
++                ))
+                 .await
+             }
+         };
+@@ -1783,7 +1785,7 @@ where
+                 };
+             }
+             Err(err) => {
+-                return Self::handle_other_error(
++                return Box::pin(Self::handle_other_error(
+                     pd_client,
+                     plan,
+                     region_ver_id,
+@@ -1794,7 +1796,7 @@ where
+                     preserve_region_results,
+                     one_region,
+                     err,
+-                )
++                ))
+                 .await;
+             }
+         };
+@@ -1870,7 +1872,7 @@ where
+                 .await;
+             }
+             Err(e) if is_grpc_error(&e) => {
+-                return Self::handle_other_error(
++                return Box::pin(Self::handle_other_error(
+                     pd_client,
+                     plan,
+                     region_store.region_with_leader.ver_id(),
+@@ -1883,7 +1885,7 @@ where
+                     preserve_region_results,
+                     one_region,
+                     e,
+-                )
++                ))
+                 .await;
+             }
+             Err(e) => {
+@@ -2068,7 +2070,12 @@ where
+                 // deadline exhaustion after its typed region-error branches.
+                 Ok(RegionErrorRetry::Immediate)
+             } else {
+-                handle_region_error(pd_client.clone(), e.clone(), region_store.clone()).await
++                Box::pin(handle_region_error(
++                    pd_client.clone(),
++                    e.clone(),
++                    region_store.clone(),
++                ))
++                .await
+             };
+             let mut region_error_action = match region_error_action {
+                 Ok(action) => action,
+@@ -3430,8 +3437,10 @@ where
+             let charges_detail = resolve_lock_detail_charged();
+             let started = (self.snapshot_runtime_stats.is_some() || charges_detail).then(Instant::now);
+             let lock_result = match &self.read_lock_context {
++                // Boxed: lock resolution is the cold path, and inline its
++                // future is most of every request's plan future.
+                 Some(read_lock_context) => {
+-                    resolve_locks_for_read_with_context_result(
++                    Box::pin(resolve_locks_for_read_with_context_result(
+                         resolver_locks,
+                         self.timestamp.clone(),
+                         pd_client.clone(),
+@@ -3439,11 +3448,11 @@ where
+                         self.keyspace_name.as_deref(),
+                         self.resolve_locks_context.clone(),
+                         read_lock_context,
+-                    )
++                    ))
+                     .await
+                 }
+                 None => {
+-                    resolve_locks_with_context_result(
++                    Box::pin(resolve_locks_with_context_result(
+                         resolver_locks,
+                         if clone.pessimistic_lock_wait.is_some() {
+                             Timestamp::from_version(0)
+@@ -3454,7 +3463,7 @@ where
+                         self.keyspace,
+                         self.keyspace_name.as_deref(),
+                         self.resolve_locks_context.clone(),
+-                    )
++                    ))
+                     .await
+                 }
+             };
