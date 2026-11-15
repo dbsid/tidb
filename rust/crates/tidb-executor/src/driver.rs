@@ -469,7 +469,7 @@ pub fn run_select_meta_stmt(
 /// cached plans both enter `executorBuilder.build`; this is that common seam.
 pub fn run_select_meta_stmt_with_physical(
     select: &tidb_ast::SelectStmt,
-    physical: Option<&mut tidb_planner_core_operator_physicalop::PhysicalPlan>,
+    physical: Option<&mut std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>>,
     catalog: &SessionExtendedInfoSchema,
     current_db: &str,
     ctx: &crate::StmtContext,
@@ -487,7 +487,7 @@ pub fn run_select_meta_stmt_with_physical(
 /// optionally consuming a cache-rebuilt tree selected by the planner.
 pub fn run_query_meta_stmt_with_physical(
     query: &QueryStmt,
-    physical: Option<&mut tidb_planner_core_operator_physicalop::PhysicalPlan>,
+    physical: Option<&mut std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>>,
     catalog: &SessionExtendedInfoSchema,
     current_db: &str,
     ctx: &crate::StmtContext,
@@ -499,7 +499,7 @@ pub fn run_query_meta_stmt_with_physical(
 /// statement owner retains its snapshot until this record set finishes.
 pub fn open_query_meta_stmt_with_physical(
     query: &QueryStmt,
-    physical: Option<&mut tidb_planner_core_operator_physicalop::PhysicalPlan>,
+    physical: Option<&mut std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>>,
     catalog: &SessionExtendedInfoSchema,
     current_db: &str,
     ctx: &crate::StmtContext,
@@ -510,7 +510,7 @@ pub fn open_query_meta_stmt_with_physical(
         None => {
             set_opr::validate_query_usage(query, ctx)?;
             let optimize = start_optimize_region();
-            let mut physical = optimize_query_stmt(query, catalog, current_db, ctx)?;
+            let mut physical = std::sync::Arc::new(optimize_query_stmt(query, catalog, current_db, ctx)?);
             optimize.end();
             physical_builder::open_query(query, &mut physical, catalog, ctx)
         }
@@ -522,7 +522,7 @@ pub fn open_query_meta_stmt_with_physical(
 /// and visitor walk on every cache hit.
 pub fn open_query_meta_stmt_with_physical_without_sequence_validation(
     query: &QueryStmt,
-    physical: Option<&mut tidb_planner_core_operator_physicalop::PhysicalPlan>,
+    physical: Option<&mut std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>>,
     catalog: &SessionExtendedInfoSchema,
     current_db: &str,
     ctx: &crate::StmtContext,
