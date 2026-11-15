@@ -186,8 +186,13 @@ impl<PdC: PdClient> TikvTransactionDriver<PdC> {
         F: std::future::Future<Output = tikv_client::Result<T>> + 'a,
     {
         let span = tidb_tracing::current_span();
+        // Boxed: a call's future is kilobytes (6 KB for a point Get), and on
+        // its way to the poll the blocking runtime moves it twice.
         self.transaction.block_on(move |transaction| {
-            tidb_txnkv::rpc::trace::with_span_ctx(span, operation(transaction))
+            Box::pin(tidb_txnkv::rpc::trace::with_span_ctx(
+                span,
+                operation(transaction),
+            ))
         })
     }
 
