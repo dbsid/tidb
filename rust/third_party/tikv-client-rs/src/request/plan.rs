@@ -3281,28 +3281,58 @@ where
     type Result = P::Result;
 
     async fn execute(&self) -> Result<Self::Result> {
-        let mut clone = self.clone();
-        let mut resolving_locks_guard: Option<ResolvingLocksGuard> = None;
-        let mut first_lock_txn_id = None;
-        let mut clean_lock_retry_result = None;
-        let (mut result, mut request_lock_hints) = match clone.execute_inner().await {
+        let (mut result, request_lock_hints) = match self.execute_inner().await {
             Ok(result) => result,
             Err(error) => {
-                if clone.record_async_batch_get_metric {
+                if self.record_async_batch_get_metric {
                     crate::stats::increment_async_batch_get("other_error");
                 }
                 return Err(error);
             }
         };
-        if clone.record_async_batch_get_metric {
+        if self.record_async_batch_get_metric {
             record_async_batch_get_result(&result);
         }
+        let locks = self.take_result_locks(&mut result);
+        if locks.is_empty() {
+            return Ok(result);
+        }
+        // client-go sends the request it was given and copies nothing unless
+        // the response reports a lock. Boxed: lock resolution is the cold
+        // path, and inline its future is most of every request's plan future.
+        Box::pin(self.resolve_locks_and_resend(self.clone(), result, locks, request_lock_hints))
+            .await
+    }
+}
+
+impl<P: Plan + Shardable, PdC: PdClient> ResolveLock<P, PdC>
+where
+    P::Result: HasLocks + 'static,
+{
+    /// The locks `result` reports, which this plan resolves before it sends
+    /// the request again.
+    fn take_result_locks(&self, result: &mut P::Result) -> Vec<kvrpcpb::LockInfo> {
+        if self.response_locks_only {
+            result.take_response_locks()
+        } else {
+            result.take_locks()
+        }
+    }
+
+    /// The caller loop of client-go's `SendReqCtx` once a response reported
+    /// `locks`: resolve them and send again on the same Backoffer until a
+    /// response reports none. `clone` is the retry owner, a copy of this plan.
+    async fn resolve_locks_and_resend(
+        &self,
+        mut clone: Self,
+        mut result: P::Result,
+        mut locks: Vec<kvrpcpb::LockInfo>,
+        mut request_lock_hints: Option<ReadLockHintsInRequest>,
+    ) -> Result<P::Result> {
+        let mut resolving_locks_guard: Option<ResolvingLocksGuard> = None;
+        let mut first_lock_txn_id = None;
+        let mut clean_lock_retry_result = None;
         loop {
-            let mut locks = if clone.response_locks_only {
-                result.take_response_locks()
-            } else {
-                result.take_locks()
-            };
             if locks.is_empty() {
                 if let Some(clean) = clean_lock_retry_result {
                     result.merge_clean_lock_retry_result(clean);
@@ -3350,6 +3380,7 @@ where
                     }
                     if locks.is_empty() {
                         (result, request_lock_hints) = clone.execute_inner_retry().await?;
+                        locks = clone.take_result_locks(&mut result);
                         continue;
                     }
                 } else {
@@ -3391,6 +3422,7 @@ where
                         .wait_for_lock_retry(None, crate::error::ERR_LOCK_WAIT_TIMEOUT.into())
                         .await?;
                     (result, request_lock_hints) = clone.execute_inner_retry().await?;
+                    locks = clone.take_result_locks(&mut result);
                     continue;
                 }
             }
@@ -3484,6 +3516,7 @@ where
                     .await?;
             }
             (result, request_lock_hints) = clone.execute_inner_retry().await?;
+            locks = clone.take_result_locks(&mut result);
         }
     }
 }
@@ -6547,6 +6580,74 @@ mod test {
             snapshot_async_batch_get: false,
         };
         assert!(plan.execute().await.is_err())
+    }
+
+    /// A lock-free plan that counts how often it is copied.
+    struct CloneCountingPlan(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Clone for CloneCountingPlan {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    #[async_trait]
+    impl Plan for CloneCountingPlan {
+        type Result = BatchGetResponse;
+
+        async fn execute(&self) -> Result<Self::Result> {
+            Ok(BatchGetResponse::default())
+        }
+    }
+
+    impl Shardable for CloneCountingPlan {
+        type Shard = ();
+
+        fn shards(
+            &self,
+            _: &Arc<impl crate::pd::PdClient>,
+        ) -> BoxStream<'static, crate::Result<(Self::Shard, RegionWithLeader)>> {
+            Box::pin(stream::empty()).boxed()
+        }
+
+        fn apply_shard(&mut self, _: Self::Shard) {}
+
+        fn apply_store(&mut self, _: &crate::store::RegionStore) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// client-go resends a request only after its response reports a lock:
+    /// a lock-free response costs no copy of the lock-retry state.
+    #[tokio::test]
+    async fn resolve_lock_copies_no_retry_state_for_a_lock_free_response() {
+        let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plan = ResolveLock {
+            inner: CloneCountingPlan(Arc::clone(&clones)),
+            timestamp: Timestamp::default(),
+            backoff: Backoff::no_backoff(),
+            pd_client: Arc::new(MockPdClient::default()),
+            keyspace: Keyspace::Disable,
+            keyspace_name: None,
+            rpc_interceptor: None,
+            resource_group_name: None,
+            resource_control: None,
+            ru_details: None,
+            resolve_locks_context: ResolveLocksContext::default(),
+            read_lock_context: None,
+            snapshot_runtime_stats: None,
+            snapshot_lock_backoff: None,
+            response_locks_only: false,
+            prewrite_lock_conflict: None,
+            max_timestamp_point_get: false,
+            record_async_batch_get_metric: false,
+            pessimistic_lock_wait: None,
+        };
+        plan.execute().await.unwrap();
+        // The one copy is `execute_inner`'s, which carries the request's
+        // read-lock context.
+        assert_eq!(clones.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
