@@ -170,6 +170,16 @@ pub struct StatementVarSnapshot {
     mpp_version: tidb_txnkv::MppVersion,
     mpp_exchange_compression_mode: tidb_vardef::modes::ExchangeCompressionMode,
     tiflash_fine_grained_shuffle: tidb_sessionctx::TiFlashFineGrainedShuffleSession,
+    tiflash_compute_dispatch_policy: String,
+    allow_tiflash_fallback: bool,
+    enable_vectorized_expression: bool,
+    tiflash_fast_scan: bool,
+    hash_exchange_with_new_collation: bool,
+    enable_mutation_checker: bool,
+    dist_sql_scan_concurrency: u64,
+    store_batch_size: u64,
+    tiflash_replica_read: tidb_tiflash::ReplicaRead,
+    foreign_key_checks: bool,
 }
 
 
@@ -1376,6 +1386,59 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
             mpp_version: self.choose_mpp_version(),
             mpp_exchange_compression_mode: self.mpp_exchange_compression_mode(),
             tiflash_fine_grained_shuffle: self.tiflash_fine_grained_shuffle_session(),
+            tiflash_compute_dispatch_policy: self
+                .session_vars()
+                .get_system("tiflash_compute_dispatch_policy")
+                .unwrap_or_else(|_| "consistent_hash".into()),
+            allow_tiflash_fallback: self
+                .session_vars()
+                .get_system("tidb_allow_fallback_to_tikv")
+                .is_ok_and(|value| {
+                    value
+                        .split(',')
+                        .any(|engine| engine.trim().eq_ignore_ascii_case("tiflash"))
+                }),
+            enable_vectorized_expression: self
+                .session_vars()
+                .get_system(tidb_vardef::tidb_vars::TIDB_ENABLE_VECTORIZED_EXPRESSION)
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
+            tiflash_fast_scan: self
+                .session_vars()
+                .get_system(tidb_vardef::tidb_vars::TIFLASH_FAST_SCAN)
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
+            hash_exchange_with_new_collation: self
+                .session_vars()
+                .system_value(tidb_vardef::tidb_vars::TIDB_HASH_EXCHANGE_WITH_NEW_COLLATION)
+                .map_or(
+                    tidb_vardef::defaults::DEF_TIDB_HASH_EXCHANGE_WITH_NEW_COLLATION,
+                    |value| tidb_vardef::option_values::tidb_opt_on(&value),
+                ),
+            enable_mutation_checker: self
+                .session_vars()
+                .system_value(tidb_vardef::tidb_vars::TIDB_ENABLE_MUTATION_CHECKER)
+                .map_or(
+                    tidb_vardef::defaults::DEF_TIDB_ENABLE_MUTATION_CHECKER,
+                    |value| tidb_vardef::option_values::tidb_opt_on(&value),
+                ),
+            dist_sql_scan_concurrency: self
+                .session_vars()
+                .get_system(tidb_vardef::tidb_vars::TIDB_DIST_SQL_SCAN_CONCURRENCY)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(tidb_vardef::defaults::DEF_DIST_SQL_SCAN_CONCURRENCY as u64),
+            store_batch_size: self
+                .session_vars()
+                .get_system(tidb_vardef::tidb_vars::TIDB_STORE_BATCH_SIZE)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(tidb_vardef::defaults::DEF_TIDB_STORE_BATCH_SIZE as u64),
+            tiflash_replica_read: tidb_tiflash::get_tiflash_replica_read_by_str(
+                &self
+                    .session_vars()
+                    .get_system(tidb_vardef::tidb_vars::TIFLASH_REPLICA_READ)
+                    .unwrap_or_default(),
+            ),
+            foreign_key_checks: self.foreign_key_checks(),
         });
         *self.statement_var_cache_ref().borrow_mut() = Some(Arc::clone(&snapshot));
         snapshot
@@ -1640,18 +1703,8 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
         let session_state = crate::StmtContextSessionState {
             mpp_query_info: Arc::clone(&self.mpp_query_info_ref()),
             mpp_server_id: (self.server_id_getter_ref())(),
-            tiflash_compute_dispatch_policy: self
-                .session_vars()
-                .get_system("tiflash_compute_dispatch_policy")
-                .unwrap_or_else(|_| "consistent_hash".into()),
-            allow_tiflash_fallback: self
-                .session_vars()
-                .get_system("tidb_allow_fallback_to_tikv")
-                .is_ok_and(|value| {
-                    value
-                        .split(',')
-                        .any(|engine| engine.trim().eq_ignore_ascii_case("tiflash"))
-                }),
+            tiflash_compute_dispatch_policy: snapshot.tiflash_compute_dispatch_policy.clone(),
+            allow_tiflash_fallback: snapshot.allow_tiflash_fallback,
             advisory_locks: self.advisory_locks_ref().clone(),
             before_executor_first_run: Arc::clone(&self.executor_first_run_breakpoint_ref()),
             runaway: Arc::clone(self.statement_runaway_ref()),
@@ -1731,11 +1784,7 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                     .with_index_lookup_push_down_session(index_lookup_push_down_session)
                     .with_optimizer_fix_control(self.session_vars().optimizer_fix_control().clone())
                     .with_optimizer_cost_env(optimizer_cost_env.clone())
-                    .with_enable_vectorized_expression(
-                        self.session_vars()
-                            .get_system(tidb_vardef::tidb_vars::TIDB_ENABLE_VECTORIZED_EXPRESSION)
-                            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
-                    )
+                    .with_enable_vectorized_expression(snapshot.enable_vectorized_expression)
                     .with_hashagg_concurrency(
                         hashagg_partial_concurrency,
                         hashagg_final_concurrency,
@@ -1866,50 +1915,22 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                     .with_pessimistic_txn_provider(self.pessimistic_txn_provider())
                     .with_mpp_exchange_compression_mode(snapshot.mpp_exchange_compression_mode)
                     .with_mpp_version(snapshot.mpp_version)
-                    .with_tiflash_fast_scan(
-                        self.session_vars()
-                            .get_system(tidb_vardef::tidb_vars::TIFLASH_FAST_SCAN)
-                            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
-                    )
+                    .with_tiflash_fast_scan(snapshot.tiflash_fast_scan)
                     .with_tiflash_fine_grained_shuffle(
                         snapshot.tiflash_fine_grained_shuffle,
                         self.tiflash_cluster_info(),
                     )
                     .with_weak_consistency(self.stmt_weak_consistency())
-                    .with_hash_exchange_with_new_collation(
-                        self.session_vars()
-                            .system_value(tidb_vardef::tidb_vars::TIDB_HASH_EXCHANGE_WITH_NEW_COLLATION)
-                            .map_or(
-                                tidb_vardef::defaults::DEF_TIDB_HASH_EXCHANGE_WITH_NEW_COLLATION,
-                                |value| tidb_vardef::option_values::tidb_opt_on(&value),
-                            ),
-                    )
+                    .with_hash_exchange_with_new_collation(snapshot.hash_exchange_with_new_collation)
                     .with_row_encoding_config(self.row_encoding_config())
                     .with_sysdate_is_now(sysdate_is_now)
                     .with_replica_read(replica_read)
                     .with_read_consistency(read_replica_scope, is_staleness)
                     .with_coprocessor_read_policy(snapshot.coprocessor_read_policy.clone())
                     .with_enabled_rate_limit_action(snapshot.rate_limit_action)
-                    .with_dist_sql_scan_concurrency(
-                        self.session_vars()
-                            .get_system(tidb_vardef::tidb_vars::TIDB_DIST_SQL_SCAN_CONCURRENCY)
-                            .ok()
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .unwrap_or(tidb_vardef::defaults::DEF_DIST_SQL_SCAN_CONCURRENCY as u64),
-                    )
-                    .with_store_batch_size(
-                        self.session_vars()
-                            .get_system(tidb_vardef::tidb_vars::TIDB_STORE_BATCH_SIZE)
-                            .ok()
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .unwrap_or(tidb_vardef::defaults::DEF_TIDB_STORE_BATCH_SIZE as u64),
-                    )
-                    .with_tiflash_replica_read(tidb_tiflash::get_tiflash_replica_read_by_str(
-                        &self
-                            .session_vars()
-                            .get_system(tidb_vardef::tidb_vars::TIFLASH_REPLICA_READ)
-                            .unwrap_or_default(),
-                    ))
+                    .with_dist_sql_scan_concurrency(snapshot.dist_sql_scan_concurrency)
+                    .with_store_batch_size(snapshot.store_batch_size)
+                    .with_tiflash_replica_read(snapshot.tiflash_replica_read)
                     .with_lazy_clock(snapshot.timestamp, zone);
                 if let Some(latest_index_schema) = latest_index_schema {
                     let _ = ctx.with_latest_info_schema(crate::LatestInfoSchema::new(latest_index_schema));
@@ -1940,26 +1961,9 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                 .with_pushdown_blacklists(self.pushdown_blacklists().snapshot())
                 .with_allow_derive_topn(snapshot.allow_derive_topn)
                 .with_enabled_rate_limit_action(snapshot.rate_limit_action)
-                .with_dist_sql_scan_concurrency(
-                    self.session_vars()
-                        .get_system(tidb_vardef::tidb_vars::TIDB_DIST_SQL_SCAN_CONCURRENCY)
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(tidb_vardef::defaults::DEF_DIST_SQL_SCAN_CONCURRENCY as u64),
-                )
-                .with_store_batch_size(
-                    self.session_vars()
-                        .get_system(tidb_vardef::tidb_vars::TIDB_STORE_BATCH_SIZE)
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(tidb_vardef::defaults::DEF_TIDB_STORE_BATCH_SIZE as u64),
-                )
-                .with_tiflash_replica_read(tidb_tiflash::get_tiflash_replica_read_by_str(
-                    &self
-                        .session_vars()
-                        .get_system(tidb_vardef::tidb_vars::TIFLASH_REPLICA_READ)
-                        .unwrap_or_default(),
-                ))
+                .with_dist_sql_scan_concurrency(snapshot.dist_sql_scan_concurrency)
+                .with_store_batch_size(snapshot.store_batch_size)
+                .with_tiflash_replica_read(snapshot.tiflash_replica_read)
                 .with_process_plan_info_sink(Arc::clone(&self.process_plan_info_ref()))
                 .with_statement_phase_observer(self.statement_phase_observer())
                 .with_phase_durations(self.phase_durations_ref().clone())
@@ -2079,7 +2083,7 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                     self.session_vars().query_cop_store_limit() as isize,
                 ))
                 .with_auto_increment_step(increment, offset)
-                .with_foreign_key_checks(self.foreign_key_checks())
+                .with_foreign_key_checks(snapshot.foreign_key_checks)
                 .with_enable_check_constraint(self.enable_check_constraint())
                 .with_placement_mode_ignore(snapshot.placement_mode_ignore)
                     .with_lock_unchanged_keys(snapshot.lock_unchanged_keys)
@@ -2087,33 +2091,16 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                     .with_pessimistic_txn_provider(self.pessimistic_txn_provider())
                     .with_mpp_exchange_compression_mode(snapshot.mpp_exchange_compression_mode)
                     .with_mpp_version(snapshot.mpp_version)
-                    .with_tiflash_fast_scan(
-                        self.session_vars()
-                            .get_system(tidb_vardef::tidb_vars::TIFLASH_FAST_SCAN)
-                            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
-                    )
+                    .with_tiflash_fast_scan(snapshot.tiflash_fast_scan)
                     .with_tiflash_fine_grained_shuffle(
                         snapshot.tiflash_fine_grained_shuffle,
                         self.tiflash_cluster_info(),
                     )
                     .with_weak_consistency(self.stmt_weak_consistency())
-                    .with_hash_exchange_with_new_collation(
-                        self.session_vars()
-                            .system_value(tidb_vardef::tidb_vars::TIDB_HASH_EXCHANGE_WITH_NEW_COLLATION)
-                            .map_or(
-                                tidb_vardef::defaults::DEF_TIDB_HASH_EXCHANGE_WITH_NEW_COLLATION,
-                                |value| tidb_vardef::option_values::tidb_opt_on(&value),
-                            ),
-                    )
+                    .with_hash_exchange_with_new_collation(snapshot.hash_exchange_with_new_collation)
                     .with_row_encoding_config(self.row_encoding_config())
                 .with_constraint_check_in_place(constraint_check_in_place)
-                .with_enable_mutation_checker(
-                    self.session_vars()
-                        .system_value(tidb_vardef::tidb_vars::TIDB_ENABLE_MUTATION_CHECKER)
-                        .map_or(tidb_vardef::defaults::DEF_TIDB_ENABLE_MUTATION_CHECKER, |value| {
-                            tidb_vardef::option_values::tidb_opt_on(&value)
-                        }),
-                )
+                .with_enable_mutation_checker(snapshot.enable_mutation_checker)
                 .with_pessimistic_check_in_prewrite(
                     !self.pessimistic_constraint_check_in_place()
                         && self.in_transaction()
@@ -2152,11 +2139,7 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                 .with_index_lookup_push_down_session(index_lookup_push_down_session)
                 .with_optimizer_fix_control(self.session_vars().optimizer_fix_control().clone())
                 .with_optimizer_cost_env(optimizer_cost_env)
-                .with_enable_vectorized_expression(
-                    self.session_vars()
-                        .get_system(tidb_vardef::tidb_vars::TIDB_ENABLE_VECTORIZED_EXPRESSION)
-                        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
-                )
+                .with_enable_vectorized_expression(snapshot.enable_vectorized_expression)
                 .with_hashagg_concurrency(hashagg_partial_concurrency, hashagg_final_concurrency)
                 .with_join_reorder_through_proj(join_reorder_through_proj)
                 .with_join_reorder_through_sel(join_reorder_through_sel)

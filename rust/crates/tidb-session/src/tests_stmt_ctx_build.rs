@@ -575,3 +575,41 @@ fn ddl_job_metadata_uses_the_session_snapshot() {
         assert_eq!(context.ddl_sql_mode(), original_mode);
     }
 }
+
+#[test]
+fn snapshotted_read_settings_refresh_after_set() {
+    let mut session = crate::Session::new();
+    for is_dml in [false, true] {
+        let context = session.statement_context(is_dml);
+        assert_eq!(context.dist_sql_scan_concurrency(), 15);
+        assert_eq!(context.store_batch_size(), 4);
+        assert!(context.enable_vectorized_expression());
+    }
+    let read = session.statement_context(false);
+    assert!(!read.tiflash_fast_scan());
+    assert!(read.hash_exchange_with_new_collation());
+    assert!(session.statement_context(true).foreign_key_checks());
+
+    // Each SET moves the session's variable table, so the next statement
+    // context derives the settings again.
+    for set in [
+        "SET tidb_distsql_scan_concurrency = 7",
+        "SET tidb_store_batch_size = 9",
+        "SET tidb_enable_vectorized_expression = OFF",
+        "SET tiflash_fastscan = ON",
+        "SET tidb_hash_exchange_with_new_collation = OFF",
+        "SET foreign_key_checks = OFF",
+    ] {
+        session.run(set).unwrap();
+    }
+    for is_dml in [false, true] {
+        let context = session.statement_context(is_dml);
+        assert_eq!(context.dist_sql_scan_concurrency(), 7);
+        assert_eq!(context.store_batch_size(), 9);
+        assert!(!context.enable_vectorized_expression());
+    }
+    let read = session.statement_context(false);
+    assert!(read.tiflash_fast_scan());
+    assert!(!read.hash_exchange_with_new_collation());
+    assert!(!session.statement_context(true).foreign_key_checks());
+}
