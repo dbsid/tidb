@@ -122,6 +122,45 @@ fn observation_batch_binding_sql_is_normalized_once_per_summary_record() {
     assert_eq!(recorded, vec![expected]);
 }
 
+/// Go generates the hints that reproduce a plan inside `getEncodedPlan`,
+/// which only a new statement-summary record calls, not on every execution.
+#[test]
+fn observation_batch_plan_hints_are_generated_once_per_summary_record() {
+    let mut session = Session::new();
+    session.set_user("root@%".into(), "root@localhost".into());
+    session
+        .run("CREATE TABLE hints_lazy (id INT PRIMARY KEY, v INT, KEY kv (v))")
+        .unwrap();
+    session
+        .run("INSERT INTO hints_lazy VALUES (1, 10), (2, 20)")
+        .unwrap();
+    let sql = "SELECT id FROM hints_lazy WHERE v BETWEEN ? AND ?";
+    let prepared = tests_support::prepare_binary(&mut session, sql);
+    tidb_planner::plan_hint::GEN_HINTS_FROM_PHYSICAL_PLAN_CALLS.with(|count| count.set(0));
+    for _ in 0..3 {
+        tests_support::execute_binary(&mut session, &prepared, &[10, 20]);
+    }
+    assert_eq!(
+        tidb_planner::plan_hint::GEN_HINTS_FROM_PHYSICAL_PLAN_CALLS.with(|count| count.get()),
+        1,
+        "only the execution that created the summary record generates the plan's hints"
+    );
+    // The record still carries the plan's hints.
+    let (_, digest) = normalize_statement_digest(sql);
+    let recorded: Vec<_> = tidb_stmtsummary::statement_summary::STMT_SUMMARY_BY_DIGEST_MAP
+        .summary_map_values()
+        .iter()
+        .filter_map(|record| {
+            let record = record.lock().unwrap();
+            (record.digest == digest.as_str()).then(|| record.cumulative.plan_hint.clone())
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec!["use_index(@`sel_1` `test`.`hints_lazy` `kv`), no_order_index(@`sel_1` `test`.`hints_lazy` `kv`)".to_owned()]
+    );
+}
+
 #[test]
 fn observation_batch_streaming_result_publishes_once_at_close() {
     let mut session = Session::new();
