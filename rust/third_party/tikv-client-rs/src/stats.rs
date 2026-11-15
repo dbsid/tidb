@@ -102,8 +102,16 @@ impl ClientHistogram {
 
 struct ClientObserverVec(&'static str);
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread resolved a [`ClientObserverVec`] series.
+    static OBSERVER_SERIES_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl ClientObserverVec {
     fn with_label_values(&self, values: &[&str]) -> crate::metrics::ClientGoObserver {
+        #[cfg(test)]
+        OBSERVER_SERIES_RESOLUTIONS.with(|count| count.set(count.get() + 1));
         let metrics = crate::metrics::global_metrics();
         if let Some(metric) = metrics.histogram_vec(self.0) {
             return crate::metrics::ClientGoObserver::Histogram(metric.with_label_values(values));
@@ -823,52 +831,116 @@ pub(crate) fn grpc_connection_state(connection_id: &str, store_ip: &str, state: 
 /// summary, and client-minus-server network latency observation. The source
 /// summary has no configured quantiles; the shared registry preserves its
 /// summary count/sum exposition without adding histogram buckets.
+/// client-go `sendReqHistCacheKey`: the labels a store RPC's duration
+/// series is resolved by.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SendRequestKey {
+    command: &'static str,
+    store_id: u64,
+    stale_read: bool,
+    internal: bool,
+}
+
+/// The store RPC series this thread has resolved, as client-go keeps them in
+/// `sendReqHistCache`, `sendReqCounterCache` and `rpcNetLatencyCache`
+/// instead of resolving labels on every request. They are dropped when the
+/// process-wide metrics are replaced.
+#[derive(Default)]
+struct StoreRpcSeries {
+    generation: u64,
+    duration: std::collections::HashMap<SendRequestKey, crate::metrics::ClientGoObserver>,
+    by_source: std::collections::HashMap<
+        SendRequestKey,
+        std::collections::HashMap<String, crate::metrics::ClientGoObserver>,
+    >,
+    net_latency: std::collections::HashMap<(u64, bool), crate::metrics::ClientGoObserver>,
+}
+
+thread_local! {
+    static STORE_RPC_SERIES: std::cell::RefCell<StoreRpcSeries> =
+        std::cell::RefCell::default();
+}
+
 pub(crate) fn observe_tikv_store_rpc(
     request: &dyn crate::store::Request,
     response: Option<&dyn std::any::Any>,
     latency: Duration,
 ) {
     let context = request.tikv_context();
-    let store = context
-        .and_then(|context| context.peer.as_ref())
-        .map_or(0, |peer| peer.store_id)
-        .to_string();
-    let stale = context
-        .is_some_and(|context| context.stale_read)
-        .to_string();
     let source = context.map_or("", |context| context.request_source.as_str());
-    let internal = source.starts_with("internal");
-    let scope = internal.to_string();
-    let command = crate::store::CommandType::from_request_label(request.label())
-        .map_or("Unknown", crate::store::CommandType::name);
-    let seconds = duration_to_sec(latency);
-
-    TIKV_SEND_REQUEST_DURATION
-        .with_label_values(&[command, &store, &stale, &scope])
-        .observe(seconds);
-    TIKV_SEND_REQUEST_BY_SOURCE
-        .with_label_values(&[command, &store, &stale, &scope, source])
-        .observe(seconds);
-
-    let Some(details) = response.and_then(crate::store::exec_details_v2) else {
-        return;
+    let key = SendRequestKey {
+        command: crate::store::CommandType::from_request_label(request.label())
+            .map_or("Unknown", crate::store::CommandType::name),
+        store_id: context
+            .and_then(|context| context.peer.as_ref())
+            .map_or(0, |peer| peer.store_id),
+        stale_read: context.is_some_and(|context| context.stale_read),
+        internal: source.starts_with("internal"),
     };
-    let total_rpc_wall_time_ns = details
-        .time_detail_v2
-        .as_ref()
-        .map(|time| time.total_rpc_wall_time_ns)
-        .or_else(|| {
+    let seconds = duration_to_sec(latency);
+    let total_rpc_wall_time_ns = response
+        .and_then(crate::store::exec_details_v2)
+        .map(|details| {
             details
-                .time_detail
+                .time_detail_v2
                 .as_ref()
                 .map(|time| time.total_rpc_wall_time_ns)
+                .or_else(|| {
+                    details
+                        .time_detail
+                        .as_ref()
+                        .map(|time| time.total_rpc_wall_time_ns)
+                })
+                .unwrap_or_default()
         })
         .unwrap_or_default();
-    if total_rpc_wall_time_ns > 0 {
-        TIKV_RPC_NET_LATENCY
-            .with_label_values(&[&store, &scope])
-            .observe(seconds - total_rpc_wall_time_ns as f64 / 1_000_000_000.0);
-    }
+
+    STORE_RPC_SERIES.with(|series| {
+        let mut series = series.borrow_mut();
+        let generation = crate::metrics::global_metrics_generation();
+        if series.generation != generation {
+            *series = StoreRpcSeries {
+                generation,
+                ..StoreRpcSeries::default()
+            };
+        }
+        // Labels are formatted only for a series this thread has not resolved.
+        let store = || key.store_id.to_string();
+        let scope = || key.internal.to_string();
+        series
+            .duration
+            .entry(key)
+            .or_insert_with(|| {
+                TIKV_SEND_REQUEST_DURATION.with_label_values(&[
+                    key.command,
+                    &store(),
+                    &key.stale_read.to_string(),
+                    &scope(),
+                ])
+            })
+            .observe(seconds);
+        let by_source = series.by_source.entry(key).or_default();
+        if let Some(observer) = by_source.get(source) {
+            observer.observe(seconds);
+        } else {
+            let observer = TIKV_SEND_REQUEST_BY_SOURCE.with_label_values(&[
+                key.command,
+                &store(),
+                &key.stale_read.to_string(),
+                &scope(),
+                source,
+            ]);
+            observer.observe(seconds);
+            by_source.insert(source.to_owned(), observer);
+        }
+        if total_rpc_wall_time_ns > 0 {
+            series
+                .net_latency
+                .entry((key.store_id, key.internal))
+                .or_insert_with(|| TIKV_RPC_NET_LATENCY.with_label_values(&[&store(), &scope()]))
+                .observe(seconds - total_rpc_wall_time_ns as f64 / 1_000_000_000.0);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1399,5 +1471,34 @@ mod tests {
         assert_eq!(after_failure.1, after_success.1 + 1);
         assert_eq!(after_failure.2, after_success.2);
         assert_eq!(after_failure.3, after_success.3);
+    }
+
+    /// client-go resolves a store RPC's series once per label key
+    /// (`sendReqHistCache`, `sendReqCounterCache`), not on every request.
+    #[test]
+    fn store_rpc_series_are_resolved_once_per_key() {
+        let source = "internal_store_rpc_series_cache";
+        let request = kvrpcpb::GetRequest {
+            context: Some(kvrpcpb::Context {
+                peer: Some(metapb::Peer {
+                    store_id: 424_242,
+                    ..Default::default()
+                }),
+                request_source: source.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before = tikv_store_rpc_samples("Get", "424242", "false", "true", source);
+        OBSERVER_SERIES_RESOLUTIONS.with(|count| count.set(0));
+
+        observe_tikv_store_rpc(&request, None, Duration::from_millis(1));
+        observe_tikv_store_rpc(&request, None, Duration::from_millis(1));
+
+        // The duration and by-source series, each resolved by the first request.
+        assert_eq!(OBSERVER_SERIES_RESOLUTIONS.with(|count| count.get()), 2);
+        let after = tikv_store_rpc_samples("Get", "424242", "false", "true", source);
+        assert_eq!(after.0, before.0 + 2);
+        assert_eq!(after.1, before.1 + 2);
     }
 }

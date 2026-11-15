@@ -932,6 +932,16 @@ lazy_static::lazy_static! {
         RwLock::new(Arc::new(ClientGoMetrics::default()));
 }
 
+/// Bumped each time the process-wide metrics are replaced, so a series a
+/// caller resolved and kept never outlives the metrics it belongs to.
+static GLOBAL_CLIENT_GO_METRICS_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The generation of the process-wide metrics [`global_metrics`] returns.
+pub(crate) fn global_metrics_generation() -> u64 {
+    GLOBAL_CLIENT_GO_METRICS_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Returns the process-wide metrics initialization used by client operations.
 pub fn global_metrics() -> Arc<ClientGoMetrics> {
     GLOBAL_CLIENT_GO_METRICS
@@ -958,6 +968,7 @@ pub fn init_metrics_with_const_labels(
     *GLOBAL_CLIENT_GO_METRICS
         .write()
         .expect("global client-go metrics lock poisoned") = metrics;
+    GLOBAL_CLIENT_GO_METRICS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
