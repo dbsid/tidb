@@ -1405,7 +1405,11 @@ where
                 .pop()
                 .expect("single shard must exist")
                 .expect("all shard lookups were validated before dispatch");
-            let mut plan = current_plan.clone_then_apply_shard(shard);
+            // client-go sends a one-region request as the request it built;
+            // this handler owns `current_plan`, so the shard goes on it in
+            // place instead of on a copy.
+            let mut plan = current_plan;
+            plan.apply_shard(shard);
             plan.set_async_batch_get_metrics(false);
             if let Some(owner) = backoff.snapshot_retry_owner() {
                 plan.set_snapshot_retry_owner(owner);
@@ -6538,6 +6542,62 @@ mod test {
             snapshot_async_batch_get: false,
         };
         assert!(plan.execute().await.is_err())
+    }
+
+    /// A one-region plan that counts its copies.
+    struct OneShardCloneCountingPlan(Arc<AtomicUsize>);
+
+    impl Clone for OneShardCloneCountingPlan {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    #[async_trait]
+    impl Plan for OneShardCloneCountingPlan {
+        type Result = BatchGetResponse;
+
+        async fn execute(&self) -> Result<Self::Result> {
+            Ok(BatchGetResponse::default())
+        }
+    }
+
+    impl Shardable for OneShardCloneCountingPlan {
+        type Shard = ();
+
+        fn shards(
+            &self,
+            _: &Arc<impl crate::pd::PdClient>,
+        ) -> BoxStream<'static, crate::Result<(Self::Shard, RegionWithLeader)>> {
+            Box::pin(stream::iter(vec![Ok(((), MockPdClient::region1()))]))
+        }
+
+        fn apply_shard(&mut self, _: Self::Shard) {}
+
+        fn apply_store(&mut self, _: &crate::store::RegionStore) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// client-go sends a one-region request (`KVSnapshot.get`) as the request
+    /// it built: applying the region's shard copies nothing.
+    #[tokio::test]
+    async fn a_one_region_request_applies_its_shard_without_copying_the_plan() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let plan = RetryableMultiRegion {
+            inner: OneShardCloneCountingPlan(Arc::clone(&clones)),
+            pd_client: Arc::new(MockPdClient::default()),
+            backoff: Backoff::no_backoff(),
+            preserve_region_results: false,
+            concurrency: MULTI_REGION_CONCURRENCY,
+            one_region: None,
+            snapshot_region_scope: None,
+            snapshot_async_batch_get: false,
+        };
+        assert_eq!(plan.execute().await.unwrap().len(), 1);
+        // The one copy is `execute`'s: the plan runs behind `&self`.
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
