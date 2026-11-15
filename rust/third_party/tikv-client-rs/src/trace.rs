@@ -463,11 +463,11 @@ where
             ClientSpanScope::Ctx(context) => ClientSpanScope::Ctx(context.clone()),
         })
         .ok();
-    async move {
-        match scope {
-            Some(scope) => CLIENT_SPAN_SCOPE.scope(scope, future).await,
-            None => future.await,
-        }
+    // An `Either`, not an `async` block: the spawned task holds `future`
+    // once, where the block would hold it as a capture and as its awaitee.
+    match scope {
+        Some(scope) => futures::future::Either::Left(CLIENT_SPAN_SCOPE.scope(scope, future)),
+        None => futures::future::Either::Right(future),
     }
 }
 
@@ -1174,6 +1174,21 @@ mod tests {
         set_category_enabled_handler(None);
         set_trace_control_extractor(None);
         set_grpc_trace_metadata_injector(None);
+    }
+
+    /// A spawned task's inherited client-span scope holds the task's future
+    /// once.
+    #[test]
+    fn inherited_client_spans_hold_their_future_once() {
+        let buffer = [0u8; 4096];
+        let future = async move {
+            std::future::ready(()).await;
+            buffer.len()
+        };
+        let inner = std::mem::size_of_val(&future);
+        let inherited = inherit_client_spans(future);
+        let size = std::mem::size_of_val(&inherited);
+        assert!(size < inner + 256, "{size} bytes for a {inner}-byte future");
     }
 
     #[test]
