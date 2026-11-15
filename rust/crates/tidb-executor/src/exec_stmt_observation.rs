@@ -114,7 +114,7 @@ impl StatementPhases {
 /// Go `ExecStmt.StmtNode` and `SessionVars.CurrentDB`, the inputs of
 /// `GetBindingSQLAndDigest`.
 pub struct BindingSource {
-    pub stmt: tidb_ast::Stmt,
+    pub stmt: Arc<tidb_ast::Stmt>,
     pub current_db: String,
 }
 
