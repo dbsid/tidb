@@ -1,0 +1,149 @@
+diff --git a/src/request/plan.rs b/src/request/plan.rs
+index 4c9b3652..85748e11 100644
+--- a/src/request/plan.rs
++++ b/src/request/plan.rs
+@@ -1315,13 +1315,18 @@ fn into_multi_region_shard_error<T>(result: Result<Vec<Result<T>>>) -> Error {
+ /// its caller.
+ enum SendReqOutcome<P, T, R> {
+     Done(Result<T>, R),
+-    /// A terminal region miss. The caller backs off on `region_miss`, when
+-    /// set, and re-splits the request after the sender's span has finished.
+-    Resplit {
+-        plan: P,
+-        backoff: R,
+-        region_miss: Option<(RetryConfig, String, Error)>,
+-    },
++    /// A terminal region miss. Boxed: the re-split is the cold path, and
++    /// inline its plan would make every outcome as large as the plan.
++    Resplit(Box<Resplit<P, R>>),
++}
++
++/// The request a terminal region miss hands back to the caller, who backs
++/// off on `region_miss`, when set, and re-splits the request after the
++/// sender's span has finished.
++struct Resplit<P, R> {
++    plan: P,
++    backoff: R,
++    region_miss: Option<(RetryConfig, String, Error)>,
+ }
+ 
+ #[allow(private_bounds)]
+@@ -1623,11 +1628,12 @@ where
+         };
+         let result = match outcome {
+             SendReqOutcome::Done(result, backoff) => (result, backoff),
+-            SendReqOutcome::Resplit {
+-                plan,
+-                backoff,
+-                region_miss,
+-            } => {
++            SendReqOutcome::Resplit(resplit) => {
++                let Resplit {
++                    plan,
++                    backoff,
++                    region_miss,
++                } = *resplit;
+                 // Boxed: the re-split is the cold path, and inline it would
+                 // triple the size of every request's future.
+                 Box::pin(crate::trace::with_bo_span_slot(
+@@ -1748,7 +1754,7 @@ where
+                 }));
+                 // Nothing was sent, so re-sharding is always safe; source
+                 // callers back off `BoRegionMiss` and retry on this answer.
+-                return SendReqOutcome::Resplit {
++                return SendReqOutcome::Resplit(Box::new(Resplit {
+                     plan,
+                     backoff,
+                     region_miss: Some((
+@@ -1756,7 +1762,7 @@ where
+                         format!("region missing in cache: {region_ver_id:?}"),
+                         error,
+                     )),
+-                };
++                }));
+             }
+             Err(err) if is_selector_exhausted_error(&err) => {
+                 if let Some((config, reason)) = plan.largest_pending_backoff() {
+@@ -1774,7 +1780,7 @@ where
+                 // cache, exactly like a region that left the cache. Returning
+                 // it as a terminal error instead failed whole transactions
+                 // (e.g. bulk prewrites) while Regions were splitting.
+-                return SendReqOutcome::Resplit {
++                return SendReqOutcome::Resplit(Box::new(Resplit {
+                     plan,
+                     backoff,
+                     region_miss: Some((
+@@ -1782,7 +1788,7 @@ where
+                         format!("replica selector exhausted: {region_ver_id:?}"),
+                         err,
+                     )),
+-                };
++                }));
+             }
+             Err(err) => {
+                 return Box::pin(Self::handle_other_error(
+@@ -1931,7 +1937,7 @@ where
+                 if plan.retries_undetermined_result() && backoff.retries_terminal_region_errors() {
+                     drop(on_region_error_span);
+                     let error = Error::RegionError(Box::new(e));
+-                    return SendReqOutcome::Resplit {
++                    return SendReqOutcome::Resplit(Box::new(Resplit {
+                         plan,
+                         backoff,
+                         region_miss: Some((
+@@ -1939,7 +1945,7 @@ where
+                             format!("raw region error: {error:?}"),
+                             error,
+                         )),
+-                    };
++                    }));
+                 }
+                 return SendReqOutcome::Done(Err(Error::RegionError(Box::new(e))), backoff);
+             }
+@@ -2086,7 +2092,7 @@ where
+                     // client-go's sender returns the region error; its
+                     // caller backs off `BoRegionMiss` and re-splits.
+                     drop(on_region_error_span);
+-                    return SendReqOutcome::Resplit {
++                    return SendReqOutcome::Resplit(Box::new(Resplit {
+                         plan,
+                         backoff,
+                         region_miss: Some((
+@@ -2094,7 +2100,7 @@ where
+                             format!("raw region error: {error:?}"),
+                             error,
+                         )),
+-                    };
++                    }));
+                 }
+                 Err(error) => return SendReqOutcome::Done(Err(error), backoff),
+             };
+@@ -2305,11 +2311,11 @@ where
+                 } else {
+                     // The invalidated region leaves the sender without a
+                     // route; client-go's caller re-splits the request.
+-                    SendReqOutcome::Resplit {
++                    SendReqOutcome::Resplit(Box::new(Resplit {
+                         plan,
+                         backoff,
+                         region_miss: None,
+-                    }
++                    }))
+                 }
+             }
+             Ok(false) => SendReqOutcome::Done(Err(e), backoff),
+@@ -6549,6 +6555,14 @@ mod test {
+         assert!(plan.execute().await.is_err())
+     }
+ 
++    /// A re-split is the cold path: an outcome carries a large plan behind a
++    /// box, so every completed send moves only its result and backoff.
++    #[test]
++    fn a_send_outcome_keeps_the_resplit_plan_behind_a_box() {
++        struct LargePlan(#[allow(dead_code)] [u8; 4096]);
++        assert!(std::mem::size_of::<SendReqOutcome<LargePlan, (), Backoff>>() < 256);
++    }
++
+     #[tokio::test]
+     async fn test_join_set_results_keep_spawn_order() {
+         let mut join_set = JoinSet::new();
