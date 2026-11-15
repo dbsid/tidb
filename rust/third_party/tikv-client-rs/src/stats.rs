@@ -35,6 +35,70 @@ impl ClientCounter {
     }
 }
 
+/// The series this thread resolved from client-go's metric vectors, keyed by
+/// vector and label values, so a hot path resolves each one once, as
+/// client-go keeps the observers its requests use (`batchConnMetrics`,
+/// `sendReqHistCache`, `TxnCmdHistogramWithGet`, ...). Resolving one takes
+/// the process-wide metrics lock and two lookups; these are dropped when
+/// the process-wide metrics are replaced.
+struct ResolvedSeries<T> {
+    generation: u64,
+    by_hash: std::collections::HashMap<u64, Vec<(&'static str, Box<[String]>, T)>>,
+}
+
+impl<T> Default for ResolvedSeries<T> {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            by_hash: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T: Clone> ResolvedSeries<T> {
+    fn get_or_resolve(
+        &mut self,
+        vector: &'static str,
+        values: &[&str],
+        resolve: impl FnOnce() -> T,
+    ) -> T {
+        let generation = crate::metrics::global_metrics_generation();
+        if self.generation != generation {
+            self.by_hash.clear();
+            self.generation = generation;
+        }
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            vector.hash(&mut hasher);
+            values.hash(&mut hasher);
+            hasher.finish()
+        };
+        let bucket = self.by_hash.entry(hash).or_default();
+        if let Some((_, _, series)) = bucket.iter().find(|(name, labels, _)| {
+            *name == vector && labels.iter().map(String::as_str).eq(values.iter().copied())
+        }) {
+            return series.clone();
+        }
+        let series = resolve();
+        bucket.push((
+            vector,
+            values.iter().map(|value| (*value).to_owned()).collect(),
+            series.clone(),
+        ));
+        series
+    }
+}
+
+thread_local! {
+    static RESOLVED_COUNTERS: std::cell::RefCell<ResolvedSeries<Counter>> =
+        std::cell::RefCell::default();
+    static RESOLVED_GAUGES: std::cell::RefCell<ResolvedSeries<Gauge>> =
+        std::cell::RefCell::default();
+    static RESOLVED_OBSERVERS: std::cell::RefCell<ResolvedSeries<crate::metrics::ClientGoObserver>> =
+        std::cell::RefCell::default();
+}
+
 struct ClientCounterVec(&'static str);
 
 impl ClientCounterVec {
@@ -46,7 +110,11 @@ impl ClientCounterVec {
     }
 
     fn with_label_values(&self, values: &[&str]) -> Counter {
-        self.metric().with_label_values(values)
+        RESOLVED_COUNTERS.with(|series| {
+            series
+                .borrow_mut()
+                .get_or_resolve(self.0, values, || self.metric().with_label_values(values))
+        })
     }
 }
 
@@ -76,7 +144,11 @@ impl ClientGaugeVec {
     }
 
     fn with_label_values(&self, values: &[&str]) -> Gauge {
-        self.metric().with_label_values(values)
+        RESOLVED_GAUGES.with(|series| {
+            series
+                .borrow_mut()
+                .get_or_resolve(self.0, values, || self.metric().with_label_values(values))
+        })
     }
 }
 
@@ -110,6 +182,14 @@ thread_local! {
 
 impl ClientObserverVec {
     fn with_label_values(&self, values: &[&str]) -> crate::metrics::ClientGoObserver {
+        RESOLVED_OBSERVERS.with(|series| {
+            series
+                .borrow_mut()
+                .get_or_resolve(self.0, values, || self.resolve(values))
+        })
+    }
+
+    fn resolve(&self, values: &[&str]) -> crate::metrics::ClientGoObserver {
         #[cfg(test)]
         OBSERVER_SERIES_RESOLUTIONS.with(|count| count.set(count.get() + 1));
         let metrics = crate::metrics::global_metrics();
@@ -1473,6 +1553,39 @@ mod tests {
         assert_eq!(after_failure.3, after_success.3);
     }
 
+    /// client-go keeps the series its hot paths observe (`TxnCmdHistogramWithGet`
+    /// for every snapshot Get): a thread resolves a vector's series once per
+    /// label set, not on every observation.
+    #[test]
+    fn a_command_duration_series_is_resolved_once_per_thread() {
+        OBSERVER_SERIES_RESOLUTIONS.with(|count| count.set(0));
+        drop(snapshot_command_timer("get", false));
+        drop(snapshot_command_timer("get", false));
+        assert_eq!(OBSERVER_SERIES_RESOLUTIONS.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn resolved_series_are_keyed_by_vector_and_labels() {
+        let mut series = ResolvedSeries::<u32>::default();
+        let mut resolutions = 0;
+        for _ in 0..2 {
+            let value = series.get_or_resolve("Vector", &["a", "b"], || {
+                resolutions += 1;
+                1
+            });
+            assert_eq!(value, 1);
+        }
+        let other_labels = series.get_or_resolve("Vector", &["a", "c"], || {
+            resolutions += 1;
+            2
+        });
+        let other_vector = series.get_or_resolve("Other", &["a", "b"], || {
+            resolutions += 1;
+            3
+        });
+        assert_eq!((other_labels, other_vector, resolutions), (2, 3, 3));
+    }
+
     /// client-go resolves a store RPC's series once per label key
     /// (`sendReqHistCache`, `sendReqCounterCache`), not on every request.
     #[test]
@@ -1495,8 +1608,9 @@ mod tests {
         observe_tikv_store_rpc(&request, None, Duration::from_millis(1));
         observe_tikv_store_rpc(&request, None, Duration::from_millis(1));
 
-        // The duration and by-source series, each resolved by the first request.
-        assert_eq!(OBSERVER_SERIES_RESOLUTIONS.with(|count| count.get()), 2);
+        // Reading the samples above already resolved both series on this
+        // thread, so neither request resolves them again.
+        assert_eq!(OBSERVER_SERIES_RESOLUTIONS.with(|count| count.get()), 0);
         let after = tikv_store_rpc_samples("Get", "424242", "false", "true", source);
         assert_eq!(after.0, before.0 + 2);
         assert_eq!(after.1, before.1 + 2);
