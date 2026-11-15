@@ -2174,13 +2174,23 @@ impl<PdC: PdClient> Transaction<PdC> {
                 // snapshot cache misses and discards the derived ctx.
                 crate::trace::detached_client_span("tikvSnapshot.get", async move {
                     let mut request = new_get_request(key, timestamp.clone());
-                    let resource_group_tag = apply_snapshot_resource_group_tag(
+                    if let Some(tag) = apply_snapshot_resource_group_tag(
                         &mut request,
                         resource_group_tag.as_ref(),
                         transaction_resource_group_tagger.as_ref(),
                         resource_group_tagger.as_ref(),
                         SnapshotRequestType::Get,
-                    );
+                    ) {
+                        request.set_resource_group_tag(tag);
+                    }
+                    // client-go `KVSnapshot.get` builds these into the
+                    // request's own `Context`; setting them before the plan
+                    // exists spares a copy of the plan builder for each.
+                    request.set_request_source(request_source);
+                    request.set_priority_value(priority.to_pb());
+                    request.set_not_fill_cache(not_fill_cache);
+                    request.set_isolation_level(isolation_level);
+                    request.set_task_id(task_id);
                     let plan = plan_with_keyspace_name(
                         rpc,
                         keyspace,
@@ -2192,12 +2202,6 @@ impl<PdC: PdClient> Transaction<PdC> {
                         replica_read_config.clone(),
                         request,
                     )
-                    .request_source(request_source)
-                    .priority(priority)
-                    .not_fill_cache(not_fill_cache)
-                    .isolation_level(isolation_level)
-                    .task_id(task_id)
-                    .resource_group_tag(resource_group_tag)
                     .snapshot_read_timeout(snapshot_read_timeout, SNAPSHOT_READ_TIMEOUT_SHORT)
                     .validate_read_timestamp(
                         read_timestamp_validator,
