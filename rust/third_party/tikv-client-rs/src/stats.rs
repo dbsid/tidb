@@ -947,61 +947,85 @@ pub(crate) fn range_task_push_duration_samples(task_type: &str) -> u64 {
         .get_sample_count()
 }
 
-/// Records the stage/outcome breakdown emitted by client-go's BatchCommands
-/// transport. Store is carried from the request context rather than cached on
-/// a connection because a pooled target may serve a replacement store ID.
-pub(crate) fn observe_batch_request_stage(
-    store: u64,
+/// The BatchCommands request-stage observer of one store, stage and outcome.
+/// Store is carried from the request context rather than fixed on a
+/// connection because a pooled target may serve a replacement store ID;
+/// callers resolve it once per store (client-go `newStoreMetrics`).
+pub(crate) fn batch_request_stage_observer(
+    store: &str,
     stage: &'static str,
     outcome: &'static str,
-    duration: Duration,
-) {
-    TIKV_BATCH_REQUEST_STAGE_DURATION
-        .with_label_values(&[&store.to_string(), stage, outcome])
-        .observe(duration_to_sec(duration));
+) -> crate::metrics::ClientGoObserver {
+    TIKV_BATCH_REQUEST_STAGE_DURATION.with_label_values(&[store, stage, outcome])
 }
 
-/// Records the receive-loop timings emitted by client-go's BatchCommands
-/// stream summary with exact label dimensions and count/sum exposition.
-pub(crate) fn observe_batch_stream_recv_loop(
-    target: &str,
-    connection_index: usize,
-    forwarded: bool,
-    step: &'static str,
-    duration: Duration,
-) {
-    let connection_index = connection_index.to_string();
-    TIKV_BATCH_STREAM_RECV_LOOP_DURATION
-        .with_label_values(&[
-            target,
-            &connection_index,
-            if forwarded { "1" } else { "0" },
-            step,
-        ])
-        .observe(duration_to_sec(duration));
+/// client-go `batchCommandsClientMetrics`: the receive-loop timings, tail
+/// latencies and request counters of one BatchCommands stream, resolved once
+/// for the stream's labels instead of on every event.
+pub(crate) struct BatchStreamMetrics {
+    recv_loop_recv: crate::metrics::ClientGoObserver,
+    recv_loop_process: crate::metrics::ClientGoObserver,
+    recv_tail: crate::metrics::ClientGoObserver,
+    tikv_send_tail: crate::metrics::ClientGoObserver,
+    canceled_entry_tail: crate::metrics::ClientGoObserver,
+    tracked_requests: Counter,
+    retired_requests: Counter,
+    completed_responses: Counter,
+    outdated_responses: Counter,
 }
 
-/// Records the source BatchCommands receive-loop tail latency classes.
-pub(crate) fn observe_batch_stream_tail(
-    target: &str,
-    connection_index: usize,
-    forwarded: bool,
-    kind: BatchStreamTailKind,
-    duration: Duration,
-) {
-    let connection_index = connection_index.to_string();
-    let labels = [target, &connection_index, if forwarded { "1" } else { "0" }];
-    let seconds = duration_to_sec(duration);
-    match kind {
-        BatchStreamTailKind::Receive => TIKV_BATCH_STREAM_RECV_TAIL_LATENCY
-            .with_label_values(&labels)
-            .observe(seconds),
-        BatchStreamTailKind::TikvSend => TIKV_BATCH_STREAM_TIKV_SEND_TAIL_LATENCY
-            .with_label_values(&labels)
-            .observe(seconds),
-        BatchStreamTailKind::CancelledEntry => TIKV_BATCH_STREAM_CANCELED_ENTRY_TAIL_LATENCY
-            .with_label_values(&labels)
-            .observe(seconds),
+impl BatchStreamMetrics {
+    pub(crate) fn new(target: &str, connection_index: usize, forwarded: bool) -> Self {
+        let connection_index = connection_index.to_string();
+        let labels = [target, &connection_index, if forwarded { "1" } else { "0" }];
+        let recv_loop = |step| {
+            TIKV_BATCH_STREAM_RECV_LOOP_DURATION
+                .with_label_values(&[labels[0], labels[1], labels[2], step])
+        };
+        Self {
+            recv_loop_recv: recv_loop("recv"),
+            recv_loop_process: recv_loop("process"),
+            recv_tail: TIKV_BATCH_STREAM_RECV_TAIL_LATENCY.with_label_values(&labels),
+            tikv_send_tail: TIKV_BATCH_STREAM_TIKV_SEND_TAIL_LATENCY.with_label_values(&labels),
+            canceled_entry_tail: TIKV_BATCH_STREAM_CANCELED_ENTRY_TAIL_LATENCY
+                .with_label_values(&labels),
+            tracked_requests: TIKV_BATCH_STREAM_TRACKED_REQUEST_COUNT.with_label_values(&labels),
+            retired_requests: TIKV_BATCH_STREAM_RETIRED_REQUEST_COUNT.with_label_values(&labels),
+            completed_responses: TIKV_BATCH_STREAM_COMPLETED_RESPONSE_COUNT
+                .with_label_values(&labels),
+            outdated_responses: TIKV_BATCH_STREAM_OUTDATED_RESPONSE_COUNT
+                .with_label_values(&labels),
+        }
+    }
+
+    /// Records the receive loop's wait for the next response.
+    pub(crate) fn observe_recv_loop_recv(&self, duration: Duration) {
+        self.recv_loop_recv.observe(duration_to_sec(duration));
+    }
+
+    /// Records the receive loop's handling of one response.
+    pub(crate) fn observe_recv_loop_process(&self, duration: Duration) {
+        self.recv_loop_process.observe(duration_to_sec(duration));
+    }
+
+    /// Records one source receive-loop tail latency class.
+    pub(crate) fn observe_tail(&self, kind: BatchStreamTailKind, duration: Duration) {
+        let observer = match kind {
+            BatchStreamTailKind::Receive => &self.recv_tail,
+            BatchStreamTailKind::TikvSend => &self.tikv_send_tail,
+            BatchStreamTailKind::CancelledEntry => &self.canceled_entry_tail,
+        };
+        observer.observe(duration_to_sec(duration));
+    }
+
+    pub(crate) fn increment(&self, counter: BatchStreamRequestCounter, count: usize) {
+        let counter = match counter {
+            BatchStreamRequestCounter::Tracked => &self.tracked_requests,
+            BatchStreamRequestCounter::Retired => &self.retired_requests,
+            BatchStreamRequestCounter::Completed => &self.completed_responses,
+            BatchStreamRequestCounter::Outdated => &self.outdated_responses,
+        };
+        counter.inc_by(count as f64);
     }
 }
 
@@ -1020,24 +1044,6 @@ pub(crate) enum BatchStreamRequestCounter {
     Outdated,
 }
 
-pub(crate) fn increment_batch_stream_request_counter(
-    target: &str,
-    connection_index: usize,
-    forwarded: bool,
-    counter: BatchStreamRequestCounter,
-    count: usize,
-) {
-    let connection_index = connection_index.to_string();
-    let labels = [target, &connection_index, if forwarded { "1" } else { "0" }];
-    let counter = match counter {
-        BatchStreamRequestCounter::Tracked => &TIKV_BATCH_STREAM_TRACKED_REQUEST_COUNT,
-        BatchStreamRequestCounter::Retired => &TIKV_BATCH_STREAM_RETIRED_REQUEST_COUNT,
-        BatchStreamRequestCounter::Completed => &TIKV_BATCH_STREAM_COMPLETED_RESPONSE_COUNT,
-        BatchStreamRequestCounter::Outdated => &TIKV_BATCH_STREAM_OUTDATED_RESPONSE_COUNT,
-    };
-    counter.with_label_values(&labels).inc_by(count as f64);
-}
-
 pub(crate) fn observe_batch_client_unavailable(duration: Duration) {
     TIKV_BATCH_CLIENT_UNAVAILABLE.observe(duration_to_sec(duration));
 }
@@ -1050,46 +1056,81 @@ pub(crate) fn observe_batch_client_recycle(duration: Duration) {
     TIKV_BATCH_CLIENT_RECYCLE.observe(duration_to_sec(duration));
 }
 
-pub(crate) fn observe_batch_send_loop(target: &str, step: &str, duration: Duration) {
-    TIKV_BATCH_SEND_LOOP_DURATION
-        .with_label_values(&[target, step])
-        .observe(duration_to_sec(duration));
+/// client-go `batchConn.initMetrics`: the send-loop observers of one batch
+/// connection target, resolved once for the target instead of on every
+/// batch.
+pub(crate) struct BatchConnMetrics {
+    target: String,
+    pending_requests: crate::metrics::ClientGoObserver,
+    batch_size: crate::metrics::ClientGoObserver,
+    send_loop_wait_head: crate::metrics::ClientGoObserver,
+    send_loop_wait_more: crate::metrics::ClientGoObserver,
+    send_loop_send: crate::metrics::ClientGoObserver,
+    send_tail: crate::metrics::ClientGoObserver,
+    head_arrival_interval: crate::metrics::ClientGoObserver,
+    more_requests: crate::metrics::ClientGoObserver,
+    best_batch_size: crate::metrics::ClientGoObserver,
 }
 
-pub(crate) fn observe_batch_send_tail(target: &str, duration: Duration) {
-    TIKV_BATCH_SEND_TAIL_LATENCY
-        .with_label_values(&[target])
-        .observe(duration_to_sec(duration));
-}
+impl BatchConnMetrics {
+    pub(crate) fn new(target: String) -> Self {
+        let labels = [target.as_str()];
+        let send_loop = |step| TIKV_BATCH_SEND_LOOP_DURATION.with_label_values(&[labels[0], step]);
+        Self {
+            pending_requests: TIKV_BATCH_PENDING_REQUESTS.with_label_values(&labels),
+            batch_size: TIKV_BATCH_REQUESTS.with_label_values(&labels),
+            send_loop_wait_head: send_loop("wait-head"),
+            send_loop_wait_more: send_loop("wait-more"),
+            send_loop_send: send_loop("send"),
+            send_tail: TIKV_BATCH_SEND_TAIL_LATENCY.with_label_values(&labels),
+            head_arrival_interval: TIKV_BATCH_HEAD_ARRIVAL_INTERVAL.with_label_values(&labels),
+            more_requests: TIKV_BATCH_MORE_REQUESTS.with_label_values(&labels),
+            best_batch_size: TIKV_BATCH_BEST_SIZE.with_label_values(&labels),
+            target,
+        }
+    }
 
-pub(crate) fn observe_batch_pending_requests(target: &str, count: usize) {
-    TIKV_BATCH_PENDING_REQUESTS
-        .with_label_values(&[target])
-        .observe(count as f64);
-}
+    /// The target whose observers these are.
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
 
-pub(crate) fn observe_batch_requests(target: &str, count: usize) {
-    TIKV_BATCH_REQUESTS
-        .with_label_values(&[target])
-        .observe(count as f64);
-}
+    pub(crate) fn observe_pending_requests(&self, count: usize) {
+        self.pending_requests.observe(count as f64);
+    }
 
-pub(crate) fn observe_batch_head_arrival_interval(target: &str, interval: Duration) {
-    TIKV_BATCH_HEAD_ARRIVAL_INTERVAL
-        .with_label_values(&[target])
-        .observe(duration_to_sec(interval));
-}
+    pub(crate) fn observe_batch_size(&self, count: usize) {
+        self.batch_size.observe(count as f64);
+    }
 
-pub(crate) fn observe_batch_best_size(target: &str, size: f64) {
-    TIKV_BATCH_BEST_SIZE
-        .with_label_values(&[target])
-        .observe(size);
-}
+    pub(crate) fn observe_send_loop_wait_head(&self, duration: Duration) {
+        self.send_loop_wait_head.observe(duration_to_sec(duration));
+    }
 
-pub(crate) fn observe_batch_more_requests(target: &str, count: usize) {
-    TIKV_BATCH_MORE_REQUESTS
-        .with_label_values(&[target])
-        .observe(count as f64);
+    pub(crate) fn observe_send_loop_wait_more(&self, duration: Duration) {
+        self.send_loop_wait_more.observe(duration_to_sec(duration));
+    }
+
+    pub(crate) fn observe_send_loop_send(&self, duration: Duration) {
+        self.send_loop_send.observe(duration_to_sec(duration));
+    }
+
+    pub(crate) fn observe_send_tail(&self, duration: Duration) {
+        self.send_tail.observe(duration_to_sec(duration));
+    }
+
+    pub(crate) fn observe_head_arrival_interval(&self, interval: Duration) {
+        self.head_arrival_interval
+            .observe(duration_to_sec(interval));
+    }
+
+    pub(crate) fn observe_more_requests(&self, count: usize) {
+        self.more_requests.observe(count as f64);
+    }
+
+    pub(crate) fn observe_best_batch_size(&self, size: f64) {
+        self.best_batch_size.observe(size);
+    }
 }
 
 pub(crate) fn increment_batch_wait_overload() {

@@ -1,0 +1,882 @@
+diff --git a/src/stats.rs b/src/stats.rs
+index a504749e..fa88faac 100644
+--- a/src/stats.rs
++++ b/src/stats.rs
+@@ -947,61 +947,85 @@ pub(crate) fn range_task_push_duration_samples(task_type: &str) -> u64 {
+         .get_sample_count()
+ }
+ 
+-/// Records the stage/outcome breakdown emitted by client-go's BatchCommands
+-/// transport. Store is carried from the request context rather than cached on
+-/// a connection because a pooled target may serve a replacement store ID.
+-pub(crate) fn observe_batch_request_stage(
+-    store: u64,
++/// The BatchCommands request-stage observer of one store, stage and outcome.
++/// Store is carried from the request context rather than fixed on a
++/// connection because a pooled target may serve a replacement store ID;
++/// callers resolve it once per store (client-go `newStoreMetrics`).
++pub(crate) fn batch_request_stage_observer(
++    store: &str,
+     stage: &'static str,
+     outcome: &'static str,
+-    duration: Duration,
+-) {
+-    TIKV_BATCH_REQUEST_STAGE_DURATION
+-        .with_label_values(&[&store.to_string(), stage, outcome])
+-        .observe(duration_to_sec(duration));
+-}
++) -> crate::metrics::ClientGoObserver {
++    TIKV_BATCH_REQUEST_STAGE_DURATION.with_label_values(&[store, stage, outcome])
++}
++
++/// client-go `batchCommandsClientMetrics`: the receive-loop timings, tail
++/// latencies and request counters of one BatchCommands stream, resolved once
++/// for the stream's labels instead of on every event.
++pub(crate) struct BatchStreamMetrics {
++    recv_loop_recv: crate::metrics::ClientGoObserver,
++    recv_loop_process: crate::metrics::ClientGoObserver,
++    recv_tail: crate::metrics::ClientGoObserver,
++    tikv_send_tail: crate::metrics::ClientGoObserver,
++    canceled_entry_tail: crate::metrics::ClientGoObserver,
++    tracked_requests: Counter,
++    retired_requests: Counter,
++    completed_responses: Counter,
++    outdated_responses: Counter,
++}
++
++impl BatchStreamMetrics {
++    pub(crate) fn new(target: &str, connection_index: usize, forwarded: bool) -> Self {
++        let connection_index = connection_index.to_string();
++        let labels = [target, &connection_index, if forwarded { "1" } else { "0" }];
++        let recv_loop = |step| {
++            TIKV_BATCH_STREAM_RECV_LOOP_DURATION
++                .with_label_values(&[labels[0], labels[1], labels[2], step])
++        };
++        Self {
++            recv_loop_recv: recv_loop("recv"),
++            recv_loop_process: recv_loop("process"),
++            recv_tail: TIKV_BATCH_STREAM_RECV_TAIL_LATENCY.with_label_values(&labels),
++            tikv_send_tail: TIKV_BATCH_STREAM_TIKV_SEND_TAIL_LATENCY.with_label_values(&labels),
++            canceled_entry_tail: TIKV_BATCH_STREAM_CANCELED_ENTRY_TAIL_LATENCY
++                .with_label_values(&labels),
++            tracked_requests: TIKV_BATCH_STREAM_TRACKED_REQUEST_COUNT.with_label_values(&labels),
++            retired_requests: TIKV_BATCH_STREAM_RETIRED_REQUEST_COUNT.with_label_values(&labels),
++            completed_responses: TIKV_BATCH_STREAM_COMPLETED_RESPONSE_COUNT
++                .with_label_values(&labels),
++            outdated_responses: TIKV_BATCH_STREAM_OUTDATED_RESPONSE_COUNT
++                .with_label_values(&labels),
++        }
++    }
+ 
+-/// Records the receive-loop timings emitted by client-go's BatchCommands
+-/// stream summary with exact label dimensions and count/sum exposition.
+-pub(crate) fn observe_batch_stream_recv_loop(
+-    target: &str,
+-    connection_index: usize,
+-    forwarded: bool,
+-    step: &'static str,
+-    duration: Duration,
+-) {
+-    let connection_index = connection_index.to_string();
+-    TIKV_BATCH_STREAM_RECV_LOOP_DURATION
+-        .with_label_values(&[
+-            target,
+-            &connection_index,
+-            if forwarded { "1" } else { "0" },
+-            step,
+-        ])
+-        .observe(duration_to_sec(duration));
+-}
++    /// Records the receive loop's wait for the next response.
++    pub(crate) fn observe_recv_loop_recv(&self, duration: Duration) {
++        self.recv_loop_recv.observe(duration_to_sec(duration));
++    }
+ 
+-/// Records the source BatchCommands receive-loop tail latency classes.
+-pub(crate) fn observe_batch_stream_tail(
+-    target: &str,
+-    connection_index: usize,
+-    forwarded: bool,
+-    kind: BatchStreamTailKind,
+-    duration: Duration,
+-) {
+-    let connection_index = connection_index.to_string();
+-    let labels = [target, &connection_index, if forwarded { "1" } else { "0" }];
+-    let seconds = duration_to_sec(duration);
+-    match kind {
+-        BatchStreamTailKind::Receive => TIKV_BATCH_STREAM_RECV_TAIL_LATENCY
+-            .with_label_values(&labels)
+-            .observe(seconds),
+-        BatchStreamTailKind::TikvSend => TIKV_BATCH_STREAM_TIKV_SEND_TAIL_LATENCY
+-            .with_label_values(&labels)
+-            .observe(seconds),
+-        BatchStreamTailKind::CancelledEntry => TIKV_BATCH_STREAM_CANCELED_ENTRY_TAIL_LATENCY
+-            .with_label_values(&labels)
+-            .observe(seconds),
++    /// Records the receive loop's handling of one response.
++    pub(crate) fn observe_recv_loop_process(&self, duration: Duration) {
++        self.recv_loop_process.observe(duration_to_sec(duration));
++    }
++
++    /// Records one source receive-loop tail latency class.
++    pub(crate) fn observe_tail(&self, kind: BatchStreamTailKind, duration: Duration) {
++        let observer = match kind {
++            BatchStreamTailKind::Receive => &self.recv_tail,
++            BatchStreamTailKind::TikvSend => &self.tikv_send_tail,
++            BatchStreamTailKind::CancelledEntry => &self.canceled_entry_tail,
++        };
++        observer.observe(duration_to_sec(duration));
++    }
++
++    pub(crate) fn increment(&self, counter: BatchStreamRequestCounter, count: usize) {
++        let counter = match counter {
++            BatchStreamRequestCounter::Tracked => &self.tracked_requests,
++            BatchStreamRequestCounter::Retired => &self.retired_requests,
++            BatchStreamRequestCounter::Completed => &self.completed_responses,
++            BatchStreamRequestCounter::Outdated => &self.outdated_responses,
++        };
++        counter.inc_by(count as f64);
+     }
+ }
+ 
+@@ -1020,24 +1044,6 @@ pub(crate) enum BatchStreamRequestCounter {
+     Outdated,
+ }
+ 
+-pub(crate) fn increment_batch_stream_request_counter(
+-    target: &str,
+-    connection_index: usize,
+-    forwarded: bool,
+-    counter: BatchStreamRequestCounter,
+-    count: usize,
+-) {
+-    let connection_index = connection_index.to_string();
+-    let labels = [target, &connection_index, if forwarded { "1" } else { "0" }];
+-    let counter = match counter {
+-        BatchStreamRequestCounter::Tracked => &TIKV_BATCH_STREAM_TRACKED_REQUEST_COUNT,
+-        BatchStreamRequestCounter::Retired => &TIKV_BATCH_STREAM_RETIRED_REQUEST_COUNT,
+-        BatchStreamRequestCounter::Completed => &TIKV_BATCH_STREAM_COMPLETED_RESPONSE_COUNT,
+-        BatchStreamRequestCounter::Outdated => &TIKV_BATCH_STREAM_OUTDATED_RESPONSE_COUNT,
+-    };
+-    counter.with_label_values(&labels).inc_by(count as f64);
+-}
+-
+ pub(crate) fn observe_batch_client_unavailable(duration: Duration) {
+     TIKV_BATCH_CLIENT_UNAVAILABLE.observe(duration_to_sec(duration));
+ }
+@@ -1050,46 +1056,81 @@ pub(crate) fn observe_batch_client_recycle(duration: Duration) {
+     TIKV_BATCH_CLIENT_RECYCLE.observe(duration_to_sec(duration));
+ }
+ 
+-pub(crate) fn observe_batch_send_loop(target: &str, step: &str, duration: Duration) {
+-    TIKV_BATCH_SEND_LOOP_DURATION
+-        .with_label_values(&[target, step])
+-        .observe(duration_to_sec(duration));
+-}
++/// client-go `batchConn.initMetrics`: the send-loop observers of one batch
++/// connection target, resolved once for the target instead of on every
++/// batch.
++pub(crate) struct BatchConnMetrics {
++    target: String,
++    pending_requests: crate::metrics::ClientGoObserver,
++    batch_size: crate::metrics::ClientGoObserver,
++    send_loop_wait_head: crate::metrics::ClientGoObserver,
++    send_loop_wait_more: crate::metrics::ClientGoObserver,
++    send_loop_send: crate::metrics::ClientGoObserver,
++    send_tail: crate::metrics::ClientGoObserver,
++    head_arrival_interval: crate::metrics::ClientGoObserver,
++    more_requests: crate::metrics::ClientGoObserver,
++    best_batch_size: crate::metrics::ClientGoObserver,
++}
++
++impl BatchConnMetrics {
++    pub(crate) fn new(target: String) -> Self {
++        let labels = [target.as_str()];
++        let send_loop = |step| TIKV_BATCH_SEND_LOOP_DURATION.with_label_values(&[labels[0], step]);
++        Self {
++            pending_requests: TIKV_BATCH_PENDING_REQUESTS.with_label_values(&labels),
++            batch_size: TIKV_BATCH_REQUESTS.with_label_values(&labels),
++            send_loop_wait_head: send_loop("wait-head"),
++            send_loop_wait_more: send_loop("wait-more"),
++            send_loop_send: send_loop("send"),
++            send_tail: TIKV_BATCH_SEND_TAIL_LATENCY.with_label_values(&labels),
++            head_arrival_interval: TIKV_BATCH_HEAD_ARRIVAL_INTERVAL.with_label_values(&labels),
++            more_requests: TIKV_BATCH_MORE_REQUESTS.with_label_values(&labels),
++            best_batch_size: TIKV_BATCH_BEST_SIZE.with_label_values(&labels),
++            target,
++        }
++    }
+ 
+-pub(crate) fn observe_batch_send_tail(target: &str, duration: Duration) {
+-    TIKV_BATCH_SEND_TAIL_LATENCY
+-        .with_label_values(&[target])
+-        .observe(duration_to_sec(duration));
+-}
++    /// The target whose observers these are.
++    pub(crate) fn target(&self) -> &str {
++        &self.target
++    }
+ 
+-pub(crate) fn observe_batch_pending_requests(target: &str, count: usize) {
+-    TIKV_BATCH_PENDING_REQUESTS
+-        .with_label_values(&[target])
+-        .observe(count as f64);
+-}
++    pub(crate) fn observe_pending_requests(&self, count: usize) {
++        self.pending_requests.observe(count as f64);
++    }
+ 
+-pub(crate) fn observe_batch_requests(target: &str, count: usize) {
+-    TIKV_BATCH_REQUESTS
+-        .with_label_values(&[target])
+-        .observe(count as f64);
+-}
++    pub(crate) fn observe_batch_size(&self, count: usize) {
++        self.batch_size.observe(count as f64);
++    }
+ 
+-pub(crate) fn observe_batch_head_arrival_interval(target: &str, interval: Duration) {
+-    TIKV_BATCH_HEAD_ARRIVAL_INTERVAL
+-        .with_label_values(&[target])
+-        .observe(duration_to_sec(interval));
+-}
++    pub(crate) fn observe_send_loop_wait_head(&self, duration: Duration) {
++        self.send_loop_wait_head.observe(duration_to_sec(duration));
++    }
+ 
+-pub(crate) fn observe_batch_best_size(target: &str, size: f64) {
+-    TIKV_BATCH_BEST_SIZE
+-        .with_label_values(&[target])
+-        .observe(size);
+-}
++    pub(crate) fn observe_send_loop_wait_more(&self, duration: Duration) {
++        self.send_loop_wait_more.observe(duration_to_sec(duration));
++    }
++
++    pub(crate) fn observe_send_loop_send(&self, duration: Duration) {
++        self.send_loop_send.observe(duration_to_sec(duration));
++    }
++
++    pub(crate) fn observe_send_tail(&self, duration: Duration) {
++        self.send_tail.observe(duration_to_sec(duration));
++    }
++
++    pub(crate) fn observe_head_arrival_interval(&self, interval: Duration) {
++        self.head_arrival_interval
++            .observe(duration_to_sec(interval));
++    }
++
++    pub(crate) fn observe_more_requests(&self, count: usize) {
++        self.more_requests.observe(count as f64);
++    }
+ 
+-pub(crate) fn observe_batch_more_requests(target: &str, count: usize) {
+-    TIKV_BATCH_MORE_REQUESTS
+-        .with_label_values(&[target])
+-        .observe(count as f64);
++    pub(crate) fn observe_best_batch_size(&self, size: f64) {
++        self.best_batch_size.observe(size);
++    }
+ }
+ 
+ pub(crate) fn increment_batch_wait_overload() {
+diff --git a/src/store/batch.rs b/src/store/batch.rs
+index 9a32822c..be83ea32 100644
+--- a/src/store/batch.rs
++++ b/src/store/batch.rs
+@@ -5,6 +5,7 @@
+ //! publication, response retirement, stream supervision, forwarding-host
+ //! isolation, recovery epochs, and connection-local admission live together.
+ 
++use arc_swap::ArcSwapOption;
+ use std::collections::HashMap;
+ use std::panic::AssertUnwindSafe;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+@@ -30,11 +31,8 @@ use super::BatchCommandResponse;
+ use crate::async_util::Cancellation;
+ use crate::retry::{RetryBackoffer, BO_TIKV_RPC};
+ use crate::stats::{
+-    increment_batch_stream_request_counter, observe_batch_best_size, observe_batch_client_recycle,
+-    observe_batch_client_unavailable, observe_batch_client_wait_establish,
+-    observe_batch_head_arrival_interval, observe_batch_more_requests,
+-    observe_batch_pending_requests, observe_batch_requests, observe_batch_send_loop,
+-    observe_batch_send_tail, observe_batch_stream_recv_loop, observe_batch_stream_tail,
++    observe_batch_client_recycle, observe_batch_client_unavailable,
++    observe_batch_client_wait_establish, BatchConnMetrics, BatchStreamMetrics,
+     BatchStreamRequestCounter, BatchStreamTailKind,
+ };
+ use crate::{Error, Result};
+@@ -386,6 +384,15 @@ enum BatchRequestOutcome {
+ }
+ 
+ impl BatchRequestOutcome {
++    /// Every outcome, in declaration order (`outcome as usize`).
++    const ALL: [Self; 5] = [
++        Self::Ok,
++        Self::Timeout,
++        Self::Cancelled,
++        Self::Failed,
++        Self::Closed,
++    ];
++
+     fn from_error(error: Option<&Error>) -> Self {
+         let Some(error) = error else {
+             return Self::Ok;
+@@ -424,6 +431,50 @@ struct BatchRequestObservation {
+     duration: Duration,
+ }
+ 
++/// client-go `batchRequestStageMetrics`: the request-stage observers of one
++/// store, resolved once for the store (`newStoreMetrics`) instead of on every
++/// observation.
++pub(crate) struct BatchRequestStageMetrics {
++    store_id: u64,
++    /// `batch_wait`, `send_wait` and `recv_wait`, each by outcome.
++    waits: [[crate::metrics::ClientGoObserver; 5]; 3],
++    /// `done` is observed only for an ok outcome.
++    done_ok: crate::metrics::ClientGoObserver,
++}
++
++impl BatchRequestStageMetrics {
++    pub(crate) fn new(store_id: u64) -> Self {
++        let store = store_id.to_string();
++        let observer = |stage: BatchRequestStage, outcome: BatchRequestOutcome| {
++            crate::stats::batch_request_stage_observer(&store, stage.as_str(), outcome.as_str())
++        };
++        let waits = |stage| BatchRequestOutcome::ALL.map(|outcome| observer(stage, outcome));
++        Self {
++            store_id,
++            waits: [
++                waits(BatchRequestStage::BatchWait),
++                waits(BatchRequestStage::SendWait),
++                waits(BatchRequestStage::RecvWait),
++            ],
++            done_ok: observer(BatchRequestStage::Done, BatchRequestOutcome::Ok),
++        }
++    }
++
++    fn observe(&self, observation: &BatchRequestObservation) {
++        let stage = match observation.stage {
++            BatchRequestStage::BatchWait => 0,
++            BatchRequestStage::SendWait => 1,
++            BatchRequestStage::RecvWait => 2,
++            BatchRequestStage::Done => {
++                debug_assert_eq!(observation.outcome, BatchRequestOutcome::Ok);
++                self.done_ok.observe(observation.duration.as_secs_f64());
++                return;
++            }
++        };
++        self.waits[stage][observation.outcome as usize].observe(observation.duration.as_secs_f64());
++    }
++}
++
+ struct BatchRequestSendState {
+     batch_size: usize,
+     send_started_at: Instant,
+@@ -441,7 +492,7 @@ struct BatchRequestPublishedState {
+ /// response/failure retirement. It is the owned Rust form of client-go's
+ /// `batchCommandsEntry` plus `batchCommandsRequestState` atomics.
+ pub(crate) struct BatchRequestTelemetry {
+-    store_id: u64,
++    stage_metrics: Arc<BatchRequestStageMetrics>,
+     arrived_at: Instant,
+     selected_after_arrival_ns: AtomicU64,
+     send_state: Mutex<Option<Arc<BatchRequestSendState>>>,
+@@ -454,8 +505,20 @@ pub(crate) struct BatchRequestTelemetry {
+ 
+ impl BatchRequestTelemetry {
+     pub(crate) fn new(store_id: u64, arrived_at: Instant) -> Self {
++        Self::with_stage_metrics(
++            Arc::new(BatchRequestStageMetrics::new(store_id)),
++            arrived_at,
++        )
++    }
++
++    /// A request whose stages report to `stage_metrics`, its store's
++    /// observers.
++    pub(crate) fn with_stage_metrics(
++        stage_metrics: Arc<BatchRequestStageMetrics>,
++        arrived_at: Instant,
++    ) -> Self {
+         Self {
+-            store_id,
++            stage_metrics,
+             arrived_at,
+             selected_after_arrival_ns: AtomicU64::new(0),
+             send_state: Mutex::new(None),
+@@ -814,12 +877,7 @@ impl BatchRequestTelemetry {
+         }
+         let outcome = BatchRequestOutcome::from_error(error);
+         for observation in self.observations(outcome, Instant::now()) {
+-            crate::stats::observe_batch_request_stage(
+-                self.store_id,
+-                observation.stage.as_str(),
+-                observation.outcome.as_str(),
+-                observation.duration,
+-            );
++            self.stage_metrics.observe(&observation);
+         }
+     }
+ }
+@@ -1038,16 +1096,24 @@ impl BatchCommandGroup {
+         target: &str,
+         connection_index: usize,
+     ) -> Result<()> {
++        let metrics = Arc::new(BatchStreamMetrics::new(
++            target,
++            connection_index,
++            !self.forwarded_host.is_empty(),
++        ));
+         self.publish_with_progress(
+             pending,
+             outbound,
+             target,
+             connection_index,
+             Arc::new(BatchStreamProgress::default()),
++            &metrics,
+         )
+         .await
+     }
+ 
++    /// Publishes the group on the stream whose observers and counters are
++    /// `metrics`.
+     async fn publish_with_progress(
+         mut self,
+         pending: &BatchPendingResponses,
+@@ -1055,6 +1121,7 @@ impl BatchCommandGroup {
+         target: &str,
+         connection_index: usize,
+         progress: Arc<BatchStreamProgress>,
++        metrics: &Arc<BatchStreamMetrics>,
+     ) -> Result<()> {
+         assert_eq!(
+             self.request.request_ids.len(),
+@@ -1083,22 +1150,13 @@ impl BatchCommandGroup {
+                 entry.response_sender,
+                 entry.telemetry,
+                 Some(BatchStreamMetricLabels {
++                    connection_index,
+                     progress: progress.clone(),
+-                    ..BatchStreamMetricLabels::new(
+-                        target.to_owned(),
+-                        connection_index,
+-                        !self.forwarded_host.is_empty(),
+-                    )
++                    metrics: Arc::clone(metrics),
+                 }),
+             );
+         }
+-        increment_batch_stream_request_counter(
+-            target,
+-            connection_index,
+-            !self.forwarded_host.is_empty(),
+-            BatchStreamRequestCounter::Tracked,
+-            ids.len(),
+-        );
++        metrics.increment(BatchStreamRequestCounter::Tracked, ids.len());
+         self.request.client_send_time_ns = std::time::SystemTime::now()
+             .duration_since(std::time::UNIX_EPOCH)
+             .map_or(0, |duration| {
+@@ -1155,7 +1213,13 @@ impl BatchCommandsWorker {
+         forwarded_host: impl Into<String>,
+         deadline: tokio::time::Instant,
+     ) -> Result<BatchCommandSubmission> {
+-        let (entry, submission) = BatchCommandsBuilder::entry(request, priority, forwarded_host);
++        let stage_metrics = self.dispatcher.stage_metrics(request.store_id());
++        let (entry, submission) = BatchCommandsBuilder::entry_with_stage_metrics(
++            request,
++            priority,
++            forwarded_host,
++            stage_metrics,
++        );
+         if self.dispatcher.cancellation.is_cancelled() {
+             entry.fail(|| Error::StringError("batch client closed".to_owned()));
+             return Ok(submission);
+@@ -1188,7 +1252,13 @@ impl BatchCommandsWorker {
+         priority: u64,
+         forwarded_host: impl Into<String>,
+     ) -> BatchCommandSubmission {
+-        let (entry, submission) = BatchCommandsBuilder::entry(request, priority, forwarded_host);
++        let stage_metrics = self.dispatcher.stage_metrics(request.store_id());
++        let (entry, submission) = BatchCommandsBuilder::entry_with_stage_metrics(
++            request,
++            priority,
++            forwarded_host,
++            stage_metrics,
++        );
+         if self.dispatcher.cancellation.is_cancelled() {
+             entry.fail(|| Error::StringError("batch client closed".to_owned()));
+             return submission;
+@@ -1462,7 +1532,9 @@ where
+ {
+     use futures::StreamExt;
+ 
+-    let forwarded = !forwarded_host.is_empty();
++    // client-go `initBatchCommandsClientMetrics`: the stream's observers
++    // and counters, resolved once for its labels.
++    let metrics = BatchStreamMetrics::new(target, connection_index, !forwarded_host.is_empty());
+     let mut last_canceled_entry_log_time = None;
+     loop {
+         let receive_started = Instant::now();
+@@ -1471,21 +1543,9 @@ where
+             response = responses.next() => response,
+         };
+         let receive_duration = receive_started.elapsed();
+-        observe_batch_stream_recv_loop(
+-            target,
+-            connection_index,
+-            forwarded,
+-            "recv",
+-            receive_duration,
+-        );
++        metrics.observe_recv_loop_recv(receive_duration);
+         if receive_duration > BATCH_RECV_TAIL_LATENCY_THRESHOLD {
+-            observe_batch_stream_tail(
+-                target,
+-                connection_index,
+-                forwarded,
+-                BatchStreamTailKind::Receive,
+-                receive_duration,
+-            );
++            metrics.observe_tail(BatchStreamTailKind::Receive, receive_duration);
+         }
+         let Some(response) = response else {
+             return BatchReceiveLoopExit::Failed(Error::StringError(
+@@ -1504,10 +1564,7 @@ where
+                             elapsed_since_epoch.saturating_sub(tikv_send_time);
+                         one_way_delay = estimated_one_way_delay;
+                         if estimated_one_way_delay > BATCH_RECV_TAIL_LATENCY_THRESHOLD / 2 {
+-                            observe_batch_stream_tail(
+-                                target,
+-                                connection_index,
+-                                forwarded,
++                            metrics.observe_tail(
+                                 BatchStreamTailKind::TikvSend,
+                                 estimated_one_way_delay,
+                             );
+@@ -1539,22 +1596,10 @@ where
+                     if summary.transport_layer_load > 0 {
+                         transport_layer_load.store(summary.transport_layer_load, Ordering::Release);
+                     }
+-                    increment_batch_stream_request_counter(
+-                        target,
+-                        connection_index,
+-                        forwarded,
+-                        BatchStreamRequestCounter::Outdated,
+-                        summary.outdated,
+-                    );
++                    metrics.increment(BatchStreamRequestCounter::Outdated, summary.outdated);
+                 }
+                 if let Err(error) = result {
+-                    increment_batch_stream_request_counter(
+-                        target,
+-                        connection_index,
+-                        forwarded,
+-                        BatchStreamRequestCounter::Outdated,
+-                        error.summary.outdated,
+-                    );
++                    metrics.increment(BatchStreamRequestCounter::Outdated, error.summary.outdated);
+                     // client-go indexes the response slice while iterating
+                     // request IDs. A short response therefore panics only
+                     // after delivering its valid prefix; the outer receive
+@@ -1562,13 +1607,7 @@ where
+                     // same stream without retiring the remaining entries.
+                     panic!("{error}");
+                 }
+-                observe_batch_stream_recv_loop(
+-                    target,
+-                    connection_index,
+-                    forwarded,
+-                    "process",
+-                    process_started.elapsed(),
+-                );
++                metrics.observe_recv_loop_process(process_started.elapsed());
+             }
+             Err(status) => {
+                 return BatchReceiveLoopExit::Failed(Error::GrpcAPI(status));
+@@ -1640,6 +1679,9 @@ pub(crate) struct BatchCommandsStream {
+     target: String,
+     connection_index: usize,
+     progress: Arc<BatchStreamProgress>,
++    /// client-go `batchCommandsClientMetrics`: the stream's request counters,
++    /// shared by every request it publishes.
++    metrics: Arc<BatchStreamMetrics>,
+     pending: Arc<BatchPendingResponses>,
+     state: Arc<AsyncMutex<BatchStreamState>>,
+     ready: Arc<tokio::sync::Notify>,
+@@ -1713,11 +1755,17 @@ impl BatchCommandsStream {
+             event_listener,
+             responses,
+         ));
++        let metrics = Arc::new(BatchStreamMetrics::new(
++            &target,
++            connection_index,
++            !forwarded_host.is_empty(),
++        ));
+         Ok(Self {
+             forwarded_host,
+             target,
+             connection_index,
+             progress,
++            metrics,
+             pending,
+             state,
+             ready,
+@@ -1902,6 +1950,7 @@ impl BatchCommandsStream {
+                         &self.target,
+                         self.connection_index,
+                         self.progress.clone(),
++                        &self.metrics,
+                     )
+                     .await;
+             }
+@@ -1944,6 +1993,12 @@ pub(crate) struct BatchCommandsDispatcher {
+     max_concurrency_request_limit: usize,
+     cancellation: Cancellation,
+     transport_layer_load: Arc<AtomicU64>,
++    /// client-go `connPool.metrics`: the request-stage observers of the store
++    /// the last request named, replaced when a request names another store.
++    stage_metrics: ArcSwapOption<BatchRequestStageMetrics>,
++    /// client-go `batchConn.metrics`: the send-loop observers of the
++    /// connection's target.
++    conn_metrics: ArcSwapOption<BatchConnMetrics>,
+     #[cfg(test)]
+     panic_next_send_loop: AtomicBool,
+     #[cfg(test)]
+@@ -2066,26 +2121,23 @@ impl BatchCommandsDispatcher {
+                         if dispatcher.panic_after_collect.swap(false, Ordering::AcqRel) {
+                             panic!("source batch-send-loop post-collect panic injection");
+                         }
+-                        let target = dispatcher.client.batch_metric_target();
++                        let metrics = dispatcher.conn_metrics();
+                         let head_received_at =
+                             collector.last_head_received_at.unwrap_or(send_loop_started);
+-                        observe_batch_pending_requests(&target, receiver.len() + collected.len());
+-                        observe_batch_best_size(&target, policy.average_batch_wait_size);
+-                        observe_batch_head_arrival_interval(
+-                            &target,
++                        metrics.observe_pending_requests(receiver.len() + collected.len());
++                        metrics.observe_best_batch_size(policy.average_batch_wait_size);
++                        metrics.observe_head_arrival_interval(
+                             collector.last_head_arrival_interval.unwrap_or_default(),
+                         );
+-                        observe_batch_send_loop(
+-                            &target,
+-                            "wait-head",
++                        metrics.observe_send_loop_wait_head(
+                             head_received_at.saturating_duration_since(send_loop_started),
+                         );
+-                        observe_batch_send_loop(&target, "wait-more", send_loop_started.elapsed());
++                        metrics.observe_send_loop_wait_more(send_loop_started.elapsed());
+                         if collector.last_waited_for_overload {
+                             crate::stats::increment_batch_wait_overload();
+                         }
+                         if let Some(extra) = collector.last_extra_fetched {
+-                            observe_batch_more_requests(&target, extra);
++                            metrics.observe_more_requests(extra);
+                         }
+                         let entries = collected.entries.take(collected.len());
+                         {
+@@ -2095,10 +2147,10 @@ impl BatchCommandsDispatcher {
+                             }
+                         }
+                         let _ = dispatcher.flush().await;
+-                        observe_batch_send_loop(&target, "send", send_loop_started.elapsed());
++                        metrics.observe_send_loop_send(send_loop_started.elapsed());
+                         let send_tail = head_received_at.elapsed();
+                         if send_tail > BATCH_SEND_TAIL_LATENCY_THRESHOLD {
+-                            observe_batch_send_tail(&target, send_tail);
++                            metrics.observe_send_tail(send_tail);
+                         }
+                         let now = Instant::now();
+                         if now.duration_since(last_pending_inspect_at)
+@@ -2148,6 +2200,8 @@ impl BatchCommandsDispatcher {
+             max_concurrency_request_limit,
+             cancellation: Cancellation::default(),
+             transport_layer_load: Arc::new(AtomicU64::new(0)),
++            stage_metrics: ArcSwapOption::empty(),
++            conn_metrics: ArcSwapOption::empty(),
+             #[cfg(test)]
+             panic_next_send_loop: AtomicBool::new(false),
+             #[cfg(test)]
+@@ -2155,6 +2209,33 @@ impl BatchCommandsDispatcher {
+         }
+     }
+ 
++    /// client-go `connPool.getStoreMetrics`: the request-stage observers of
++    /// `store_id`. A pooled target may serve a replacement store ID, so a
++    /// request naming another store replaces the cached observers.
++    fn stage_metrics(&self, store_id: u64) -> Arc<BatchRequestStageMetrics> {
++        if let Some(metrics) = self.stage_metrics.load_full() {
++            if metrics.store_id == store_id {
++                return metrics;
++            }
++        }
++        let metrics = Arc::new(BatchRequestStageMetrics::new(store_id));
++        self.stage_metrics.store(Some(Arc::clone(&metrics)));
++        metrics
++    }
++
++    /// The send-loop observers of the connection's current metric target.
++    fn conn_metrics(&self) -> Arc<BatchConnMetrics> {
++        let target = self.client.batch_metric_target();
++        if let Some(metrics) = self.conn_metrics.load_full() {
++            if metrics.target() == target {
++                return metrics;
++            }
++        }
++        let metrics = Arc::new(BatchConnMetrics::new(target));
++        self.conn_metrics.store(Some(Arc::clone(&metrics)));
++        metrics
++    }
++
+     pub(crate) fn enqueue(
+         &self,
+         request: BatchCommandRequest,
+@@ -2263,7 +2344,7 @@ impl BatchCommandsDispatcher {
+             }
+         }
+         if published != 0 {
+-            observe_batch_requests(&self.client.batch_metric_target(), published);
++            self.conn_metrics().observe_batch_size(published);
+         }
+         first_error.map_or(Ok(published), Err)
+     }
+@@ -2401,11 +2482,23 @@ impl BatchCommandsBuilder {
+         request: BatchCommandRequest,
+         priority: u64,
+         forwarded_host: impl Into<String>,
++    ) -> (BatchCommandEntry, BatchCommandSubmission) {
++        let stage_metrics = Arc::new(BatchRequestStageMetrics::new(request.store_id()));
++        Self::entry_with_stage_metrics(request, priority, forwarded_host, stage_metrics)
++    }
++
++    /// [`Self::entry`] for a request whose store's stage observers the caller
++    /// already resolved.
++    fn entry_with_stage_metrics(
++        request: BatchCommandRequest,
++        priority: u64,
++        forwarded_host: impl Into<String>,
++        stage_metrics: Arc<BatchRequestStageMetrics>,
+     ) -> (BatchCommandEntry, BatchCommandSubmission) {
+         let cancellation = Arc::new(AtomicBool::new(false));
+         let (response_sender, response) = oneshot::channel();
+         let arrived_at = Instant::now();
+-        let mut telemetry = BatchRequestTelemetry::new(request.store_id(), arrived_at);
++        let mut telemetry = BatchRequestTelemetry::with_stage_metrics(stage_metrics, arrived_at);
+         telemetry.client_spans = crate::trace::current_client_span_context();
+         let telemetry = Arc::new(telemetry);
+         let entry = BatchCommandEntry {
+@@ -3104,6 +3197,36 @@ mod tests {
+         assert_eq!(pending.len(), 1);
+     }
+ 
++    /// client-go `connPool.getStoreMetrics`: a store's request-stage
++    /// observers are resolved once and kept until a request names another
++    /// store, and a request's stages still report under its store's labels.
++    #[tokio::test]
++    async fn a_dispatcher_resolves_a_stores_stage_observers_once() {
++        const STORE: u64 = 9_025_001;
++        let client = KvRpcClient::new(
++            vec![TikvClient::new(
++                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
++            )],
++            Duration::from_secs(1),
++        );
++        let dispatcher = BatchCommandsDispatcher::new(client, 1);
++        let first = dispatcher.stage_metrics(STORE);
++        assert!(Arc::ptr_eq(&first, &dispatcher.stage_metrics(STORE)));
++        let other = dispatcher.stage_metrics(STORE + 1);
++        assert!(!Arc::ptr_eq(&first, &other));
++        assert_eq!(other.store_id, STORE + 1);
++
++        let batch_wait_ok = || {
++            crate::stats::batch_request_stage_observer(&STORE.to_string(), "batch_wait", "ok")
++                .sample_count()
++        };
++        let before = batch_wait_ok();
++        let telemetry = BatchRequestTelemetry::with_stage_metrics(first, Instant::now());
++        telemetry.mark_selected(Instant::now());
++        telemetry.complete(Some(&Error::StringError("batch client closed".to_owned())));
++        assert_eq!(batch_wait_ok(), before + 1);
++    }
++
+     #[tokio::test]
+     async fn source_request_deadline_includes_waiting_for_queue_capacity() {
+         let client = KvRpcClient::new(
+@@ -4270,6 +4393,7 @@ mod tests {
+             target: "fast-fail".to_owned(),
+             connection_index: 0,
+             progress: Arc::new(BatchStreamProgress::default()),
++            metrics: Arc::new(BatchStreamMetrics::new("fast-fail", 0, false)),
+             pending,
+             state: Arc::new(AsyncMutex::new(BatchStreamState { outbound: None })),
+             ready: Arc::new(tokio::sync::Notify::new()),
+diff --git a/src/store/command.rs b/src/store/command.rs
+index 277882de..97d6a7aa 100644
+--- a/src/store/command.rs
++++ b/src/store/command.rs
+@@ -6,10 +6,7 @@
+ //! modules.
+ 
+ use crate::proto::{coprocessor, kvrpcpb, tikvpb};
+-use crate::stats::{
+-    increment_batch_stream_request_counter, observe_batch_stream_tail, BatchStreamRequestCounter,
+-    BatchStreamTailKind,
+-};
++use crate::stats::{BatchStreamMetrics, BatchStreamRequestCounter, BatchStreamTailKind};
+ use crate::{Error, Result};
+ use std::any::Any;
+ use std::collections::HashMap;
+@@ -348,41 +345,33 @@ struct BatchPendingResponse {
+ /// source counter labels without guessing from a later stream failure.
+ #[derive(Clone)]
+ pub(crate) struct BatchStreamMetricLabels {
+-    pub(crate) target: String,
+     pub(crate) connection_index: usize,
+-    pub(crate) forwarded: bool,
+     pub(crate) progress: Arc<BatchStreamProgress>,
++    /// The owning stream's observers and counters.
++    pub(crate) metrics: Arc<BatchStreamMetrics>,
+ }
+ 
+ impl BatchStreamMetricLabels {
+     pub(crate) fn new(target: String, connection_index: usize, forwarded: bool) -> Self {
+         Self {
+-            target,
+             connection_index,
+-            forwarded,
+             progress: Arc::new(BatchStreamProgress::default()),
++            metrics: Arc::new(BatchStreamMetrics::new(
++                &target,
++                connection_index,
++                forwarded,
++            )),
+         }
+     }
+ 
+     fn increment(&self, counter: BatchStreamRequestCounter) {
+-        increment_batch_stream_request_counter(
+-            &self.target,
+-            self.connection_index,
+-            self.forwarded,
+-            counter,
+-            1,
+-        );
++        self.metrics.increment(counter, 1);
+     }
+ 
+     fn observe_cancelled_entry_tail(&self, telemetry: &BatchRequestTelemetry) {
+         if let Some(duration) = telemetry.cancelled_response_tail() {
+-            observe_batch_stream_tail(
+-                &self.target,
+-                self.connection_index,
+-                self.forwarded,
+-                BatchStreamTailKind::CancelledEntry,
+-                duration,
+-            );
++            self.metrics
++                .observe_tail(BatchStreamTailKind::CancelledEntry, duration);
+         }
+     }
+ }
