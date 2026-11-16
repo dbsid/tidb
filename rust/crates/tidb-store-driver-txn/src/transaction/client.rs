@@ -80,6 +80,91 @@ pub struct SnapshotGetResult {
 }
 use tidb_txnkv::kv_storage::SnapshotScanRegion;
 
+/// The read settings a statement's [`tidb_txnkv::SnapshotReadOptions`]
+/// carry, on a client transaction or a client snapshot alike.
+pub(crate) trait SnapshotReadSettings {
+    fn set_replica_read(&mut self, read_type: tikv_client::ReplicaReadType);
+    fn set_stale_read(&mut self, stale_read: bool);
+    fn set_isolation_level(&mut self, level: tikv_client::proto::kvrpcpb::IsolationLevel);
+    fn set_read_replica_scope(&mut self, scope: &str);
+    fn set_match_store_labels(&mut self, labels: Vec<tikv_client::proto::metapb::StoreLabel>);
+    fn set_snapshot_read_timeout(&mut self, timeout: Duration);
+    fn set_snapshot_resource_group_name(&mut self, name: Option<String>);
+    fn set_load_based_replica_read_threshold(&mut self, busy_threshold: Duration);
+    fn set_replica_read_adjuster(&mut self, adjuster: tikv_client::ReplicaReadAdjuster);
+}
+
+impl<S: PdClient> SnapshotReadSettings for tikv_client::Transaction<S> {
+    fn set_replica_read(&mut self, read_type: tikv_client::ReplicaReadType) {
+        tikv_client::Transaction::set_replica_read(self, read_type);
+    }
+    fn set_stale_read(&mut self, stale_read: bool) {
+        tikv_client::Transaction::set_stale_read(self, stale_read);
+    }
+    fn set_isolation_level(&mut self, level: tikv_client::proto::kvrpcpb::IsolationLevel) {
+        tikv_client::Transaction::set_isolation_level(self, level);
+    }
+    fn set_read_replica_scope(&mut self, scope: &str) {
+        tikv_client::Transaction::set_read_replica_scope(self, scope);
+    }
+    fn set_match_store_labels(&mut self, labels: Vec<tikv_client::proto::metapb::StoreLabel>) {
+        tikv_client::Transaction::set_match_store_labels(self, labels);
+    }
+    fn set_snapshot_read_timeout(&mut self, timeout: Duration) {
+        tikv_client::Transaction::set_snapshot_read_timeout(self, timeout);
+    }
+    fn set_snapshot_resource_group_name(&mut self, name: Option<String>) {
+        tikv_client::Transaction::set_snapshot_resource_group_name(self, name);
+    }
+    fn set_load_based_replica_read_threshold(&mut self, busy_threshold: Duration) {
+        tikv_client::Transaction::set_load_based_replica_read_threshold(self, busy_threshold);
+    }
+    fn set_replica_read_adjuster(&mut self, adjuster: tikv_client::ReplicaReadAdjuster) {
+        tikv_client::Transaction::set_replica_read_adjuster(self, adjuster);
+    }
+}
+
+impl<S: PdClient> SnapshotReadSettings for tikv_client::KvSnapshot<S> {
+    fn set_replica_read(&mut self, read_type: tikv_client::ReplicaReadType) {
+        tikv_client::KvSnapshot::set_replica_read(self, read_type);
+    }
+    fn set_stale_read(&mut self, stale_read: bool) {
+        tikv_client::KvSnapshot::set_stale_read(self, stale_read);
+    }
+    fn set_isolation_level(&mut self, level: tikv_client::proto::kvrpcpb::IsolationLevel) {
+        tikv_client::KvSnapshot::set_isolation_level(self, level);
+    }
+    fn set_read_replica_scope(&mut self, scope: &str) {
+        tikv_client::KvSnapshot::set_read_replica_scope(self, scope);
+    }
+    fn set_match_store_labels(&mut self, labels: Vec<tikv_client::proto::metapb::StoreLabel>) {
+        tikv_client::KvSnapshot::set_match_store_labels(self, labels);
+    }
+    fn set_snapshot_read_timeout(&mut self, timeout: Duration) {
+        tikv_client::KvSnapshot::set_snapshot_read_timeout(self, timeout);
+    }
+    fn set_snapshot_resource_group_name(&mut self, name: Option<String>) {
+        tikv_client::KvSnapshot::set_snapshot_resource_group_name(self, name);
+    }
+    fn set_load_based_replica_read_threshold(&mut self, busy_threshold: Duration) {
+        tikv_client::KvSnapshot::set_load_based_replica_read_threshold(self, busy_threshold);
+    }
+    fn set_replica_read_adjuster(&mut self, adjuster: tikv_client::ReplicaReadAdjuster) {
+        tikv_client::KvSnapshot::set_replica_read_adjuster(self, adjuster);
+    }
+}
+
+/// A statement's resource-group tagger as the client runs it on each
+/// request (Go `ResourceGroupTagger(req)`).
+pub(crate) fn client_resource_group_tagger(
+    tagger: &tidb_txnkv::StatementResourceGroupTagger,
+) -> tikv_client::TransactionResourceGroupTagger {
+    let tagger = Arc::clone(tagger);
+    Arc::new(move |request: &mut dyn tikv_client::tikv::Request| {
+        tagger().build(Some(&mut tidb_txnkv::ClientRequest(request)));
+    })
+}
+
 impl<S: PdClient> tidb_txnkv::new_txn::TxnResourceGroup for TikvTxn<S> {
     fn set_resource_group_name(&mut self, name: &str) {
         self.engine.transaction_mut().set_resource_group_name(name);
@@ -269,15 +354,10 @@ impl<S: PdClient> TikvTxn<S> {
             let pipelined =
                 applied.is_some() && self.engine.transaction_mut().inner_mut().is_pipelined();
             if !pipelined && !applied.is_some_and(|applied| Arc::ptr_eq(applied, tagger)) {
-                let tagger = Arc::clone(tagger);
                 self.engine
                     .transaction_mut()
                     .inner_mut()
-                    .set_resource_group_tagger(Some(Arc::new(
-                        move |request: &mut dyn tikv_client::tikv::Request| {
-                            tagger().build(Some(&mut tidb_txnkv::ClientRequest(request)));
-                        },
-                    )));
+                    .set_resource_group_tagger(Some(client_resource_group_tagger(tagger)));
             }
         }
         // Go `txn.SetOption(kv.RequestSourceType, ...)` per statement
@@ -437,7 +517,7 @@ impl<S: PdClient> TikvTxn<S> {
             error => Self::read_error(error),
         }
     }
-    fn client_read_error(error: tikv_client::Error) -> OptimisticCoordinatorError {
+    pub(crate) fn client_read_error(error: tikv_client::Error) -> OptimisticCoordinatorError {
         // client-go `KVSnapshot`'s `CheckVisibility` failure keeps its own
         // identity, so Go's `ToTiDBErr` gives it `ErrTxnAbortedByGC`.
         if let tikv_client::Error::TransactionAbortedByGc(_) = &error {
@@ -470,8 +550,10 @@ impl<S: PdClient> TikvTxn<S> {
         self.snapshot_read_options = Some(options.clone());
     }
 
-    fn apply_snapshot_read_options(
-        transaction: &mut tikv_client::Transaction<S>,
+    /// Sets a statement's read options on a transaction's or a store's
+    /// snapshot (Go `SetOption` on a `kv.Snapshot`).
+    pub(crate) fn apply_snapshot_read_options(
+        transaction: &mut impl SnapshotReadSettings,
         options: &tidb_txnkv::SnapshotReadOptions,
     ) {
         use tikv_client::{ReplicaReadAdjustment, ReplicaReadSelectorOption, ReplicaReadType};
