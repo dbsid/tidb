@@ -1,6 +1,7 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -819,55 +820,196 @@ pub(crate) fn grpc_connection_state(connection_id: &str, store_ip: &str, state: 
         .get()
 }
 
-/// Records client-go's per-store request histogram, source-dimensional
-/// summary, and client-minus-server network latency observation. The source
-/// summary has no configured quantiles; the shared registry preserves its
-/// summary count/sum exposition without adding histogram buckets.
-pub(crate) fn observe_tikv_store_rpc(
-    request: &dyn crate::store::Request,
-    response: Option<&dyn std::any::Any>,
-    latency: Duration,
-) {
-    let context = request.tikv_context();
-    let store = context
-        .and_then(|context| context.peer.as_ref())
-        .map_or(0, |peer| peer.store_id)
-        .to_string();
-    let stale = context
-        .is_some_and(|context| context.stale_read)
-        .to_string();
-    let source = context.map_or("", |context| context.request_source.as_str());
-    let internal = source.starts_with("internal");
-    let scope = internal.to_string();
-    let command = crate::store::CommandType::from_request_label(request.label())
-        .map_or("Unknown", crate::store::CommandType::name);
-    let seconds = duration_to_sec(latency);
+/// client-go `rpcMetrics`: one store's send-request observers of a curried
+/// vector (by store, and for the summary also by source). The common
+/// non-stale, external Get, Cop and BatchGet observers are resolved up front
+/// (`deriveRPCMetrics`); every other request shape is resolved once, on first
+/// use, into a copy-on-write map (client-go `latOther`).
+struct RpcMetrics {
+    vec: &'static ClientObserverVec,
+    store: String,
+    /// The summary's `source` label, absent for the histogram.
+    source: Option<String>,
+    get: crate::metrics::ClientGoObserver,
+    cop: crate::metrics::ClientGoObserver,
+    batch_get: crate::metrics::ClientGoObserver,
+    other: arc_swap::ArcSwap<
+        std::collections::HashMap<(&'static str, bool, bool), crate::metrics::ClientGoObserver>,
+    >,
+}
 
-    TIKV_SEND_REQUEST_DURATION
-        .with_label_values(&[command, &store, &stale, &scope])
-        .observe(seconds);
-    TIKV_SEND_REQUEST_BY_SOURCE
-        .with_label_values(&[command, &store, &stale, &scope, source])
-        .observe(seconds);
+impl RpcMetrics {
+    fn new(vec: &'static ClientObserverVec, store: String, source: Option<String>) -> Self {
+        let common = |command: crate::store::CommandType| {
+            Self::resolve(vec, &store, source.as_deref(), command.name(), false, false)
+        };
+        Self {
+            get: common(crate::store::CommandType::Get),
+            cop: common(crate::store::CommandType::Coprocessor),
+            batch_get: common(crate::store::CommandType::BatchGet),
+            other: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            vec,
+            store,
+            source,
+        }
+    }
 
-    let Some(details) = response.and_then(crate::store::exec_details_v2) else {
-        return;
-    };
-    let total_rpc_wall_time_ns = details
-        .time_detail_v2
-        .as_ref()
-        .map(|time| time.total_rpc_wall_time_ns)
-        .or_else(|| {
-            details
-                .time_detail
-                .as_ref()
-                .map(|time| time.total_rpc_wall_time_ns)
-        })
-        .unwrap_or_default();
-    if total_rpc_wall_time_ns > 0 {
-        TIKV_RPC_NET_LATENCY
-            .with_label_values(&[&store, &scope])
-            .observe(seconds - total_rpc_wall_time_ns as f64 / 1_000_000_000.0);
+    fn resolve(
+        vec: &ClientObserverVec,
+        store: &str,
+        source: Option<&str>,
+        command: &str,
+        stale: bool,
+        internal: bool,
+    ) -> crate::metrics::ClientGoObserver {
+        let stale = if stale { "true" } else { "false" };
+        let scope = if internal { "true" } else { "false" };
+        match source {
+            Some(source) => vec.with_label_values(&[command, store, stale, scope, source]),
+            None => vec.with_label_values(&[command, store, stale, scope]),
+        }
+    }
+
+    /// client-go `rpcMetrics.get(cmd, stale, internal).Observe(seconds)`.
+    fn observe(
+        &self,
+        command: Option<crate::store::CommandType>,
+        stale: bool,
+        internal: bool,
+        seconds: f64,
+    ) {
+        if !stale && !internal {
+            let common = match command {
+                Some(crate::store::CommandType::Get) => Some(&self.get),
+                Some(crate::store::CommandType::Coprocessor) => Some(&self.cop),
+                Some(crate::store::CommandType::BatchGet) => Some(&self.batch_get),
+                _ => None,
+            };
+            if let Some(observer) = common {
+                observer.observe(seconds);
+                return;
+            }
+        }
+        let key = (
+            command.map_or("Unknown", crate::store::CommandType::name),
+            stale,
+            internal,
+        );
+        if let Some(observer) = self.other.load().get(&key) {
+            observer.observe(seconds);
+            return;
+        }
+        let observer = Self::resolve(
+            self.vec,
+            &self.store,
+            self.source.as_deref(),
+            key.0,
+            stale,
+            internal,
+        );
+        observer.observe(seconds);
+        self.other.rcu(|other| {
+            let mut other = std::collections::HashMap::clone(other);
+            other.insert(key, observer.clone());
+            other
+        });
+    }
+}
+
+/// client-go `storeMetrics`' send-request observers: one store's request
+/// histogram, source-dimensional summary and client-minus-server network
+/// latency, resolved once for the store instead of on every request. The
+/// source summary has no configured quantiles; the shared registry preserves
+/// its summary count/sum exposition without adding histogram buckets.
+pub(crate) struct StoreRpcMetrics {
+    store_id: u64,
+    /// client-go `rpcLatHist`.
+    send_request: RpcMetrics,
+    /// client-go `rpcSrcLatSum`, by request source.
+    by_source: arc_swap::ArcSwap<std::collections::HashMap<String, Arc<RpcMetrics>>>,
+    /// client-go `rpcNetLatExternal` and `rpcNetLatInternal`.
+    net_latency_external: crate::metrics::ClientGoObserver,
+    net_latency_internal: crate::metrics::ClientGoObserver,
+}
+
+impl StoreRpcMetrics {
+    pub(crate) fn new(store_id: u64) -> Self {
+        let store = store_id.to_string();
+        Self {
+            store_id,
+            send_request: RpcMetrics::new(&TIKV_SEND_REQUEST_DURATION, store.clone(), None),
+            by_source: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            net_latency_external: TIKV_RPC_NET_LATENCY.with_label_values(&[&store, "false"]),
+            net_latency_internal: TIKV_RPC_NET_LATENCY.with_label_values(&[&store, "true"]),
+        }
+    }
+
+    /// The store whose observers these are.
+    pub(crate) fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// client-go `storeMetrics.updateRPCMetrics`: records one request to this
+    /// store, which took `latency` and answered `response` (absent when it
+    /// failed).
+    pub(crate) fn observe(
+        &self,
+        request: &dyn crate::store::Request,
+        response: Option<&dyn std::any::Any>,
+        latency: Duration,
+    ) {
+        let context = request.tikv_context();
+        let stale = context.is_some_and(|context| context.stale_read);
+        let source = context.map_or("", |context| context.request_source.as_str());
+        let internal = source.starts_with("internal");
+        let command = crate::store::CommandType::from_request_label(request.label());
+        let seconds = duration_to_sec(latency);
+
+        self.send_request.observe(command, stale, internal, seconds);
+        self.source_metrics(source)
+            .observe(command, stale, internal, seconds);
+
+        let Some(details) = response.and_then(crate::store::exec_details_v2) else {
+            return;
+        };
+        let total_rpc_wall_time_ns = details
+            .time_detail_v2
+            .as_ref()
+            .map(|time| time.total_rpc_wall_time_ns)
+            .or_else(|| {
+                details
+                    .time_detail
+                    .as_ref()
+                    .map(|time| time.total_rpc_wall_time_ns)
+            })
+            .unwrap_or_default();
+        if total_rpc_wall_time_ns > 0 {
+            let net_latency = if internal {
+                &self.net_latency_internal
+            } else {
+                &self.net_latency_external
+            };
+            net_latency.observe(seconds - total_rpc_wall_time_ns as f64 / 1_000_000_000.0);
+        }
+    }
+
+    fn source_metrics(&self, source: &str) -> Arc<RpcMetrics> {
+        if let Some(metrics) = self.by_source.load().get(source) {
+            return Arc::clone(metrics);
+        }
+        let metrics = Arc::new(RpcMetrics::new(
+            &TIKV_SEND_REQUEST_BY_SOURCE,
+            self.store_id.to_string(),
+            Some(source.to_owned()),
+        ));
+        self.by_source.rcu(|by_source| {
+            let mut by_source = std::collections::HashMap::clone(by_source);
+            by_source
+                .entry(source.to_owned())
+                .or_insert_with(|| Arc::clone(&metrics));
+            by_source
+        });
+        metrics
     }
 }
 
@@ -1395,6 +1537,31 @@ mod tests {
         }
     }
 
+    /// The common request shapes (client-go `deriveRPCMetrics`' Get, Cop and
+    /// BatchGet) report under the same labels as every other shape.
+    #[test]
+    fn store_rpc_metrics_report_a_common_request_under_its_labels() {
+        let source = "external_metrics_common_unique";
+        let request = kvrpcpb::GetRequest {
+            context: Some(kvrpcpb::Context {
+                peer: Some(metapb::Peer {
+                    store_id: 987_655,
+                    ..Default::default()
+                }),
+                request_source: source.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before = tikv_store_rpc_samples("Get", "987655", "false", "false", source);
+        let metrics = StoreRpcMetrics::new(987_655);
+        metrics.observe(&request, None, Duration::from_millis(3));
+        metrics.observe(&request, None, Duration::from_millis(3));
+        let after = tikv_store_rpc_samples("Get", "987655", "false", "false", source);
+        assert_eq!(after.0, before.0 + 2);
+        assert_eq!(after.1, before.1 + 2);
+    }
+
     #[test]
     fn source_store_rpc_metrics_preserve_dimensions_and_net_latency() {
         let source = "internal_metrics_transport_unique";
@@ -1427,14 +1594,15 @@ mod tests {
         };
         let before = tikv_store_rpc_samples("Get", "987654", "true", "true", source);
 
-        observe_tikv_store_rpc(&request, Some(&response), Duration::from_millis(4));
+        let metrics = StoreRpcMetrics::new(987_654);
+        metrics.observe(&request, Some(&response), Duration::from_millis(4));
         let after_success = tikv_store_rpc_samples("Get", "987654", "true", "true", source);
         assert_eq!(after_success.0, before.0 + 1);
         assert_eq!(after_success.1, before.1 + 1);
         assert_eq!(after_success.2, before.2 + 1);
         assert!((after_success.3 - before.3 - 0.003).abs() < 1e-12);
 
-        observe_tikv_store_rpc(&request, None, Duration::from_millis(2));
+        metrics.observe(&request, None, Duration::from_millis(2));
         let after_failure = tikv_store_rpc_samples("Get", "987654", "true", "true", source);
         assert_eq!(after_failure.0, after_success.0 + 1);
         assert_eq!(after_failure.1, after_success.1 + 1);

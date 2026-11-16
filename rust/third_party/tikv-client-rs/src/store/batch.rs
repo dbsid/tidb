@@ -435,7 +435,6 @@ struct BatchRequestObservation {
 /// store, resolved once for the store (`newStoreMetrics`) instead of on every
 /// observation.
 pub(crate) struct BatchRequestStageMetrics {
-    store_id: u64,
     /// `batch_wait`, `send_wait` and `recv_wait`, each by outcome.
     waits: [[crate::metrics::ClientGoObserver; 5]; 3],
     /// `done` is observed only for an ok outcome.
@@ -450,7 +449,6 @@ impl BatchRequestStageMetrics {
         };
         let waits = |stage| BatchRequestOutcome::ALL.map(|outcome| observer(stage, outcome));
         Self {
-            store_id,
             waits: [
                 waits(BatchRequestStage::BatchWait),
                 waits(BatchRequestStage::SendWait),
@@ -1206,14 +1204,17 @@ pub(crate) struct BatchCommandsWorker {
 const BATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 impl BatchCommandsWorker {
+    /// Queues `request` for the send loop until `deadline`. Its stages report
+    /// to `stage_metrics`, its store's observers (client-go
+    /// `storeMetrics.batchReqStage`).
     pub(crate) async fn submit_until(
         &self,
         request: BatchCommandRequest,
         priority: u64,
         forwarded_host: impl Into<String>,
         deadline: tokio::time::Instant,
+        stage_metrics: Arc<BatchRequestStageMetrics>,
     ) -> Result<BatchCommandSubmission> {
-        let stage_metrics = self.dispatcher.stage_metrics(request.store_id());
         let (entry, submission) = BatchCommandsBuilder::entry_with_stage_metrics(
             request,
             priority,
@@ -1252,13 +1253,7 @@ impl BatchCommandsWorker {
         priority: u64,
         forwarded_host: impl Into<String>,
     ) -> BatchCommandSubmission {
-        let stage_metrics = self.dispatcher.stage_metrics(request.store_id());
-        let (entry, submission) = BatchCommandsBuilder::entry_with_stage_metrics(
-            request,
-            priority,
-            forwarded_host,
-            stage_metrics,
-        );
+        let (entry, submission) = BatchCommandsBuilder::entry(request, priority, forwarded_host);
         if self.dispatcher.cancellation.is_cancelled() {
             entry.fail(|| Error::StringError("batch client closed".to_owned()));
             return submission;
@@ -1993,9 +1988,6 @@ pub(crate) struct BatchCommandsDispatcher {
     max_concurrency_request_limit: usize,
     cancellation: Cancellation,
     transport_layer_load: Arc<AtomicU64>,
-    /// client-go `connPool.metrics`: the request-stage observers of the store
-    /// the last request named, replaced when a request names another store.
-    stage_metrics: ArcSwapOption<BatchRequestStageMetrics>,
     /// client-go `batchConn.metrics`: the send-loop observers of the
     /// connection's target.
     conn_metrics: ArcSwapOption<BatchConnMetrics>,
@@ -2200,27 +2192,12 @@ impl BatchCommandsDispatcher {
             max_concurrency_request_limit,
             cancellation: Cancellation::default(),
             transport_layer_load: Arc::new(AtomicU64::new(0)),
-            stage_metrics: ArcSwapOption::empty(),
             conn_metrics: ArcSwapOption::empty(),
             #[cfg(test)]
             panic_next_send_loop: AtomicBool::new(false),
             #[cfg(test)]
             panic_after_collect: AtomicBool::new(false),
         }
-    }
-
-    /// client-go `connPool.getStoreMetrics`: the request-stage observers of
-    /// `store_id`. A pooled target may serve a replacement store ID, so a
-    /// request naming another store replaces the cached observers.
-    fn stage_metrics(&self, store_id: u64) -> Arc<BatchRequestStageMetrics> {
-        if let Some(metrics) = self.stage_metrics.load_full() {
-            if metrics.store_id == store_id {
-                return metrics;
-            }
-        }
-        let metrics = Arc::new(BatchRequestStageMetrics::new(store_id));
-        self.stage_metrics.store(Some(Arc::clone(&metrics)));
-        metrics
     }
 
     /// The send-loop observers of the connection's current metric target.
@@ -3197,31 +3174,18 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
-    /// client-go `connPool.getStoreMetrics`: a store's request-stage
-    /// observers are resolved once and kept until a request names another
-    /// store, and a request's stages still report under its store's labels.
-    #[tokio::test]
-    async fn a_dispatcher_resolves_a_stores_stage_observers_once() {
+    /// A request's stages report under the labels of the store whose
+    /// observers it carries.
+    #[test]
+    fn a_requests_stages_report_under_its_stores_labels() {
         const STORE: u64 = 9_025_001;
-        let client = KvRpcClient::new(
-            vec![TikvClient::new(
-                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
-            )],
-            Duration::from_secs(1),
-        );
-        let dispatcher = BatchCommandsDispatcher::new(client, 1);
-        let first = dispatcher.stage_metrics(STORE);
-        assert!(Arc::ptr_eq(&first, &dispatcher.stage_metrics(STORE)));
-        let other = dispatcher.stage_metrics(STORE + 1);
-        assert!(!Arc::ptr_eq(&first, &other));
-        assert_eq!(other.store_id, STORE + 1);
-
+        let metrics = Arc::new(BatchRequestStageMetrics::new(STORE));
         let batch_wait_ok = || {
             crate::stats::batch_request_stage_observer(&STORE.to_string(), "batch_wait", "ok")
                 .sample_count()
         };
         let before = batch_wait_ok();
-        let telemetry = BatchRequestTelemetry::with_stage_metrics(first, Instant::now());
+        let telemetry = BatchRequestTelemetry::with_stage_metrics(metrics, Instant::now());
         telemetry.mark_selected(Instant::now());
         telemetry.complete(Some(&Error::StringError("batch client closed".to_owned())));
         assert_eq!(batch_wait_ok(), before + 1);
@@ -3251,6 +3215,7 @@ mod tests {
                 0,
                 "",
                 tokio::time::Instant::now() + Duration::from_millis(5),
+                Arc::new(BatchRequestStageMetrics::new(0)),
             )
             .await
         {
@@ -3292,6 +3257,7 @@ mod tests {
                 0,
                 "",
                 tokio::time::Instant::now() + Duration::from_secs(1),
+                Arc::new(BatchRequestStageMetrics::new(0)),
             ),
             async {
                 tokio::task::yield_now().await;
