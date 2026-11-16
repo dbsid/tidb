@@ -194,7 +194,7 @@ impl CopReadTaskResponse {
     #[must_use]
     pub fn region_error_ref(&self) -> Option<&tidb_proto::RegionError> {
         matches!(self.error.as_ref(), Some(CopReadResponseError::Region))
-            .then(|| self.response.region_error.as_ref())
+            .then(|| self.response.region_error.as_deref())
             .flatten()
     }
 

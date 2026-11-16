@@ -1140,14 +1140,14 @@ mod tests {
                     .iter()
                     .map(|_| tikvpb::batch_commands_response::Response {
                         cmd: Some(Cmd::Get(kvrpcpb::GetResponse {
-                            exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                            exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                                 time_detail_v2: Some(kvrpcpb::TimeDetailV2 {
                                     total_rpc_wall_time_ns: 1_000_000,
                                     wait_wall_time_ns: 100_000,
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         })),
                     })
@@ -1206,14 +1206,14 @@ mod tests {
                     .iter()
                     .map(|_| tikvpb::batch_commands_response::Response {
                         cmd: Some(Cmd::Get(kvrpcpb::GetResponse {
-                            exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                            exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                                 time_detail_v2: Some(kvrpcpb::TimeDetailV2 {
                                     total_rpc_wall_time_ns: 1_000_000,
                                     wait_wall_time_ns: 100_000,
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         })),
                     })

@@ -1743,13 +1743,13 @@ mod tests {
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = observed.clone();
         let response = kvrpcpb::GetResponse {
-            exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+            exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                 time_detail_v2: Some(kvrpcpb::TimeDetailV2 {
                     total_rpc_wall_time_ns: 1_000_000,
                     ..Default::default()
                 }),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         let start = Instant::now();
@@ -2100,13 +2100,13 @@ mod client_span_tests {
                 && counter.fetch_add(1, AtomicOrdering::SeqCst) == 0
             {
                 return Box::new(kvrpcpb::GetResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         not_leader: Some(crate::proto::errorpb::NotLeader {
                             region_id: 1,
                             leader: None,
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 });
             }
@@ -2136,7 +2136,7 @@ mod client_span_tests {
                 && counter.fetch_add(1, AtomicOrdering::SeqCst) == 0
             {
                 return Box::new(kvrpcpb::GetResponse {
-                    error: Some(kvrpcpb::KeyError {
+                    error: Some(Box::new(kvrpcpb::KeyError {
                         locked: Some(kvrpcpb::LockInfo {
                             primary_lock: vec![5],
                             lock_version: 2,
@@ -2147,7 +2147,7 @@ mod client_span_tests {
                             ..Default::default()
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 });
             }
