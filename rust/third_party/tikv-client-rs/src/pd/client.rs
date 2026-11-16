@@ -1077,7 +1077,7 @@ where
         self.enable_forwarding
     }
     async fn get_store_by_id(&self, id: StoreId) -> Result<()> {
-        self.region_cache.get_store_by_id(id).await.map(|_| ())
+        self.region_cache.resolve_store_by_id(id).await
     }
     fn store_liveness(&self, id: StoreId) -> Option<StoreLiveness> {
         self.region_cache.store_liveness(id)
@@ -1345,28 +1345,30 @@ where
         target_store: metapb::Store,
         proxy_peer: Option<metapb::Peer>,
     ) -> Result<RegionStore> {
-        let forwarded = proxy_peer.is_some();
-        let physical_store = match proxy_peer {
-            Some(proxy_peer) => {
+        let proxy_store = match proxy_peer {
+            Some(proxy_peer) => Some(
                 self.region_cache
                     .get_store_by_id(proxy_peer.store_id)
-                    .await?
-            }
-            None => target_store.clone(),
+                    .await?,
+            ),
+            None => None,
         };
+        let forwarded = proxy_store.is_some();
+        // The store the request is sent to: the proxy, or the target itself.
+        let physical_store = proxy_store.as_ref().unwrap_or(&target_store);
         let kv_client = self.kv_client(&physical_store.address).await?;
         kv_client.set_event_listener(self.region_cache.client_event_listener());
 
         let health_status = self.region_cache.store_health_status(target_peer.store_id);
         let store_token_count = self.store_token_count(target_peer.store_id);
         let physical_store_id = physical_store.id;
-        let physical_endpoint_type = crate::store::EndpointType::from_store(&physical_store);
+        let physical_endpoint_type = crate::store::EndpointType::from_store(physical_store);
         let logical_endpoint_type = crate::store::EndpointType::from_store(&target_store);
         let access_index =
             self.region_cache
                 .access_index(&region, &target_peer, logical_endpoint_type);
         let mut route = RegionStore::new(region, Arc::new(kv_client))
-            .with_target(physical_store.address)
+            .with_target(physical_store.address.clone())
             .with_physical_store(physical_store_id, physical_endpoint_type)
             .with_target_peer(target_peer)
             .with_access_index(access_index)

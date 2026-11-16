@@ -1920,22 +1920,44 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     }
 
     pub async fn get_store_by_id(&self, id: StoreId) -> Result<Store> {
-        if let Some((state, store)) = self
-            .store_cache
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|store| (store.resolve_state(), store.meta.clone()))
-        {
-            match state {
-                StoreResolveState::Resolved | StoreResolveState::NeedCheck => return Ok(store),
-                StoreResolveState::Tombstone => return Err(store_tombstone_error(id)),
-                StoreResolveState::Unresolved => {}
-            }
+        if let Some(store) = self.cached_store(id, |store| store.meta.clone()) {
+            return store;
         }
         self.read_through_store_by_id(id)
             .await?
             .ok_or_else(|| store_tombstone_error(id))
+    }
+
+    /// [`Self::get_store_by_id`] for a caller that needs the store resolved
+    /// but not its metadata: a cached store answers without a copy, as
+    /// client-go's `getStore` hands out a pointer.
+    pub async fn resolve_store_by_id(&self, id: StoreId) -> Result<()> {
+        if let Some(resolved) = self.cached_store(id, |_| ()) {
+            return resolved;
+        }
+        self.read_through_store_by_id(id)
+            .await?
+            .map(|_| ())
+            .ok_or_else(|| store_tombstone_error(id))
+    }
+
+    /// `read` of the cached store `id` when it is resolved or due for a check,
+    /// its tombstone error, or `None` when the store must be read through.
+    fn cached_store<T>(
+        &self,
+        id: StoreId,
+        read: impl FnOnce(&CachedStore) -> T,
+    ) -> Option<Result<T>> {
+        let cached = {
+            let cache = self.store_cache.read().unwrap();
+            let store = cache.get(&id)?;
+            match store.resolve_state() {
+                StoreResolveState::Resolved | StoreResolveState::NeedCheck => Ok(read(store)),
+                StoreResolveState::Tombstone => Err(()),
+                StoreResolveState::Unresolved => return None,
+            }
+        };
+        Some(cached.map_err(|()| store_tombstone_error(id)))
     }
 
     /// Force read through (query from PD) and update cache
@@ -3647,7 +3669,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         selector_state: &ReplicaSelectorState,
     ) -> Result<Vec<ReplicaCandidate>> {
         for peer in &region.region.peers {
-            if let Err(error) = self.get_store_by_id(peer.store_id).await {
+            if let Err(error) = self.resolve_store_by_id(peer.store_id).await {
                 if self.store_resolve_state(peer.store_id) == Some(StoreResolveState::Tombstone) {
                     continue;
                 }
@@ -6006,6 +6028,40 @@ mod test {
             .await;
         assert_eq!(requests.load(SeqCst), 2);
         assert_eq!(cache.store_health(9).unwrap().tikv_side_slow_score, 90);
+    }
+
+    /// `resolve_store_by_id` answers as `get_store_by_id` does, for a store
+    /// read through, a cached one and a tombstone, without copying the store.
+    #[tokio::test]
+    async fn resolving_a_store_answers_as_reading_it() -> Result<()> {
+        let client = Arc::new(MockRetryClient::default());
+        client.stores.lock().await.push(metapb::Store {
+            id: 1,
+            address: "store-1".to_owned(),
+            ..Default::default()
+        });
+        let cache = RegionCache::new(client.clone());
+
+        // An unknown store is read through PD once, then answered from cache.
+        cache.resolve_store_by_id(1).await?;
+        assert_eq!(
+            cache.store_resolve_state(1),
+            Some(StoreResolveState::Resolved)
+        );
+        cache.resolve_store_by_id(1).await?;
+        assert_eq!(client.get_store_count.load(SeqCst), 1);
+
+        // A store PD no longer has is a tombstone, reported as reading it is.
+        let resolved = cache.resolve_store_by_id(2).await.unwrap_err();
+        assert_eq!(
+            cache.store_resolve_state(2),
+            Some(StoreResolveState::Tombstone)
+        );
+        assert_eq!(
+            resolved.to_string(),
+            cache.get_store_by_id(2).await.unwrap_err().to_string()
+        );
+        Ok(())
     }
 
     #[test]
