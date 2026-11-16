@@ -2765,6 +2765,19 @@ where
     type Result = Vec<Result<P::Result>>;
 
     async fn execute(&self) -> Result<Self::Result> {
+        self.clone().execute_once().await
+    }
+}
+
+#[allow(private_bounds)]
+impl<P: Plan + Shardable, PdC: PdClient, R: RegionRetryState> RetryableMultiRegion<P, PdC, R>
+where
+    P::Result: HasKeyErrors + HasRegionError,
+{
+    /// Runs the request on the plan and backoff this owns. client-go sends
+    /// the request it built (`KVSnapshot.get`), so a plan run once needs no
+    /// copy of either; [`Plan::execute`] runs behind `&self` and copies them.
+    pub(crate) async fn execute_once(self) -> Result<Vec<Result<P::Result>>> {
         // The generic Rust plan caps multi-region concurrency. client-go's
         // snapshot BatchGet sends every initial region batch concurrently;
         // its optional worker pool applies only to callback retry work.
@@ -2774,17 +2787,16 @@ where
             self.concurrency.max(1)
         };
         let concurrency_permits = Arc::new(Semaphore::new(concurrency));
-        let backoff = self.backoff.clone();
         // Region location and every send below run with client-go's
         // `bo.GetCtx()`.
-        let slot = Self::bo_span_slot(&backoff, &self.inner).await;
+        let slot = Self::bo_span_slot(&self.backoff, &self.inner).await;
         let (result, backoff) = crate::trace::with_bo_span_slot(
             slot,
             Self::single_plan_handler(
-                self.pd_client.clone(),
-                self.inner.clone(),
-                backoff,
-                concurrency_permits.clone(),
+                self.pd_client,
+                self.inner,
+                self.backoff,
+                concurrency_permits,
                 self.preserve_region_results,
                 self.one_region,
                 self.snapshot_region_scope,
@@ -6538,6 +6550,64 @@ mod test {
             snapshot_async_batch_get: false,
         };
         assert!(plan.execute().await.is_err())
+    }
+
+    /// A one-region plan that counts its copies.
+    struct RunOnceCountingPlan(Arc<AtomicUsize>);
+
+    impl Clone for RunOnceCountingPlan {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    #[async_trait]
+    impl Plan for RunOnceCountingPlan {
+        type Result = BatchGetResponse;
+
+        async fn execute(&self) -> Result<Self::Result> {
+            Ok(BatchGetResponse::default())
+        }
+    }
+
+    impl Shardable for RunOnceCountingPlan {
+        type Shard = ();
+
+        fn shards(
+            &self,
+            _: &Arc<impl crate::pd::PdClient>,
+        ) -> BoxStream<'static, crate::Result<(Self::Shard, RegionWithLeader)>> {
+            Box::pin(stream::iter(vec![Ok(((), MockPdClient::region1()))]))
+        }
+
+        fn apply_shard(&mut self, _: Self::Shard) {}
+
+        fn apply_store(&mut self, _: &crate::store::RegionStore) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// client-go `KVSnapshot.get` sends the request it built: a plan run once
+    /// is not copied by its retry layer, which `Plan::execute` must do because
+    /// it runs behind `&self`.
+    #[tokio::test]
+    async fn a_plan_run_once_is_not_copied_by_its_retry_layer() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let plan = || RetryableMultiRegion {
+            inner: RunOnceCountingPlan(Arc::clone(&clones)),
+            pd_client: Arc::new(MockPdClient::default()),
+            backoff: Backoff::no_backoff(),
+            preserve_region_results: false,
+            concurrency: MULTI_REGION_CONCURRENCY,
+            one_region: None,
+            snapshot_region_scope: None,
+            snapshot_async_batch_get: false,
+        };
+        assert_eq!(plan().execute_once().await.unwrap().len(), 1);
+        let run_once = clones.swap(0, Ordering::SeqCst);
+        assert_eq!(plan().execute().await.unwrap().len(), 1);
+        assert_eq!(clones.load(Ordering::SeqCst), run_once + 1);
     }
 
     #[tokio::test]
