@@ -142,8 +142,8 @@ impl ::prost::Name for Request {
 pub struct Response {
     #[prost(bytes = "bytes", tag = "1")]
     pub data: ::prost::bytes::Bytes,
-    #[prost(message, optional, tag = "2")]
-    pub region_error: ::core::option::Option<super::errorpb::Error>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub region_error: ::core::option::Option<::prost::alloc::boxed::Box<super::errorpb::Error>>,
     #[prost(message, optional, tag = "3")]
     pub locked: ::core::option::Option<super::kvrpcpb::LockInfo>,
     #[prost(string, tag = "4")]
@@ -156,8 +156,8 @@ pub struct Response {
     pub exec_details: ::core::option::Option<super::kvrpcpb::ExecDetails>,
     /// This field is provided in later versions, containing more detailed
     /// information.
-    #[prost(message, optional, tag = "11")]
-    pub exec_details_v2: ::core::option::Option<super::kvrpcpb::ExecDetailsV2>,
+    #[prost(message, optional, boxed, tag = "11")]
+    pub exec_details_v2: ::core::option::Option<::prost::alloc::boxed::Box<super::kvrpcpb::ExecDetailsV2>>,
     #[prost(bool, tag = "7")]
     pub is_cache_hit: bool,
     #[prost(uint64, tag = "8")]
@@ -399,16 +399,16 @@ impl ::prost::Name for StoreBatchTask {
 pub struct StoreBatchTaskResponse {
     #[prost(bytes = "bytes", tag = "1")]
     pub data: ::prost::bytes::Bytes,
-    #[prost(message, optional, tag = "2")]
-    pub region_error: ::core::option::Option<super::errorpb::Error>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub region_error: ::core::option::Option<::prost::alloc::boxed::Box<super::errorpb::Error>>,
     #[prost(message, optional, tag = "3")]
     pub locked: ::core::option::Option<super::kvrpcpb::LockInfo>,
     #[prost(string, tag = "4")]
     pub other_error: ::prost::alloc::string::String,
     #[prost(uint64, tag = "5")]
     pub task_id: u64,
-    #[prost(message, optional, tag = "6")]
-    pub exec_details_v2: ::core::option::Option<super::kvrpcpb::ExecDetailsV2>,
+    #[prost(message, optional, boxed, tag = "6")]
+    pub exec_details_v2: ::core::option::Option<::prost::alloc::boxed::Box<super::kvrpcpb::ExecDetailsV2>>,
     /// Indicates that this task's result was merged into the enclosing
     /// `Response.data`, so this message's `data` is empty. The store sets this
     /// field only when the client enables `Request.allow_batch_task_data_merge`,
@@ -467,8 +467,8 @@ pub struct DelegateResponse {
     pub mem_table_data: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub snapshot: ::prost::alloc::vec::Vec<u8>,
-    #[prost(message, optional, tag = "3")]
-    pub region_error: ::core::option::Option<super::errorpb::Error>,
+    #[prost(message, optional, boxed, tag = "3")]
+    pub region_error: ::core::option::Option<::prost::alloc::boxed::Box<super::errorpb::Error>>,
     #[prost(message, optional, tag = "4")]
     pub locked: ::core::option::Option<super::kvrpcpb::LockInfo>,
     #[prost(string, tag = "5")]

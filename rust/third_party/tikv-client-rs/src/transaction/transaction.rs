@@ -8230,7 +8230,7 @@ impl<PdC: PdClient> Committer<PdC> {
                 continue;
             }
             if let Some(error) = response.error {
-                return Err(Error::KeyError(Box::new(error)));
+                return Err(Error::KeyError(error));
             }
             let region_end = store.region_with_leader.region.end_key;
             if region_end.is_empty() || region_end >= exclusive_end {
@@ -8957,7 +8957,7 @@ impl<PdC: PdClient> Committer<PdC> {
             };
             if let Some(region_error) = response.region_error {
                 if region_error.disk_full.is_some() {
-                    return Err(Error::RegionError(Box::new(region_error)));
+                    return Err(Error::RegionError(region_error));
                 }
                 let real_epoch_not_match = region_error.epoch_not_match.is_some()
                     && !crate::retry::is_fake_region_error(Some(&region_error));
@@ -9118,7 +9118,7 @@ impl<PdC: PdClient> Committer<PdC> {
             if let Some(region_error) = response.region_error {
                 if batch.is_primary && region_error.undetermined_result.is_some() {
                     self.undetermined = true;
-                    return Err(Error::RegionError(Box::new(region_error)));
+                    return Err(Error::RegionError(region_error));
                 }
                 return Ok(true);
             }
@@ -9153,7 +9153,7 @@ impl<PdC: PdClient> Committer<PdC> {
                 self.txn_file_commit_timestamp = Some(commit_timestamp);
                 continue;
             }
-            return Err(key_error.into());
+            return Err((*key_error).into());
         }
     }
 
@@ -11960,13 +11960,13 @@ mod tests {
                     if matches!(kind, CleanupKind::Prewrite) {
                         assert!(request.is::<kvrpcpb::BatchRollbackRequest>());
                         Ok(Box::new(kvrpcpb::BatchRollbackResponse {
-                            region_error,
+                            region_error: region_error.map(Box::new),
                             ..Default::default()
                         }) as Box<dyn Any>)
                     } else {
                         assert!(request.is::<kvrpcpb::PessimisticRollbackRequest>());
                         Ok(Box::new(kvrpcpb::PessimisticRollbackResponse {
-                            region_error,
+                            region_error: region_error.map(Box::new),
                             ..Default::default()
                         }) as Box<dyn Any>)
                     }
@@ -12149,13 +12149,13 @@ mod tests {
                         request.context.as_ref().unwrap().is_retry_request,
                     ));
                     return Ok(Box::new(kvrpcpb::BatchRollbackResponse {
-                        region_error: Some(crate::proto::errorpb::Error {
+                        region_error: Some(Box::new(crate::proto::errorpb::Error {
                             not_leader: Some(crate::proto::errorpb::NotLeader {
                                 region_id: 2,
                                 leader: None,
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -12167,13 +12167,13 @@ mod tests {
                     request.context.as_ref().unwrap().is_retry_request,
                 ));
                 Ok(Box::new(kvrpcpb::PessimisticRollbackResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         not_leader: Some(crate::proto::errorpb::NotLeader {
                             region_id: 2,
                             leader: None,
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -14156,7 +14156,7 @@ mod tests {
                         _ => panic!("unexpected latest point-get attempt"),
                     };
                     return Ok(Box::new(kvrpcpb::GetResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             locked: Some(kvrpcpb::LockInfo {
                                 key: b"key".to_vec(),
                                 primary_lock: b"key".to_vec(),
@@ -14164,7 +14164,7 @@ mod tests {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -14207,7 +14207,7 @@ mod tests {
                     if captured_get_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         assert!(request.context.as_ref().unwrap().committed_locks.is_empty());
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: b"secondary".to_vec(),
                                     primary_lock: b"primary".to_vec(),
@@ -14216,7 +14216,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -14262,7 +14262,7 @@ mod tests {
                 if let Some(request) = request.downcast_ref::<kvrpcpb::GetRequest>() {
                     if captured_get_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: b"k2".to_vec(),
                                     primary_lock: b"k1".to_vec(),
@@ -14270,7 +14270,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -14336,7 +14336,7 @@ mod tests {
                             },
                             kvrpcpb::KvPair {
                                 key: b"locked".to_vec(),
-                                error: Some(kvrpcpb::KeyError {
+                                error: Some(Box::new(kvrpcpb::KeyError {
                                     locked: Some(kvrpcpb::LockInfo {
                                         key: b"locked".to_vec(),
                                         primary_lock: b"locked".to_vec(),
@@ -14344,7 +14344,7 @@ mod tests {
                                         ..Default::default()
                                     }),
                                     ..Default::default()
-                                }),
+                                })),
                                 ..Default::default()
                             },
                         ],
@@ -14448,7 +14448,7 @@ mod tests {
                     attempts.push(request.keys.clone());
                     if attempts.len() == 1 {
                         return Ok(Box::new(kvrpcpb::BatchGetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: b"locked".to_vec(),
                                     primary_lock: b"locked".to_vec(),
@@ -14456,7 +14456,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             pairs: vec![kvrpcpb::KvPair {
                                 key: b"incomplete".to_vec(),
                                 value: b"must-not-escape".to_vec(),
@@ -15361,13 +15361,13 @@ mod tests {
                     return Ok(Box::new(kvrpcpb::ScanResponse {
                         pairs: vec![
                             kvrpcpb::KvPair {
-                                error: Some(kvrpcpb::KeyError {
+                                error: Some(Box::new(kvrpcpb::KeyError {
                                     locked: Some(kvrpcpb::LockInfo {
                                         key: b"a".to_vec(),
                                         ..Default::default()
                                     }),
                                     ..Default::default()
-                                }),
+                                })),
                                 ..Default::default()
                             },
                             kvrpcpb::KvPair {
@@ -15443,13 +15443,13 @@ mod tests {
                                 ..Default::default()
                             },
                             kvrpcpb::KvPair {
-                                error: Some(kvrpcpb::KeyError {
+                                error: Some(Box::new(kvrpcpb::KeyError {
                                     locked: Some(kvrpcpb::LockInfo {
                                         key: b"b".to_vec(),
                                         ..Default::default()
                                     }),
                                     ..Default::default()
-                                }),
+                                })),
                                 ..Default::default()
                             },
                         ]
@@ -15519,7 +15519,7 @@ mod tests {
                     if attempt == 0 {
                         assert!(context.committed_locks.is_empty());
                         return Ok(Box::new(kvrpcpb::ScanResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: b"a".to_vec(),
                                     primary_lock: b"primary".to_vec(),
@@ -15527,7 +15527,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             pairs: vec![kvrpcpb::KvPair {
                                 key: b"incomplete".to_vec(),
                                 value: b"must-not-escape".to_vec(),
@@ -15664,7 +15664,7 @@ mod tests {
                 if request.is::<kvrpcpb::GetRequest>() {
                     Ok(Box::new(kvrpcpb::GetResponse {
                         value: b"get-value".to_vec(),
-                        exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                        exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                             time_detail_v2: Some(kvrpcpb::TimeDetailV2 {
                                 wait_wall_time_ns: 1,
                                 process_wall_time_ns: 2,
@@ -15686,7 +15686,7 @@ mod tests {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>)
                 } else if request.is::<kvrpcpb::BatchGetRequest>() {
@@ -15774,7 +15774,7 @@ mod tests {
                 assert!(request.is::<kvrpcpb::GetRequest>());
                 Ok(Box::new(kvrpcpb::GetResponse {
                     value: b"v".to_vec(),
-                    exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                    exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                         time_detail_v2: Some(kvrpcpb::TimeDetailV2 {
                             kv_read_wall_time_ns: 1_000_000,
                             ..Default::default()
@@ -15784,7 +15784,7 @@ mod tests {
                             ..Default::default()
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -15814,10 +15814,10 @@ mod tests {
                 assert!(request.is::<kvrpcpb::GetRequest>());
                 if captured_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Ok(Box::new(kvrpcpb::GetResponse {
-                        region_error: Some(crate::proto::errorpb::Error {
+                        region_error: Some(Box::new(crate::proto::errorpb::Error {
                             server_is_busy: Some(Default::default()),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -16070,7 +16070,7 @@ mod tests {
                         assert_eq!(context.max_execution_duration_ms, 17);
                         assert!(!context.is_retry_request);
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: b"get".to_vec(),
                                     primary_lock: b"get".to_vec(),
@@ -16078,7 +16078,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -16098,7 +16098,7 @@ mod tests {
                         return Ok(Box::new(kvrpcpb::BatchGetResponse {
                             pairs: vec![kvrpcpb::KvPair {
                                 key: b"batch".to_vec(),
-                                error: Some(kvrpcpb::KeyError {
+                                error: Some(Box::new(kvrpcpb::KeyError {
                                     locked: Some(kvrpcpb::LockInfo {
                                         key: b"batch".to_vec(),
                                         primary_lock: b"batch".to_vec(),
@@ -16106,7 +16106,7 @@ mod tests {
                                         ..Default::default()
                                     }),
                                     ..Default::default()
-                                }),
+                                })),
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -16157,7 +16157,7 @@ mod tests {
                     assert_eq!(context.busy_threshold_ms, 50);
                     assert_eq!(context.peer.as_ref().unwrap().store_id, 42);
                     return Ok(Box::new(kvrpcpb::GetResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             locked: Some(kvrpcpb::LockInfo {
                                 key: b"key".to_vec(),
                                 primary_lock: b"key".to_vec(),
@@ -16165,7 +16165,7 @@ mod tests {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -16738,14 +16738,14 @@ mod tests {
                 if request.downcast_ref::<kvrpcpb::ScanRequest>().is_some() {
                     if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                         return Ok(Box::new(kvrpcpb::ScanResponse {
-                            region_error: Some(crate::proto::errorpb::Error {
+                            region_error: Some(Box::new(crate::proto::errorpb::Error {
                                 message: "server is busy".to_owned(),
                                 server_is_busy: Some(crate::proto::errorpb::ServerIsBusy {
                                     reason: "busy".to_owned(),
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -16910,10 +16910,10 @@ mod tests {
                 let expected = captured_expected.load(Ordering::SeqCst);
                 if kind == "get" && priority != expected {
                     return Ok(Box::new(kvrpcpb::GetResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             abort: "request check error".to_owned(),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -16986,10 +16986,10 @@ mod tests {
                 assert!(request.downcast_ref::<kvrpcpb::GetRequest>().is_some());
                 if captured_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Ok(Box::new(kvrpcpb::GetResponse {
-                        region_error: Some(crate::proto::errorpb::Error {
+                        region_error: Some(Box::new(crate::proto::errorpb::Error {
                             server_is_busy: Some(Default::default()),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -17330,7 +17330,7 @@ mod tests {
                         assert!(context.resolved_locks.is_empty());
                         assert!(context.committed_locks.is_empty());
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: b"read".to_vec(),
                                     primary_lock: b"read".to_vec(),
@@ -17338,7 +17338,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -17392,7 +17392,7 @@ mod tests {
                 if req.is::<kvrpcpb::GetRequest>() {
                     if get_attempts_by_hook.fetch_add(1, Ordering::SeqCst) == 0 {
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: b"read".to_vec(),
                                     primary_lock: b"read".to_vec(),
@@ -17401,7 +17401,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -17474,7 +17474,7 @@ mod tests {
                     };
                     if first_attempt {
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: req.key.clone(),
                                     primary_lock: b"primary".to_vec(),
@@ -17482,7 +17482,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -17538,7 +17538,7 @@ mod tests {
                     );
                     heartbeat_attempts_by_hook.fetch_add(1, Ordering::SeqCst);
                     return Ok(Box::new(kvrpcpb::TxnHeartBeatResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             locked: Some(kvrpcpb::LockInfo {
                                 key: b"write".to_vec(),
                                 primary_lock: b"write".to_vec(),
@@ -17546,7 +17546,7 @@ mod tests {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -18454,13 +18454,13 @@ mod tests {
                 if request.is::<kvrpcpb::TxnHeartBeatRequest>() {
                     captured_attempts.fetch_add(1, Ordering::SeqCst);
                     return Ok(Box::new(kvrpcpb::TxnHeartBeatResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             txn_not_found: Some(kvrpcpb::TxnNotFound {
                                 start_ts: 1,
                                 primary_key: b"primary".to_vec(),
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -19434,10 +19434,10 @@ mod tests {
                         && !busy.swap(true, Ordering::SeqCst)
                     {
                         return Ok(Box::new(kvrpcpb::PrewriteResponse {
-                            region_error: Some(crate::proto::errorpb::Error {
+                            region_error: Some(Box::new(crate::proto::errorpb::Error {
                                 server_is_busy: Some(crate::proto::errorpb::ServerIsBusy::default()),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -19537,7 +19537,7 @@ mod tests {
                             .unwrap()
                             .replace_regions(current_regions.clone());
                         return Ok(Box::new(kvrpcpb::PessimisticLockResponse {
-                            region_error: Some(crate::proto::errorpb::Error {
+                            region_error: Some(Box::new(crate::proto::errorpb::Error {
                                 epoch_not_match: Some(crate::proto::errorpb::EpochNotMatch {
                                     current_regions: current_regions
                                         .iter()
@@ -19556,7 +19556,7 @@ mod tests {
                                         .collect(),
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -19600,10 +19600,10 @@ mod tests {
                 assert!(request.is::<kvrpcpb::PessimisticLockRequest>());
                 if !busy.swap(true, Ordering::SeqCst) {
                     return Ok(Box::new(kvrpcpb::PessimisticLockResponse {
-                        region_error: Some(crate::proto::errorpb::Error {
+                        region_error: Some(Box::new(crate::proto::errorpb::Error {
                             server_is_busy: Some(crate::proto::errorpb::ServerIsBusy::default()),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -19649,10 +19649,10 @@ mod tests {
                     && !busy.swap(true, Ordering::SeqCst)
                 {
                     return Ok(Box::new(kvrpcpb::PessimisticLockResponse {
-                        region_error: Some(crate::proto::errorpb::Error {
+                        region_error: Some(Box::new(crate::proto::errorpb::Error {
                             server_is_busy: Some(crate::proto::errorpb::ServerIsBusy::default()),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -20128,13 +20128,13 @@ mod tests {
                         .is_retry_request,
                 );
                 Ok(Box::new(kvrpcpb::FlushResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         not_leader: Some(crate::proto::errorpb::NotLeader {
                             region_id: 2,
                             leader: None,
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -20985,10 +20985,10 @@ mod tests {
                 }
                 if request.is::<kvrpcpb::TxnHeartBeatRequest>() {
                     return Ok(Box::new(kvrpcpb::TxnHeartBeatResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             abort: "terminal primary rejection".to_owned(),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -21793,10 +21793,10 @@ mod tests {
                     .downcast_ref::<kvrpcpb::BatchRollbackRequest>()
                     .expect("cleanup uses BatchRollback");
                 Ok(Box::new(kvrpcpb::BatchRollbackResponse {
-                    error: Some(kvrpcpb::KeyError {
+                    error: Some(Box::new(kvrpcpb::KeyError {
                         abort: "primary rollback failed".to_owned(),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -21878,10 +21878,10 @@ mod tests {
     async fn source_txn_file_prewrite_keeps_disk_full_terminal_and_key_exists_typed() {
         let rpc = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(|_| {
             Ok(Box::new(kvrpcpb::PrewriteResponse {
-                region_error: Some(crate::proto::errorpb::Error {
+                region_error: Some(Box::new(crate::proto::errorpb::Error {
                     disk_full: Some(Default::default()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }) as Box<dyn Any>)
         })));
@@ -21945,18 +21945,18 @@ mod tests {
             |request: &dyn Any| {
                 if request.downcast_ref::<kvrpcpb::CommitRequest>().is_some() {
                     return Ok(Box::new(kvrpcpb::CommitResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             retryable: "retry transaction".to_owned(),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
                 Ok(Box::new(kvrpcpb::BatchRollbackResponse {
-                    error: Some(kvrpcpb::KeyError {
+                    error: Some(Box::new(kvrpcpb::KeyError {
                         abort: "cleanup rejected".to_owned(),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -22004,10 +22004,10 @@ mod tests {
                 captured.lock().unwrap().push(keys.clone());
                 if keys == [vec![20]] && !undetermined.swap(true, Ordering::SeqCst) {
                     return Ok(Box::new(kvrpcpb::PrewriteResponse {
-                        region_error: Some(crate::proto::errorpb::Error {
+                        region_error: Some(Box::new(crate::proto::errorpb::Error {
                             undetermined_result: Some(Default::default()),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -22038,10 +22038,10 @@ mod tests {
             |request| {
                 assert!(request.downcast_ref::<kvrpcpb::CommitRequest>().is_some());
                 Ok(Box::new(kvrpcpb::CommitResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         undetermined_result: Some(Default::default()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -22117,13 +22117,13 @@ mod tests {
                 assert!(request.is::<kvrpcpb::PrewriteRequest>());
                 captured_prewrite_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(kvrpcpb::PrewriteResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         not_leader: Some(crate::proto::errorpb::NotLeader {
                             region_id: 2,
                             leader: None,
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -22150,13 +22150,13 @@ mod tests {
                 assert!(request.is::<kvrpcpb::CommitRequest>());
                 captured_commit_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(kvrpcpb::CommitResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         not_leader: Some(crate::proto::errorpb::NotLeader {
                             region_id: 2,
                             leader: None,
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -22259,7 +22259,7 @@ mod tests {
                     .push(request.primary_key.clone());
                 if captured_requests.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Ok(Box::new(kvrpcpb::CommitResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             commit_ts_expired: Some(kvrpcpb::CommitTsExpired {
                                 start_ts: 1,
                                 attempted_commit_ts: request.commit_version,
@@ -22267,7 +22267,7 @@ mod tests {
                                 min_commit_ts: request.commit_version + 1,
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -22421,10 +22421,10 @@ mod tests {
                     )));
                 }
                 Ok(Box::new(kvrpcpb::CommitResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         server_is_busy: Some(Default::default()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -22454,10 +22454,10 @@ mod tests {
                     )));
                 }
                 Ok(Box::new(kvrpcpb::CommitResponse {
-                    error: Some(kvrpcpb::KeyError {
+                    error: Some(Box::new(kvrpcpb::KeyError {
                         abort: "definitive primary rejection".to_owned(),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -22573,10 +22573,10 @@ mod tests {
 
         let key_error_rpc = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(|_| {
             Ok(Box::new(kvrpcpb::CommitResponse {
-                error: Some(kvrpcpb::KeyError {
+                error: Some(Box::new(kvrpcpb::KeyError {
                     abort: "aborted".to_owned(),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }) as Box<dyn Any>)
         })));
@@ -22606,10 +22606,10 @@ mod tests {
             move |_| {
                 captured_request_count.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(kvrpcpb::CommitResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         undetermined_result: Some(Default::default()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>)
             },
@@ -22678,7 +22678,7 @@ mod tests {
                     .push(request.commit_version);
                 if captured_count.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Ok(Box::new(kvrpcpb::CommitResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             commit_ts_expired: Some(kvrpcpb::CommitTsExpired {
                                 start_ts: 1,
                                 attempted_commit_ts: request.commit_version,
@@ -22686,7 +22686,7 @@ mod tests {
                                 min_commit_ts: 5,
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>);
                 }
@@ -22739,7 +22739,7 @@ mod tests {
                         .downcast_ref::<kvrpcpb::CommitRequest>()
                         .expect("expired retry sends Commit");
                     Ok(Box::new(kvrpcpb::CommitResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             commit_ts_expired: Some(kvrpcpb::CommitTsExpired {
                                 start_ts: 1,
                                 attempted_commit_ts: request.commit_version,
@@ -22747,7 +22747,7 @@ mod tests {
                                 min_commit_ts: 5,
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn Any>)
                 },
@@ -23664,7 +23664,7 @@ mod tests {
                 if let Some(request) = request.downcast_ref::<kvrpcpb::GetRequest>() {
                     if captured_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: request.key.clone(),
                                     primary_lock: b"primary".to_vec(),
@@ -23673,7 +23673,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn Any>);
                     }
@@ -23739,7 +23739,7 @@ mod tests {
                     if let Some(request) = request.downcast_ref::<kvrpcpb::GetRequest>() {
                         if captured_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                             return Ok(Box::new(kvrpcpb::GetResponse {
-                                error: Some(kvrpcpb::KeyError {
+                                error: Some(Box::new(kvrpcpb::KeyError {
                                     locked: Some(kvrpcpb::LockInfo {
                                         key: request.key.clone(),
                                         primary_lock: b"primary".to_vec(),
@@ -23747,7 +23747,7 @@ mod tests {
                                         ..Default::default()
                                     }),
                                     ..Default::default()
-                                }),
+                                })),
                                 ..Default::default()
                             }) as Box<dyn Any>);
                         }
@@ -23883,7 +23883,7 @@ mod tests {
                     .unwrap()
                     .replace_regions(split_regions_for_hook.clone());
                 return Ok(Box::new(kvrpcpb::PrewriteResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         epoch_not_match: Some(crate::proto::errorpb::EpochNotMatch {
                             current_regions: split_regions_for_hook
                                 .iter()
@@ -23899,7 +23899,7 @@ mod tests {
                                 .collect(),
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>);
             }
@@ -24052,7 +24052,7 @@ mod tests {
                     .unwrap()
                     .replace_regions(split_regions_for_hook.clone());
                 return Ok(Box::new(kvrpcpb::PrewriteResponse {
-                    region_error: Some(crate::proto::errorpb::Error {
+                    region_error: Some(Box::new(crate::proto::errorpb::Error {
                         epoch_not_match: Some(crate::proto::errorpb::EpochNotMatch {
                             current_regions: split_regions_for_hook
                                 .iter()
@@ -24068,7 +24068,7 @@ mod tests {
                                 .collect(),
                         }),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }) as Box<dyn Any>);
             }

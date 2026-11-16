@@ -1370,7 +1370,7 @@ mod tests {
             ..Default::default()
         };
         let response = kvrpcpb::GetResponse {
-            exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+            exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                 time_detail_v2: Some(kvrpcpb::TimeDetailV2 {
                     total_rpc_wall_time_ns: 1_000_000,
                     ..Default::default()
@@ -1381,7 +1381,7 @@ mod tests {
                     ..Default::default()
                 }),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         let before = tikv_store_rpc_samples("Get", "987654", "true", "true", source);

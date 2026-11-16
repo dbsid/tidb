@@ -340,7 +340,7 @@ impl<Req: KvRequest> Dispatch<Req> {
                             duration,
                             lock.context.as_ref().map_or(0, |context| context.region_id),
                             self.target.clone(),
-                            response.exec_details_v2.as_ref(),
+                            response.exec_details_v2.as_deref(),
                         );
                     }
                 }
@@ -365,7 +365,7 @@ impl<Req: KvRequest> Dispatch<Req> {
                         duration,
                         prewrite.context.as_ref().map_or(0, |context| context.region_id),
                         self.target.clone(),
-                        response.exec_details_v2.as_ref(),
+                        response.exec_details_v2.as_deref(),
                     );
                 }
             }
@@ -381,7 +381,7 @@ impl<Req: KvRequest> Dispatch<Req> {
                         duration,
                         commit.context.as_ref().map_or(0, |context| context.region_id),
                         self.target.clone(),
-                        response.exec_details_v2.as_ref(),
+                        response.exec_details_v2.as_deref(),
                     );
                 }
             }
@@ -3945,10 +3945,10 @@ mod test {
         });
         let key_locked = ValidateSnapshotVisibility {
             inner: VisibilityResponsePlan(kvrpcpb::BatchGetResponse {
-                error: Some(kvrpcpb::KeyError {
+                error: Some(Box::new(kvrpcpb::KeyError {
                     locked: Some(kvrpcpb::LockInfo::default()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }),
             validator: Some(Arc::clone(&validator)),
@@ -3963,7 +3963,7 @@ mod test {
 
         let region_error = ValidateSnapshotVisibility {
             inner: VisibilityResponsePlan(kvrpcpb::BatchGetResponse {
-                region_error: Some(errorpb::Error::default()),
+                region_error: Some(Box::new(errorpb::Error::default())),
                 ..Default::default()
             }),
             validator: Some(validator),
@@ -4054,7 +4054,7 @@ mod test {
         );
         assert_eq!(
             async_batch_get_result(&kvrpcpb::BatchGetResponse {
-                region_error: Some(crate::proto::errorpb::Error::default()),
+                region_error: Some(Box::new(crate::proto::errorpb::Error::default())),
                 ..Default::default()
             }),
             Some("region_error")
@@ -4062,10 +4062,10 @@ mod test {
         assert_eq!(
             async_batch_get_result(&kvrpcpb::BatchGetResponse {
                 pairs: vec![kvrpcpb::KvPair {
-                    error: Some(kvrpcpb::KeyError {
+                    error: Some(Box::new(kvrpcpb::KeyError {
                         locked: Some(kvrpcpb::LockInfo::default()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4074,10 +4074,10 @@ mod test {
         );
         assert_eq!(
             async_batch_get_result(&kvrpcpb::BufferBatchGetResponse {
-                error: Some(kvrpcpb::KeyError {
+                error: Some(Box::new(kvrpcpb::KeyError {
                     abort: "abort".to_owned(),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }),
             Some("other_error")
@@ -4099,10 +4099,10 @@ mod test {
             assert!(request.is::<kvrpcpb::GetRequest>());
             observed_attempts.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(kvrpcpb::GetResponse {
-                region_error: Some(errorpb::Error {
+                region_error: Some(Box::new(errorpb::Error {
                     not_leader: Some(errorpb::NotLeader::default()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -4464,10 +4464,10 @@ mod test {
         let client = MockKvClient::with_dispatch_hook(|request| {
             assert!(request.is::<kvrpcpb::CommitRequest>());
             Ok(Box::new(kvrpcpb::CommitResponse {
-                error: Some(kvrpcpb::KeyError {
+                error: Some(Box::new(kvrpcpb::KeyError {
                     abort: "abort".to_owned(),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -4531,10 +4531,10 @@ mod test {
         let client = MockKvClient::with_dispatch_hook(|request| {
             assert!(request.is::<kvrpcpb::GetRequest>());
             Ok(Box::new(kvrpcpb::GetResponse {
-                region_error: Some(errorpb::Error {
+                region_error: Some(Box::new(errorpb::Error {
                     message: "trace-region".to_owned(),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -4825,13 +4825,13 @@ mod test {
         // value; copr sends carry the statement's RUDetails that way.
         let client = MockKvClient::with_dispatch_hook(|_| {
             Ok(Box::new(kvrpcpb::GetResponse {
-                exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                     ru_v2: Some(kvrpcpb::Ruv2 {
                         storage_processed_keys_get: 4,
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -4866,13 +4866,13 @@ mod test {
         let client = MockKvClient::with_dispatch_hook(|request| {
             assert!(request.is::<kvrpcpb::GetRequest>());
             Ok(Box::new(kvrpcpb::GetResponse {
-                exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                     ru_v2: Some(kvrpcpb::Ruv2 {
                         storage_processed_keys_get: 3,
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -4901,10 +4901,10 @@ mod test {
         let client = MockKvClient::with_dispatch_hook(|request| {
             assert!(request.is::<kvrpcpb::PrewriteRequest>());
             Ok(Box::new(kvrpcpb::PrewriteResponse {
-                exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                     ru_v2: Some(kvrpcpb::Ruv2::default()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -4933,10 +4933,10 @@ mod test {
         let client = MockKvClient::with_dispatch_hook(|request| {
             assert!(request.is::<kvrpcpb::GetRequest>());
             Ok(Box::new(kvrpcpb::GetResponse {
-                exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                     ru_v2: Some(kvrpcpb::Ruv2::default()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -4974,13 +4974,13 @@ mod test {
         let client = MockKvClient::with_dispatch_hook(|request| {
             assert!(request.is::<kvrpcpb::GetRequest>());
             Ok(Box::new(kvrpcpb::GetResponse {
-                exec_details_v2: Some(kvrpcpb::ExecDetailsV2 {
+                exec_details_v2: Some(Box::new(kvrpcpb::ExecDetailsV2 {
                     ru_v2: Some(kvrpcpb::Ruv2 {
                         storage_processed_keys_get: 3,
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }))
         });
@@ -5026,7 +5026,7 @@ mod test {
             move |request: &dyn std::any::Any| {
                 if request.is::<kvrpcpb::GetRequest>() {
                     return Ok(Box::new(kvrpcpb::GetResponse {
-                        error: Some(kvrpcpb::KeyError {
+                        error: Some(Box::new(kvrpcpb::KeyError {
                             locked: Some(kvrpcpb::LockInfo {
                                 key: b"locked".to_vec(),
                                 primary_lock: b"primary".to_vec(),
@@ -5034,7 +5034,7 @@ mod test {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     }) as Box<dyn std::any::Any>);
                 }
@@ -5102,7 +5102,7 @@ mod test {
                     assert_eq!(request.key, codec.encode_key(b"locked"));
                     if get_count_by_hook.fetch_add(1, Ordering::SeqCst) == 0 {
                         return Ok(Box::new(kvrpcpb::GetResponse {
-                            error: Some(kvrpcpb::KeyError {
+                            error: Some(Box::new(kvrpcpb::KeyError {
                                 locked: Some(kvrpcpb::LockInfo {
                                     key: codec.encode_key(b"locked"),
                                     primary_lock: codec.encode_key(b"locked"),
@@ -5110,7 +5110,7 @@ mod test {
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         }) as Box<dyn std::any::Any>);
                     }
@@ -5180,7 +5180,7 @@ mod test {
                                 },
                                 kvrpcpb::KvPair {
                                     key: codec.encode_key(b"locked"),
-                                    error: Some(kvrpcpb::KeyError {
+                                    error: Some(Box::new(kvrpcpb::KeyError {
                                         locked: Some(kvrpcpb::LockInfo {
                                             key: codec.encode_key(b"locked"),
                                             primary_lock: codec.encode_key(b"locked"),
@@ -5188,7 +5188,7 @@ mod test {
                                             ..Default::default()
                                         }),
                                         ..Default::default()
-                                    }),
+                                    })),
                                     ..Default::default()
                                 },
                             ],
@@ -6157,13 +6157,13 @@ mod test {
                 Err(Error::Unimplemented)
             } else {
                 Ok(BatchGetResponse {
-                    region_error: Some(errorpb::Error {
+                    region_error: Some(Box::new(errorpb::Error {
                         // Use a source-retryable error that retains a
                         // backoff under replica selection, so the sibling
                         // cancellation test observes an actual waiting task.
                         max_timestamp_not_synced: Some(Default::default()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 })
             }
