@@ -1315,13 +1315,17 @@ fn into_multi_region_shard_error<T>(result: Result<Vec<Result<T>>>) -> Error {
 /// its caller.
 enum SendReqOutcome<P, T, R> {
     Done(Result<T>, R),
-    /// A terminal region miss. The caller backs off on `region_miss`, when
-    /// set, and re-splits the request after the sender's span has finished.
-    Resplit {
-        plan: P,
-        backoff: R,
-        region_miss: Option<(RetryConfig, String, Error)>,
-    },
+    /// A terminal region miss. Boxed: it carries the request's plan, and
+    /// every send returns this outcome while few re-split.
+    Resplit(Box<Resplit<P, R>>),
+}
+
+/// A request the caller re-splits against fresh regions: it backs off on
+/// `region_miss`, when set, after the sender's span has finished.
+struct Resplit<P, R> {
+    plan: P,
+    backoff: R,
+    region_miss: Option<(RetryConfig, String, Error)>,
 }
 
 #[allow(private_bounds)]
@@ -1623,11 +1627,12 @@ where
         };
         let result = match outcome {
             SendReqOutcome::Done(result, backoff) => (result, backoff),
-            SendReqOutcome::Resplit {
-                plan,
-                backoff,
-                region_miss,
-            } => {
+            SendReqOutcome::Resplit(resplit) => {
+                let Resplit {
+                    plan,
+                    backoff,
+                    region_miss,
+                } = *resplit;
                 crate::trace::with_bo_span_slot(
                     slot,
                     Self::resplit(
@@ -1746,7 +1751,7 @@ where
                 }));
                 // Nothing was sent, so re-sharding is always safe; source
                 // callers back off `BoRegionMiss` and retry on this answer.
-                return SendReqOutcome::Resplit {
+                return SendReqOutcome::Resplit(Box::new(Resplit {
                     plan,
                     backoff,
                     region_miss: Some((
@@ -1754,7 +1759,7 @@ where
                         format!("region missing in cache: {region_ver_id:?}"),
                         error,
                     )),
-                };
+                }));
             }
             Err(err) if is_selector_exhausted_error(&err) => {
                 if let Some((config, reason)) = plan.largest_pending_backoff() {
@@ -1772,7 +1777,7 @@ where
                 // cache, exactly like a region that left the cache. Returning
                 // it as a terminal error instead failed whole transactions
                 // (e.g. bulk prewrites) while Regions were splitting.
-                return SendReqOutcome::Resplit {
+                return SendReqOutcome::Resplit(Box::new(Resplit {
                     plan,
                     backoff,
                     region_miss: Some((
@@ -1780,7 +1785,7 @@ where
                         format!("replica selector exhausted: {region_ver_id:?}"),
                         err,
                     )),
-                };
+                }));
             }
             Err(err) => {
                 return Self::handle_other_error(
@@ -1929,7 +1934,7 @@ where
                 if plan.retries_undetermined_result() && backoff.retries_terminal_region_errors() {
                     drop(on_region_error_span);
                     let error = Error::RegionError(Box::new(e));
-                    return SendReqOutcome::Resplit {
+                    return SendReqOutcome::Resplit(Box::new(Resplit {
                         plan,
                         backoff,
                         region_miss: Some((
@@ -1937,7 +1942,7 @@ where
                             format!("raw region error: {error:?}"),
                             error,
                         )),
-                    };
+                    }));
                 }
                 return SendReqOutcome::Done(Err(Error::RegionError(Box::new(e))), backoff);
             }
@@ -2079,7 +2084,7 @@ where
                     // client-go's sender returns the region error; its
                     // caller backs off `BoRegionMiss` and re-splits.
                     drop(on_region_error_span);
-                    return SendReqOutcome::Resplit {
+                    return SendReqOutcome::Resplit(Box::new(Resplit {
                         plan,
                         backoff,
                         region_miss: Some((
@@ -2087,7 +2092,7 @@ where
                             format!("raw region error: {error:?}"),
                             error,
                         )),
-                    };
+                    }));
                 }
                 Err(error) => return SendReqOutcome::Done(Err(error), backoff),
             };
@@ -2298,11 +2303,11 @@ where
                 } else {
                     // The invalidated region leaves the sender without a
                     // route; client-go's caller re-splits the request.
-                    SendReqOutcome::Resplit {
+                    SendReqOutcome::Resplit(Box::new(Resplit {
                         plan,
                         backoff,
                         region_miss: None,
-                    }
+                    }))
                 }
             }
             Ok(false) => SendReqOutcome::Done(Err(e), backoff),
@@ -6538,6 +6543,17 @@ mod test {
             snapshot_async_batch_get: false,
         };
         assert!(plan.execute().await.is_err())
+    }
+
+    /// Every send returns its outcome through the sender's span wrappers; the
+    /// cold re-split, which carries the whole plan, must not size it.
+    #[test]
+    fn a_send_outcome_is_not_sized_by_its_cold_resplit() {
+        type GetPlan = ResolveLock<Dispatch<kvrpcpb::GetRequest>, MockPdClient>;
+        let outcome = std::mem::size_of::<
+            SendReqOutcome<GetPlan, Vec<Result<kvrpcpb::GetResponse>>, SnapshotRegionBackoff>,
+        >();
+        assert!(outcome <= 256, "the send outcome is {outcome} bytes");
     }
 
     #[tokio::test]
