@@ -30,14 +30,17 @@ use crate::proto::pdpb::Timestamp;
 use crate::request::Collect;
 use crate::request::CollectError;
 use crate::request::CollectSingle;
+use crate::request::DefaultProcessor;
 use crate::request::Dispatch;
 use crate::request::EncodeKeyspace;
 use crate::request::KeyMode;
 use crate::request::Keyspace;
 use crate::request::KvRequest;
+use crate::request::Merge;
 use crate::request::NoTarget;
 use crate::request::Plan;
 use crate::request::PlanBuilder;
+use crate::request::Process;
 use crate::request::RetryOptions;
 use crate::request::Shardable;
 use crate::request::TruncateKeyspace;
@@ -2221,10 +2224,14 @@ impl<PdC: PdClient> Transaction<PdC> {
                         snapshot_runtime_stats.clone(),
                         snapshot_variables,
                     )
-                    .merge(CollectSingle)
-                    .post_process_default()
                     .plan();
-                    let value = plan.execute().await?;
+                    // client-go `KVSnapshot.get` sends the one request it
+                    // built: the plan runs once, on itself, and its one
+                    // response is the value. Boxed: inline, the request's
+                    // state would be moved with every future around the Get.
+                    let responses = Box::pin(plan.execute_once()).await;
+                    let value = DefaultProcessor
+                        .process(responses.and_then(|responses| CollectSingle.merge(responses)))?;
                     if let Some(validator) = snapshot_visibility_validator {
                         validator.check_visibility(snapshot_version).await?;
                     }
@@ -2365,9 +2372,9 @@ impl<PdC: PdClient> Transaction<PdC> {
                         snapshot_runtime_stats.clone(),
                         snapshot_variables,
                     )
-                    .merge(CollectSingle)
                     .plan();
-                    let response = plan.execute().await?;
+                    // As `get_in_statement`: the plan runs once, on itself.
+                    let response = CollectSingle.merge(Box::pin(plan.execute_once()).await?)?;
                     if let Some(validator) = snapshot_visibility_validator {
                         validator.check_visibility(snapshot_version).await?;
                     }
