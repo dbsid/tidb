@@ -429,6 +429,25 @@ impl<PdC: PdClient> Client<PdC> {
         Ok(self.new_transaction(timestamp, options))
     }
 
+    /// client-go `KVStore.Begin(tikv.WithStartTS(ts))`: a transaction at the
+    /// start timestamp `options` configures takes no timestamp from the
+    /// oracle, so it begins without awaiting anything, as
+    /// [`Self::begin_with_options`] does for such options.
+    ///
+    /// Fails when `options` configures no start timestamp.
+    pub fn begin_with_start_timestamp(
+        &self,
+        options: TransactionOptions,
+    ) -> Result<Transaction<PdC>> {
+        options.validate()?;
+        let timestamp = options.configured_start_timestamp().ok_or_else(|| {
+            crate::Error::StringError(
+                "a transaction begun without the oracle needs a start timestamp".to_owned(),
+            )
+        })?;
+        Ok(self.new_transaction(timestamp, options))
+    }
+
     /// Create a new [`Snapshot`] at the given [`Timestamp`].
     pub fn snapshot(&self, timestamp: Timestamp, options: TransactionOptions) -> Snapshot<PdC> {
         Snapshot::new(self.new_transaction(timestamp, options.read_only()))
@@ -802,8 +821,8 @@ impl<PdC: PdClient> Client<PdC> {
             self.keyspace,
             self.keyspace_name.clone(),
             self.latches.clone(),
+            self.lock_resolver_context.clone(),
         );
-        transaction.set_lock_resolver_context(self.lock_resolver_context.clone());
         transaction.set_read_timestamp_validator(self.read_timestamp_validator.clone());
         // client-go checks the store's txn safe point after a read returns
         // (`KVSnapshot.Get` / `BatchGet`, `Scanner.Next`), not before it is
@@ -992,6 +1011,41 @@ mod latch_config_tests {
             TransactionOptions::new_optimistic(),
         );
         drop(snapshot);
+    }
+
+    /// client-go `KVStore.Begin(tikv.WithStartTS(ts))` begins at the given
+    /// timestamp without the oracle; without one there is nothing to begin at.
+    #[tokio::test]
+    async fn a_transaction_begins_at_its_configured_start_timestamp_without_the_oracle() {
+        let (_client, cluster, pd) =
+            crate::mock::mocktikv::new_tikv_and_pd_client("", None).unwrap();
+        crate::mock::mocktikv::bootstrap_with_single_store(&cluster);
+        let client = Client::new_with_pd_client(Arc::new(pd), Config::default())
+            .await
+            .unwrap();
+        let mut writer = client.begin_optimistic().await.unwrap();
+        writer.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+        writer.commit().await.unwrap();
+        let read_ts = client.current_timestamp().await.unwrap();
+
+        let mut reader = client
+            .begin_with_start_timestamp(
+                TransactionOptions::new_optimistic()
+                    .read_only()
+                    .start_timestamp(read_ts.clone()),
+            )
+            .unwrap();
+        assert_eq!(reader.start_timestamp().version(), read_ts.version());
+        assert_eq!(
+            reader.get(b"k".to_vec()).await.unwrap(),
+            Some(b"v".to_vec())
+        );
+        // A read-only transaction has nothing to roll back.
+        drop(reader);
+
+        assert!(client
+            .begin_with_start_timestamp(TransactionOptions::new_optimistic())
+            .is_err());
     }
 
     /// client-go `KVStore.SetOracle`: the store's timestamps come from the

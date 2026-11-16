@@ -166,8 +166,11 @@ impl<S: PdClient> TikvTxn<S> {
         } else {
             options
         };
+        // Go `store.Begin(tikv.WithStartTS(ts))`: the start timestamp is
+        // given, so the transaction begins without the runtime.
         let mut transaction = store
-            .block_on(store.store().begin_with_options(options))
+            .store()
+            .begin_with_start_timestamp(options)
             .map_err(Self::client_read_error)?;
         transaction.add_rpc_interceptor(calls.interceptor());
         // Go `newTiKVTxn` -> `txn.SetKVFilter(TiDBKVFilter{})`.

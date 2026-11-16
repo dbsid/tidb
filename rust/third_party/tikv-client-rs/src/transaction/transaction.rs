@@ -1309,7 +1309,13 @@ impl<PdC: PdClient> Transaction<PdC> {
     ) -> Result<Transaction<PdC>> {
         options.validate()?;
         Ok(Self::new_with_latches_and_keyspace_name(
-            timestamp, rpc, options, keyspace, None, None,
+            timestamp,
+            rpc,
+            options,
+            keyspace,
+            None,
+            None,
+            ResolveLocksContext::default(),
         ))
     }
 
@@ -1321,9 +1327,19 @@ impl<PdC: PdClient> Transaction<PdC> {
         keyspace: Keyspace,
         latches: Option<Arc<LatchesScheduler>>,
     ) -> Transaction<PdC> {
-        Self::new_with_latches_and_keyspace_name(timestamp, rpc, options, keyspace, None, latches)
+        Self::new_with_latches_and_keyspace_name(
+            timestamp,
+            rpc,
+            options,
+            keyspace,
+            None,
+            latches,
+            ResolveLocksContext::default(),
+        )
     }
 
+    /// A transaction whose lock resolution runs with `lock_resolver_context`,
+    /// its store's context (client-go `store.GetLockResolver()`).
     pub(crate) fn new_with_latches_and_keyspace_name(
         timestamp: Timestamp,
         rpc: Arc<PdC>,
@@ -1331,6 +1347,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         keyspace: Keyspace,
         keyspace_name: Option<String>,
         latches: Option<Arc<LatchesScheduler>>,
+        lock_resolver_context: ResolveLocksContext,
     ) -> Transaction<PdC> {
         let status = if options.read_only {
             TransactionStatus::ReadOnly
@@ -1379,7 +1396,7 @@ impl<PdC: PdClient> Transaction<PdC> {
             snapshot_visibility_validator: None,
             read_replica_scope: String::new(),
             read_lock_context: ReadLockContext::default(),
-            lock_resolver_context: ResolveLocksContext::default(),
+            lock_resolver_context,
             is_heartbeat_started: Arc::new(atomic::AtomicBool::new(false)),
             heartbeat_generation: Arc::new(atomic::AtomicU64::new(0)),
             committer_initialized: pipelined,
@@ -18038,6 +18055,7 @@ mod tests {
             Keyspace::try_enable(7).unwrap(),
             Some("tenant".to_owned()),
             None,
+            ResolveLocksContext::default(),
         );
 
         txn.get("read".to_owned()).await.unwrap();
