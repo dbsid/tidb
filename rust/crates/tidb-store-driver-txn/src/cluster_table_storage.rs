@@ -294,13 +294,47 @@ pub struct StatementSnapshot<S = tikv_client::PdRpcClient>
 where
     S: StoreClient,
 {
-    /// `None` once the statement has finished; every read after that is
-    /// refused because its transaction has already ended.
-    transaction: Option<TikvTxn<S>>,
+    /// The read-only transaction at `start_ts`; see [`SnapshotTransaction`].
+    transaction: SnapshotTransaction<S>,
     start_ts: u64,
     timeout: Duration,
     /// Reused by all reads in this statement; see `SessionSnapshot`.
     cancellation: UnaryCancellation,
+}
+
+/// The read-only transaction behind a [`StatementSnapshot`].
+///
+/// A statement that reads only through coprocessor requests names the
+/// snapshot's timestamp and never reads through the transaction, so the first
+/// read that does opens it. Opening at a known timestamp spends no timestamp
+/// and sends no request, so every read still sees the statement's snapshot.
+enum SnapshotTransaction<S: StoreClient> {
+    /// Not opened yet; the statement settings it receives are applied, in
+    /// order, when it opens.
+    Pending {
+        opener: Arc<RealOptimisticTransactionOpener<S>>,
+        settings: Vec<PendingSnapshotSetting>,
+    },
+    Open(TikvTxn<S>),
+    /// The statement has finished; every read after that is refused.
+    Finished,
+}
+
+/// A statement setting received before the transaction opened.
+enum PendingSnapshotSetting {
+    ReadOptions(tidb_txnkv::SnapshotReadOptions),
+    RequestSource(tidb_txnkv::RequestSource),
+    KvContext(tidb_txnkv::StatementKvContextCell),
+}
+
+impl PendingSnapshotSetting {
+    fn apply<S: StoreClient>(self, transaction: &mut TikvTxn<S>) {
+        match self {
+            Self::ReadOptions(options) => transaction.set_snapshot_read_options(&options),
+            Self::RequestSource(source) => transaction.set_request_source(&source),
+            Self::KvContext(context) => transaction.set_statement_kv_context(context),
+        }
+    }
 }
 
 /// One statement snapshot whose ordinary PD timestamp request is in flight.
@@ -318,18 +352,21 @@ where
 }
 
 impl<S: StoreClient> PreparedStatementSnapshot<S> {
-    /// Waits for the timestamp prepared after planning, then opens the
-    /// read-only transaction HERE. `begin_read_only_at` spends no timestamp
-    /// and sends no request -- it is local state over an already-shared
-    /// transport -- so handing it to another thread only bought a round trip.
+    /// Waits for the timestamp prepared after planning. The read-only
+    /// transaction opens on this thread at the first read through it:
+    /// `begin_read_only_at` spends no timestamp and sends no request -- it is
+    /// local state over an already-shared transport -- and a statement whose
+    /// reads are all coprocessor requests needs only the timestamp.
     pub fn wait(self) -> Result<StatementSnapshot<S>, OptimisticCoordinatorError> {
         let start_ts = self
             .start_ts
             .wait()
             .map_err(|error| OptimisticCoordinatorError::Timestamp(error.to_string()))?;
-        let transaction = self.opener.begin_read_only_at(start_ts)?;
         Ok(StatementSnapshot {
-            transaction: Some(transaction),
+            transaction: SnapshotTransaction::Pending {
+                opener: self.opener,
+                settings: Vec::new(),
+            },
             start_ts,
             timeout: self.timeout,
             cancellation: UnaryCancellation::new(),
@@ -342,7 +379,10 @@ impl<S: StoreClient> fmt::Debug for StatementSnapshot<S> {
         formatter
             .debug_struct("StatementSnapshot")
             .field("start_ts", &self.start_ts)
-            .field("open", &self.transaction.is_some())
+            .field(
+                "open",
+                &matches!(self.transaction, SnapshotTransaction::Open(_)),
+            )
             .finish()
     }
 }
@@ -356,7 +396,7 @@ impl StatementSnapshot {
     ) -> Result<StatementSnapshot<S>, OptimisticCoordinatorError> {
         let transaction = opener.begin_read_only_at(start_ts)?;
         Ok(StatementSnapshot {
-            transaction: Some(transaction),
+            transaction: SnapshotTransaction::Open(transaction),
             start_ts,
             timeout,
             cancellation: UnaryCancellation::new(),
@@ -401,7 +441,9 @@ impl<S: StoreClient> StatementSnapshot<S> {
     ///
     /// Calling it twice is a no-op: the statement is already finished.
     pub fn finish(&mut self) -> Result<(), StorageError> {
-        let Some(transaction) = self.transaction.take() else {
+        let SnapshotTransaction::Open(transaction) =
+            std::mem::replace(&mut self.transaction, SnapshotTransaction::Finished)
+        else {
             return Ok(());
         };
         transaction
@@ -418,10 +460,37 @@ impl<S: StoreClient> StatementSnapshot<S> {
         UnaryCallContext::with_deadline(Instant::now() + self.timeout, self.cancellation.clone())
     }
 
+    /// The open transaction, opened by this first read through it.
     fn reader(&mut self) -> Result<&mut TikvTxn<S>, StorageError> {
-        self.transaction
-            .as_mut()
-            .ok_or_else(|| StorageError::Backend("the transaction is already finished".to_owned()))
+        if matches!(self.transaction, SnapshotTransaction::Pending { .. }) {
+            let SnapshotTransaction::Pending { opener, settings } =
+                std::mem::replace(&mut self.transaction, SnapshotTransaction::Finished)
+            else {
+                unreachable!("the snapshot was pending");
+            };
+            let mut transaction = opener
+                .begin_read_only_at(self.start_ts)
+                .map_err(|error| StorageError::Backend(error.to_string()))?;
+            for setting in settings {
+                setting.apply(&mut transaction);
+            }
+            self.transaction = SnapshotTransaction::Open(transaction);
+        }
+        match &mut self.transaction {
+            SnapshotTransaction::Open(transaction) => Ok(transaction),
+            _ => Err(StorageError::Backend(
+                "the transaction is already finished".to_owned(),
+            )),
+        }
+    }
+
+    /// Hands `setting` to the transaction, or keeps it for its opening.
+    fn apply_setting(&mut self, setting: PendingSnapshotSetting) {
+        match &mut self.transaction {
+            SnapshotTransaction::Open(transaction) => setting.apply(transaction),
+            SnapshotTransaction::Pending { settings, .. } => settings.push(setting),
+            SnapshotTransaction::Finished => {}
+        }
     }
 }
 
@@ -433,7 +502,9 @@ impl<S: StoreClient> Drop for StatementSnapshot<S> {
         // on a read-only transaction is a local state transition and sends no
         // request -- which is why this no longer has to be detached to keep
         // the next statement off its critical path.
-        if let Some(transaction) = self.transaction.take() {
+        if let SnapshotTransaction::Open(transaction) =
+            std::mem::replace(&mut self.transaction, SnapshotTransaction::Finished)
+        {
             let _ = transaction.finish_without_writes();
         }
     }
@@ -441,27 +512,22 @@ impl<S: StoreClient> Drop for StatementSnapshot<S> {
 
 impl<S: StoreClient> ClusterSnapshot for StatementSnapshot<S> {
     fn set_snapshot_read_options(&mut self, options: tidb_txnkv::SnapshotReadOptions) {
-        if let Some(transaction) = self.transaction.as_mut() {
-            transaction.set_snapshot_read_options(&options);
-        }
+        self.apply_setting(PendingSnapshotSetting::ReadOptions(options));
     }
 
     fn set_request_source(&mut self, source: &tidb_txnkv::RequestSource) {
-        if let Some(transaction) = self.transaction.as_mut() {
-            transaction.set_request_source(source);
-        }
+        self.apply_setting(PendingSnapshotSetting::RequestSource(source.clone()));
     }
 
     fn set_statement_kv_context(&mut self, context: &tidb_txnkv::StatementKvContextCell) {
-        if let Some(transaction) = self.transaction.as_mut() {
-            transaction.set_statement_kv_context(context.clone());
-        }
+        self.apply_setting(PendingSnapshotSetting::KvContext(context.clone()));
     }
 
     fn point_rpc_counts(&mut self) -> (u64, u64) {
-        self.transaction
-            .as_ref()
-            .map_or((0, 0), TikvTxn::snapshot_point_rpc_counts)
+        match &self.transaction {
+            SnapshotTransaction::Open(transaction) => transaction.snapshot_point_rpc_counts(),
+            _ => (0, 0),
+        }
     }
 
     fn get(&mut self, key: &Key) -> Result<Option<Vec<u8>>, StorageError> {
@@ -2623,7 +2689,7 @@ mod tests {
     /// snapshot itself.
     fn a_finished_statement_snapshot_refuses_reads_and_finishes_once() {
         let mut snapshot: StatementSnapshot = StatementSnapshot {
-            transaction: None,
+            transaction: SnapshotTransaction::Finished,
             start_ts: 42,
             timeout: Duration::from_secs(1),
             cancellation: UnaryCancellation::new(),
