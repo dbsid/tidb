@@ -266,12 +266,16 @@ where
         call: &tidb_txnkv::rpc::UnaryCallContext,
         options: &tidb_txnkv::SnapshotReadOptions,
     ) -> Result<(Option<Vec<u8>>, u64), OptimisticCoordinatorError> {
-        let mut snapshot = self.max_ts_snapshot(options)?;
-        let result = snapshot
-            .snapshot_get(key, call)
-            .map(|result| (result.value, result.rpc_count));
-        snapshot.finish_without_writes()?;
-        result
+        // Go reads the point through the store's snapshot at `MaxUint64`
+        // (`GetSnapshot`), with no transaction around it.
+        crate::transaction::snapshot::TikvSnapshot::open(
+            &self.store,
+            u64::MAX,
+            options,
+            self.resource_group_name.as_deref(),
+        )
+        .get(key, call)
+        .map(|result| (result.value, result.rpc_count))
     }
 
     /// Reads a bounded range at `u64::MAX` without activating a transaction.

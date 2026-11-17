@@ -20,6 +20,7 @@
 
 mod call_interceptor;
 mod coordinator;
+mod snapshot;
 
 pub use coordinator::{
     CommitProtocol, ProductionTransaction, RealOptimisticTransactionOpener, TikvTxn,
