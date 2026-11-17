@@ -151,6 +151,68 @@ where
     }
 }
 
+/// Locates the regions covering the logical ranges and decodes their metadata
+/// for the coprocessor task builder. Lookups use physical TiKV keys.
+async fn locate_regions<F>(
+    ranges: &[(Vec<u8>, Vec<u8>)],
+    codec: Option<&tikv_client::request::ApiV2Codec>,
+    mut region_for_key: impl FnMut(tikv_client::Key) -> F,
+) -> Result<Vec<tikv_client::RegionWithLeader>, tikv_client::Error>
+where
+    F: std::future::Future<Output = Result<tikv_client::RegionWithLeader, tikv_client::Error>>,
+{
+    let mut regions: Vec<tikv_client::RegionWithLeader> = Vec::new();
+    for (start, end) in ranges {
+        let mut start = start.as_slice();
+        // Go BatchLocateKeyRanges consumes the prefix already covered by its
+        // last region. These bounds have been decoded into the caller's keyspace.
+        if let Some(last) = regions.last() {
+            let lower = last.region.start_key.as_slice();
+            let upper = last.region.end_key.as_slice();
+            if lower <= start && (upper.is_empty() || start < upper) {
+                if upper.is_empty() || (!end.is_empty() && end.as_slice() <= upper) {
+                    continue;
+                }
+                start = upper;
+            }
+        }
+        let (mut next, end) = match codec {
+            Some(codec) => codec.encode_range(start, end),
+            None => (start.to_vec(), end.clone()),
+        };
+        loop {
+            let mut region = region_for_key(next.into()).await?;
+            let region_end = region.region.end_key.clone();
+            if regions
+                .last()
+                .is_none_or(|last| last.region.id != region.region.id)
+            {
+                if let Some(codec) = codec {
+                    (region.region.start_key, region.region.end_key) =
+                        codec.decode_range(&region.region.start_key, &region.region.end_key)?;
+                    if let Some(buckets) = &mut region.buckets {
+                        let wire = tikv_client::request::ApiV1Codec::new(
+                            tikv_client::request::KeyMode::Txn,
+                        );
+                        let encoded = buckets
+                            .keys
+                            .iter()
+                            .map(|key| wire.encode_region_key(key))
+                            .collect::<Vec<_>>();
+                        buckets.keys = codec.decode_bucket_keys(&encoded)?;
+                    }
+                }
+                regions.push(region);
+            }
+            if region_end.is_empty() || (!end.is_empty() && region_end >= end) {
+                break;
+            }
+            next = region_end;
+        }
+    }
+    Ok(regions)
+}
+
 impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
     fn cluster_id(&self) -> u64 {
         self.block_on(self.store().pd_client().cluster_id())
@@ -163,35 +225,20 @@ impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
     ) -> Result<Vec<tikv_client::RegionWithLeader>, tikv_client::Error> {
         self.block_on(with_statement_kv_context(kv_context, async {
             let pd = self.store().pd_client();
-            let codec=match self.store().keyspace() {
-                tikv_client::request::Keyspace::Enable {keyspace_id}=>Some(tikv_client::request::ApiV2Codec::new(tikv_client::request::KeyMode::Txn,keyspace_id)?),
-                _=>None,
-            };
-            let mut regions: Vec<tikv_client::RegionWithLeader> = Vec::new();
-            for (start, end) in ranges {
-                // Go `CodecPDClient`: TiDB sees logical boundaries, while
-                // the native client's region cache retains physical keys.
-                let (start,end)=codec.as_ref().map_or_else(||(start.clone(),end.clone()),|codec|codec.encode_range(start,end));
-                let mut next = start;
-                loop {
-                    let mut region = pd.region_for_key(&next.clone().into()).await?;
-                    let region_end = region.region.end_key.clone();
-                    if regions.last().is_none_or(|last| last.region.id != region.region.id) {
-                        if let Some(codec)=&codec {
-                            (region.region.start_key,region.region.end_key)=codec.decode_range(&region.region.start_key,&region.region.end_key)?;
-                            if let Some(buckets)=&mut region.buckets {
-                                let wire=tikv_client::request::ApiV1Codec::new(tikv_client::request::KeyMode::Txn);
-                                let encoded=buckets.keys.iter().map(|key|wire.encode_region_key(key)).collect::<Vec<_>>();
-                                buckets.keys=codec.decode_bucket_keys(&encoded)?;
-                            }
-                        }
-                        regions.push(region);
-                    }
-                    if region_end.is_empty() || (!end.is_empty() && region_end >= end) {break;}
-                    next = region_end;
+            let codec = match self.store().keyspace() {
+                tikv_client::request::Keyspace::Enable { keyspace_id } => {
+                    Some(tikv_client::request::ApiV2Codec::new(
+                        tikv_client::request::KeyMode::Txn,
+                        keyspace_id,
+                    )?)
                 }
-            }
-            Ok(regions)
+                _ => None,
+            };
+            locate_regions(ranges, codec.as_ref(), |key| {
+                let pd = &pd;
+                async move { pd.region_for_key(&key).await }
+            })
+            .await
         }))
     }
 
@@ -333,6 +380,71 @@ mod tests {
     use tikv_client::mock::{MockKvClient, MockPdClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cop_ranges_reuse_a_region_until_its_exclusive_end() {
+        use tikv_client::PdClient;
+
+        let pd = MockPdClient::default();
+        let mut lookups = Vec::new();
+        // The mock regions are [empty, 10), [10, 250:250), [250:250, infinity).
+        // Cover a whole range, continue a crossing range, then start exactly
+        // at a boundary. The last range revisits an earlier region.
+        let ranges = vec![
+            (vec![1], vec![2]),
+            (vec![3], vec![10]),
+            (vec![4], vec![15]),
+            (vec![250, 250], Vec::new()),
+            (vec![255], Vec::new()),
+            (vec![1], vec![2]),
+        ];
+        let regions = locate_regions(&ranges, None, |key| {
+            let bytes: &[u8] = (&key).into();
+            lookups.push(bytes.to_vec());
+            let pd = &pd;
+            async move { pd.region_for_key(&key).await }
+        })
+        .await
+        .unwrap();
+        assert_eq!(regions.len(), 4);
+        assert_eq!(lookups, [vec![1], vec![10], vec![250, 250], vec![1]]);
+    }
+
+    #[tokio::test]
+    async fn cop_region_reuse_compares_logical_keyspace_bounds() {
+        use tikv_client::request::{ApiV2Codec, KeyMode};
+
+        let codec = ApiV2Codec::new(KeyMode::Txn, 42).unwrap();
+        let (_, split) = codec.encode_range(b"a", b"m");
+        let (prefix, limit) = codec.encode_range(b"", b"");
+        let ranges = [
+            (b"a".to_vec(), b"c".to_vec()),
+            (b"d".to_vec(), b"z".to_vec()),
+            (b"z".to_vec(), Vec::new()),
+        ];
+        let mut lookups = Vec::new();
+        let regions = locate_regions(&ranges, Some(&codec), |key| {
+            let key: Vec<u8> = key.into();
+            let mut region = tikv_client::RegionWithLeader::default();
+            if key < split {
+                region.region.id = 1;
+                region.region.start_key = prefix.clone();
+                region.region.end_key = split.clone();
+            } else {
+                region.region.id = 2;
+                region.region.start_key = split.clone();
+                region.region.end_key = limit.clone();
+            }
+            lookups.push(key);
+            std::future::ready(Ok(region))
+        })
+        .await
+        .unwrap();
+        assert_eq!(lookups, [codec.encode_range(b"a", b"c").0, split]);
+        assert_eq!(regions[0].region.end_key, b"m");
+        assert_eq!(regions[1].region.start_key, b"m");
+        assert!(regions[1].region.end_key.is_empty());
+    }
 
     /// Go's coprocessor sends its `copReq` through `SendReqCtx` and reads the
     /// `*coprocessor.Response` it returns: the store sends the request it is
