@@ -7090,6 +7090,7 @@ dependencies = [
  "getrandom 0.3.4",
  "jsonschema",
  "md-5",
+ "once_cell",
  "prost 0.14.4",
  "regex",
  "reqwest 0.13.4",

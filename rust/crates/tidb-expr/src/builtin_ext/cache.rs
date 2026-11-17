@@ -21,6 +21,8 @@
 
 use std::sync::{Arc, RwLock};
 
+use once_cell::race::OnceBox;
+
 #[derive(Debug)]
 struct CacheItem<T> {
     context_id: u64,
@@ -30,13 +32,15 @@ struct CacheItem<T> {
 /// A single context-keyed lazy value, matching Go's `builtinFuncCache[T]`.
 #[derive(Debug)]
 pub(crate) struct BuiltinFuncCache<T> {
-    cached: RwLock<Option<CacheItem<T>>>,
+    // Go stores each cache on its owning builtin signature. Keep the lock and
+    // its entry out of expressions whose signature never uses this cache.
+    cached: OnceBox<RwLock<Option<CacheItem<T>>>>,
 }
 
 impl<T> Default for BuiltinFuncCache<T> {
     fn default() -> Self {
         Self {
-            cached: RwLock::new(None),
+            cached: OnceBox::new(),
         }
     }
 }
@@ -52,6 +56,7 @@ impl<T> BuiltinFuncCache<T> {
     /// Returns the value for `context_id` without initializing the cache.
     pub(crate) fn get_cache(&self, context_id: u64) -> Option<Arc<T>> {
         self.cached
+            .get()?
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
@@ -72,6 +77,7 @@ impl<T> BuiltinFuncCache<T> {
 
         let mut cached = self
             .cached
+            .get_or_init(Box::default)
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(item) = cached.as_ref().filter(|item| item.context_id == context_id) {
@@ -82,5 +88,20 @@ impl<T> BuiltinFuncCache<T> {
         Ok(Arc::clone(
             &cached.as_ref().expect("cache item installed").value,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BuiltinFuncCache;
+
+    #[test]
+    fn an_unused_signature_cache_occupies_one_pointer() {
+        // Every scalar expression carries these handles, including AND and OR
+        // nodes that ranger moves while rebuilding prepared index ranges.
+        assert_eq!(
+            std::mem::size_of::<BuiltinFuncCache<i64>>(),
+            std::mem::size_of::<usize>()
+        );
     }
 }
