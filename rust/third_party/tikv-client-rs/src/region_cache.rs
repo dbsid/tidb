@@ -108,24 +108,39 @@ impl std::fmt::Display for InvalidReason {
 }
 
 /// Cache-local state that client-go keeps beside immutable PD region metadata.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CachedRegion {
     region: RegionWithLeader,
     /// Snapshot of every peer store's failure epoch at the time this region
     /// entered the cache. A later failure on any of those stores invalidates
     /// only regions that still carry this old snapshot.
     store_epochs: HashMap<StoreId, u32>,
-    /// Epoch seconds; client-go treats `now == ttl` as still live.
-    ttl: i64,
-    /// Source `Region.syncFlags`. Cache mutation is serialized by the Rust
-    /// cache lock, so this does not need client-go's atomic representation.
-    sync_flags: u8,
+    /// Epoch seconds; client-go treats `now == ttl` as still live. Atomic,
+    /// as client-go's `Region.ttl`: a lookup refreshes it under the read lock.
+    ttl: AtomicI64,
+    /// Source `Region.syncFlags`, atomic as client-go's: a lookup takes them
+    /// under the read lock.
+    sync_flags: AtomicU8,
     tiflash_cursor: Arc<AtomicUsize>,
     /// Last forwarding proxy that completed successfully for this cached
     /// region. Source prefers it before walking the remaining replicas.
     proxy_store_id: Option<StoreId>,
     /// Source `Region.invalidReason`: why the region is invalidated.
     invalid_reason: InvalidReason,
+}
+
+impl Clone for CachedRegion {
+    fn clone(&self) -> Self {
+        Self {
+            region: self.region.clone(),
+            store_epochs: self.store_epochs.clone(),
+            ttl: AtomicI64::new(self.ttl()),
+            sync_flags: AtomicU8::new(self.sync_flags.load(Ordering::Acquire)),
+            tiflash_cursor: Arc::clone(&self.tiflash_cursor),
+            proxy_store_id: self.proxy_store_id,
+            invalid_reason: self.invalid_reason,
+        }
+    }
 }
 
 impl CachedRegion {
@@ -138,8 +153,8 @@ impl CachedRegion {
         Self {
             region,
             store_epochs,
-            ttl: next_region_cache_ttl(now),
-            sync_flags,
+            ttl: AtomicI64::new(next_region_cache_ttl(now)),
+            sync_flags: AtomicU8::new(sync_flags),
             tiflash_cursor: Arc::new(AtomicUsize::new(0)),
             proxy_store_id: None,
             invalid_reason: InvalidReason::Ok,
@@ -154,34 +169,54 @@ impl CachedRegion {
             if count {
                 crate::stats::observe_region_cache_invalidate_region();
             }
-            self.ttl = EXPIRED_TTL;
+            self.ttl.store(EXPIRED_TTL, Ordering::Release);
         }
     }
 
+    /// The epoch second after which the entry is expired.
+    fn ttl(&self) -> i64 {
+        self.ttl.load(Ordering::Acquire)
+    }
+
+    /// Source `Region.checkSyncFlags`.
     fn has_sync_flags(&self, flags: u8) -> bool {
-        self.sync_flags & flags != 0
+        self.sync_flags.load(Ordering::Acquire) & flags != 0
     }
 
-    fn set_sync_flags(&mut self, flags: u8) {
-        self.sync_flags |= flags;
+    /// Source `Region.setSyncFlags`.
+    fn set_sync_flags(&self, flags: u8) {
+        self.sync_flags.fetch_or(flags, Ordering::AcqRel);
     }
 
-    fn take_sync_flags(&mut self, flags: u8) -> u8 {
-        let taken = self.sync_flags & flags;
-        self.sync_flags &= !flags;
-        taken
+    /// Source `Region.resetSyncFlags`: clears `flags`, returning those set.
+    fn take_sync_flags(&self, flags: u8) -> u8 {
+        self.sync_flags.fetch_and(!flags, Ordering::AcqRel) & flags
     }
 
-    /// Source `Region.checkRegionCacheTTL`, serialized by the cache lock.
-    fn check_ttl(&mut self, now: i64) -> bool {
-        if now > self.ttl {
-            return false;
+    /// Source `Region.checkRegionCacheTTL`: whether the entry is live at
+    /// `now`, extending a TTL about to expire.
+    fn check_ttl(&self, now: i64) -> bool {
+        loop {
+            let ttl = self.ttl();
+            if now > ttl {
+                return false;
+            }
+            if self.has_sync_flags(NEED_EXPIRE_AFTER_TTL) || ttl > now + region_cache_ttl_secs() {
+                return true;
+            }
+            if self
+                .ttl
+                .compare_exchange(
+                    ttl,
+                    next_region_cache_ttl(now),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
         }
-        if !self.has_sync_flags(NEED_EXPIRE_AFTER_TTL) && self.ttl <= now + region_cache_ttl_secs()
-        {
-            self.ttl = next_region_cache_ttl(now);
-        }
-        true
     }
 }
 
@@ -1118,7 +1153,7 @@ impl<C: Send + Sync> RegionCache<C> {
             let expired = cache
                 .ver_id_to_region
                 .get(&ver_id)
-                .is_some_and(|region| now > region.ttl);
+                .is_some_and(|region| now > region.ttl());
             if expired {
                 if let Some(region) = cache.ver_id_to_region.remove(&ver_id) {
                     cache.key_to_ver_id.remove(&start_key);
@@ -1613,7 +1648,9 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         key: &Key,
         backoffer: Option<&mut RetryBackoffer>,
     ) -> Result<RegionWithLeader> {
-        let mut region_cache_guard = self.region_cache.write().await;
+        // Source `searchCachedRegionByKey`: `mu.RLock`; the entry's TTL and
+        // sync flags are atomics.
+        let region_cache_guard = self.region_cache.read().await;
         let res = {
             region_cache_guard
                 .key_to_ver_id
@@ -1625,7 +1662,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         let reload = if let Some((_, candidate_region_ver_id)) = res {
             let region = region_cache_guard
                 .ver_id_to_region
-                .get_mut(&candidate_region_ver_id)
+                .get(&candidate_region_ver_id)
                 .unwrap();
 
             if region.region.contains(key) && region.check_ttl(now_epoch_secs()) {
@@ -1765,17 +1802,14 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     /// by reverse scans so an exact region boundary belongs to the preceding
     /// region rather than the following one.
     pub async fn get_region_by_end_key(&self, key: &Key) -> Result<RegionWithLeader> {
-        let mut region_cache_guard = self.region_cache.write().await;
+        let region_cache_guard = self.region_cache.read().await;
         let candidate = region_cache_guard
             .key_to_ver_id
             .range::<Key, _>(..key)
             .next_back()
             .map(|(_, version)| version.clone());
         let reload = if let Some(candidate) = candidate {
-            let region = region_cache_guard
-                .ver_id_to_region
-                .get_mut(&candidate)
-                .unwrap();
+            let region = region_cache_guard.ver_id_to_region.get(&candidate).unwrap();
             if region.region.start_key() < *key
                 && (region.region.end_key().is_empty() || *key <= region.region.end_key())
                 && region.check_ttl(now_epoch_secs())
@@ -1840,15 +1874,12 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
     pub async fn get_region_by_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         for _ in 0..=MAX_RETRY_WAITING_CONCURRENT_REQUEST {
-            let mut region_cache_guard = self.region_cache.write().await;
+            let region_cache_guard = self.region_cache.read().await;
 
             // check cache
             let ver_id = region_cache_guard.id_to_ver_id.get(&id).cloned();
             if let Some(ver_id) = ver_id {
-                let region = region_cache_guard
-                    .ver_id_to_region
-                    .get_mut(&ver_id)
-                    .unwrap();
+                let region = region_cache_guard.ver_id_to_region.get(&ver_id).unwrap();
                 if region.check_ttl(now_epoch_secs()) {
                     let flags =
                         region.take_sync_flags(NEED_RELOAD_ON_ACCESS | NEED_DELAYED_RELOAD_READY);
@@ -5116,6 +5147,40 @@ mod test {
         assert_eq!(located.leader.unwrap().store_id, 2);
     }
 
+    /// Source `searchCachedRegionByKey` / `getRegionByIDFromCache`: a cache
+    /// hit reads the cache under `mu.RLock` (the entry's TTL and sync flags
+    /// are atomics), so lookups go on while another reader holds the cache.
+    #[tokio::test]
+    async fn a_cache_hit_takes_only_the_read_lock() {
+        let client = Arc::new(MockRetryClient::default());
+        client
+            .regions
+            .lock()
+            .await
+            .insert(1, region_with_leader(1, b"", b""));
+        let cache = RegionCache::new(client.clone());
+        let located = cache
+            .get_region_by_key(&Key::from(b"a".to_vec()))
+            .await
+            .unwrap();
+
+        let reader = cache.region_cache.read().await;
+        let wait = Duration::from_secs(1);
+        let by_key =
+            tokio::time::timeout(wait, cache.get_region_by_key(&Key::from(b"a".to_vec()))).await;
+        let by_end_key =
+            tokio::time::timeout(wait, cache.get_region_by_end_key(&Key::from(b"b".to_vec())))
+                .await;
+        let by_id = tokio::time::timeout(wait, cache.get_region_by_id(located.id())).await;
+        drop(reader);
+
+        for (lookup, found) in [("key", by_key), ("end key", by_end_key), ("id", by_id)] {
+            let found =
+                found.unwrap_or_else(|_| panic!("the {lookup} lookup waited for the reader"));
+            assert_eq!(found.unwrap().ver_id(), located.ver_id(), "{lookup}");
+        }
+    }
+
     /// Source `Region.invalidate` / `InvalidateCachedRegionWithReason`: the
     /// region stays cached, expired, with the first reason only, and the
     /// next lookup reloads it from PD.
@@ -5137,7 +5202,7 @@ mod test {
             Some(super::InvalidReason::EpochNotMatch)
         );
         assert_eq!(
-            cache.region_cache.read().await.ver_id_to_region[&located.ver_id()].ttl,
+            cache.region_cache.read().await.ver_id_to_region[&located.ver_id()].ttl(),
             super::EXPIRED_TTL
         );
         // Source `GetCachedRegionWithRLock` still answers the invalid region.
@@ -5594,12 +5659,13 @@ mod test {
                 .ver_id_to_region
                 .get_mut(&cached.ver_id())
                 .unwrap()
-                .ttl = now;
+                .ttl
+                .store(now, std::sync::atomic::Ordering::Relaxed);
         }
         assert_eq!(cache.get_region_by_key(&vec![1].into()).await?, cached);
         {
             let guard = cache.region_cache.read().await;
-            assert!(guard.ver_id_to_region[&cached.ver_id()].ttl >= now + REGION_CACHE_TTL_SECS);
+            assert!(guard.ver_id_to_region[&cached.ver_id()].ttl() >= now + REGION_CACHE_TTL_SECS);
         }
 
         {
@@ -5608,7 +5674,8 @@ mod test {
                 .ver_id_to_region
                 .get_mut(&cached.ver_id())
                 .unwrap()
-                .ttl = now_epoch_secs() - 1;
+                .ttl
+                .store(now_epoch_secs() - 1, std::sync::atomic::Ordering::Relaxed);
         }
         let mut reloaded = cached.clone();
         reloaded.leader = reloaded.region.peers.first().cloned();
@@ -5668,7 +5735,10 @@ mod test {
         assert_eq!(cache.get_region_by_id(1).await.unwrap(), expected);
         assert_eq!(client.get_region_count.load(SeqCst), 2);
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&expected.ver_id()].sync_flags == 0
+            cache.region_cache.read().await.ver_id_to_region[&expected.ver_id()]
+                .sync_flags
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
         );
     }
 
@@ -5693,12 +5763,13 @@ mod test {
             .ver_id_to_region
             .get_mut(&cached.ver_id())
             .unwrap()
-            .ttl = now;
+            .ttl
+            .store(now, std::sync::atomic::Ordering::Relaxed);
 
         assert_eq!(cache.get_region_by_id(1).await.unwrap(), cached);
         let regions = cache.region_cache.read().await;
         let cached = &regions.ver_id_to_region[&cached.ver_id()];
-        assert_eq!(cached.ttl, now);
+        assert_eq!(cached.ttl(), now);
         assert!(cached.has_sync_flags(NEED_EXPIRE_AFTER_TTL));
     }
 
@@ -5733,7 +5804,8 @@ mod test {
             .ver_id_to_region
             .get_mut(&first.ver_id())
             .unwrap()
-            .ttl = now - 1;
+            .ttl
+            .store(now - 1, std::sync::atomic::Ordering::Relaxed);
         assert!(cache.set_store_liveness(9, StoreLiveness::Unreachable));
 
         assert_eq!(cache.gc_round_at(now, 1).await, (1, 1, true));
@@ -5751,7 +5823,8 @@ mod test {
             .ver_id_to_region
             .get_mut(&unhealthy.ver_id())
             .unwrap()
-            .ttl = now - 1;
+            .ttl
+            .store(now - 1, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(cache.gc_round_at(now, 1).await, (1, 1, true));
         assert!(!cache
             .region_cache
@@ -8041,7 +8114,8 @@ mod test {
             .ver_id_to_region
             .get_mut(&version)
             .unwrap()
-            .ttl = now_epoch_secs() - 1;
+            .ttl
+            .store(now_epoch_secs() - 1, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             region_ids(
                 &cache
