@@ -406,6 +406,13 @@ impl TxnManager {
         read_ts: Option<u64>,
         resource_group: &str,
     ) -> Result<(), SqlQueryError> {
+        // Go `CommitTxn` of a statement that wrote nothing: `LazyTxn.Commit`
+        // of a transaction that never became valid returns at once. An
+        // empty buffer publishes, renews and stages nothing below unless a
+        // cached table holds a write lease or a temporary table was modified.
+        if self.buffer.is_empty() && !session.empty_commit_has_work() {
+            return Ok(());
+        }
         let bindings_changed = hooks.binding_records_changed(&self.buffer);
         let renew = session.start_cached_table_renew_lease()?;
         let mut options = Self::statement_transaction_options(session);
@@ -743,5 +750,120 @@ impl CachedTableRenewLease {
 impl Drop for CachedTableRenewLease {
     fn drop(&mut self) {
         self.exits.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tidb_domain_core::cluster_transactions::{
+        CommittedTxnInfo, OpenClusterTransaction, PendingClusterSnapshot, PendingClusterTransaction,
+    };
+    use tidb_kv::cluster_storage::ClusterSnapshot;
+
+    use super::*;
+
+    /// Counts the commits a session's statements reach the store with.
+    struct CountingCommits(Arc<AtomicUsize>);
+
+    impl ClusterTransactions for CountingCommits {
+        fn kv_storage(&self) -> Arc<dyn tidb_txnkv::kv_storage::Storage> {
+            unreachable!("the test reads nothing")
+        }
+        fn prepare_snapshot(
+            &self,
+            _resource_group: &str,
+            _low_resolution: bool,
+        ) -> Result<Box<dyn PendingClusterSnapshot>, String> {
+            unreachable!("the test reads nothing")
+        }
+        fn open_snapshot(&self, _resource_group: &str) -> Result<Box<dyn ClusterSnapshot>, String> {
+            unreachable!("the test reads nothing")
+        }
+        fn open_max_ts_snapshot(
+            &self,
+            _resource_group: &str,
+        ) -> Result<Box<dyn ClusterSnapshot>, String> {
+            unreachable!("the test reads nothing")
+        }
+        fn commit(
+            &self,
+            _buffer: &MutationBuffer,
+            _read_ts: Option<u64>,
+            _resource_group: &str,
+            _options: SessionTransactionOptions,
+        ) -> Result<Option<CommittedTxnInfo>, SqlQueryError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        fn begin(
+            &self,
+            _pessimistic: bool,
+            _fair_locking: bool,
+            _resource_group: &str,
+            _options: SessionTransactionOptions,
+        ) -> Result<Box<dyn OpenClusterTransaction>, String> {
+            unreachable!("the test opens no transaction")
+        }
+        fn prepare_autocommit_write(
+            &self,
+            _resource_group: &str,
+            _pessimistic: bool,
+            _fair_locking: bool,
+            _options: SessionTransactionOptions,
+        ) -> Result<Box<dyn PendingClusterTransaction>, String> {
+            unreachable!("the test opens no transaction")
+        }
+    }
+
+    struct NoSchemaPins;
+
+    impl SchemaPins for NoSchemaPins {
+        fn hold(&self, _connection_id: u64, _version: i64) -> Box<dyn Send> {
+            Box::new(())
+        }
+    }
+
+    struct NoCommitHooks;
+
+    impl CommitHooks for NoCommitHooks {
+        fn schema_lease_checker(&self) -> Option<Arc<dyn SchemaLeaseChecker>> {
+            None
+        }
+        fn binding_records_changed(&self, _buffer: &MutationBuffer) -> bool {
+            false
+        }
+        fn refresh_committed_bindings(&self, _changed: bool) {}
+        fn rewrite_write_conflict(&self, error: SqlQueryError) -> SqlQueryError {
+            error
+        }
+    }
+
+    /// Go `CommitTxn` of an autocommit statement that wrote nothing returns
+    /// at once (`LazyTxn.Commit` of a transaction that never became valid);
+    /// a statement that staged a write still commits it.
+    #[test]
+    fn an_autocommit_statement_that_wrote_nothing_commits_nothing() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let mut txn = TxnManager::new(
+            Arc::new(CountingCommits(Arc::clone(&commits))),
+            Arc::new(NoSchemaPins),
+            1,
+            MutationBuffer::new(),
+        );
+        let registry = tidb_privilege::PrivilegeRegistry::default();
+        let mut session = crate::tests_support::bootstrap_session(&registry);
+
+        txn.flush_if_autocommit(&mut session, &NoCommitHooks, Some(5), None, "default")
+            .unwrap();
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+
+        txn.buffer()
+            .set(tidb_txnkv::Key::from(b"key".to_vec()), b"value".to_vec())
+            .unwrap();
+        txn.flush_if_autocommit(&mut session, &NoCommitHooks, Some(6), None, "default")
+            .unwrap();
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
     }
 }
