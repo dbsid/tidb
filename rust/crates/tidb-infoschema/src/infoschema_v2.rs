@@ -869,12 +869,15 @@ impl ReaderPins {
     ) -> Result<Option<(&'a crate::CatalogTableKey, &'a Arc<CachedTable>)>, ClusterCatalogError>
     {
         is.keep_alive();
-        let Some(item) = is.table_item_by_name(&key.database, &key.table) else {
-            return Ok(None);
-        };
+        // A pinned table was visible at this reader's schema version, which
+        // never changes (a new image starts with new pins), so a repeated
+        // lookup is served from the pins without searching the name index.
         if let Some(entry) = self.entries.get(key) {
             return Ok(Some(entry));
         }
+        let Some(item) = is.table_item_by_name(&key.database, &key.table) else {
+            return Ok(None);
+        };
         let table = is.table_for_item(&item, refill)?;
         Ok(Some(self.entries.insert(key.clone(), table)))
     }

@@ -1341,3 +1341,24 @@ fn update_table_info_swaps_one_table_and_keeps_the_pinned_version() {
     assert_eq!(schema.schema_version(), metadata, "the plan cache's image identity stays");
     assert!(!schema.update_table_info("missing", "t", revised(3)), "no such database");
 }
+
+/// A reader keeps the tables it looked up, as a Go caller keeps its
+/// `table.Table`: a repeated lookup is served from the reader's pins and
+/// does not search the name index again. Dropping the name at the reader's
+/// own version, which a real reader never sees, stands in for that search.
+#[test]
+fn a_readers_repeated_table_lookup_does_not_search_the_name_index() {
+    let (is, store) = fixture();
+    let table = table(2, "test");
+    store.tables.lock().unwrap().insert((1, 2), table.clone());
+    is.data.add(item("testDB", &table, 2), table.clone());
+    let pins = ReaderPins::new(&is);
+    let key = crate::CatalogTableKey::new("testDB", "test");
+
+    let (_, first) = pins.get_entry(&is, &key, true).unwrap().unwrap();
+    let first = Arc::clone(first);
+    is.data.remove(&item("testDB", &table, 2), 2);
+    let (_, again) = pins.get_entry(&is, &key, true).unwrap().unwrap();
+
+    assert!(Arc::ptr_eq(&first, again));
+}

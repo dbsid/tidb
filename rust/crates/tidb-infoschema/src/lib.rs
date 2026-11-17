@@ -2005,7 +2005,9 @@ impl SessionExtendedInfoSchema {
         });
         local.or_else(|| {
             if let Some(v2) = self.v2() {
-                let item = v2.table_item_by_partition_id(physical_id).or_else(|| v2.table_item_by_id(physical_id))?;
+                // Go callers ask `TableByID` before `FindTableByPartitionID`;
+                // most IDs name a table, whose lookup is one search.
+                let item = v2.table_item_by_id(physical_id).or_else(|| v2.table_item_by_partition_id(physical_id))?;
                 let key = CatalogTableKey::new(item.db_name.lowercase(), item.table_name.lowercase());
                 if let Some((database_name, database)) = self.schema.databases.get_key_value(&key.database) {
                     if let Some(entry) = database.tables.get(&key.table) {
