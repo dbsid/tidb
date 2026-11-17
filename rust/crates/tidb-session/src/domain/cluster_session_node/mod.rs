@@ -1987,7 +1987,8 @@ impl<'s> ClusterServerSession<'s> {
                     Vec::new(),
                 ));
             }
-            return Ok(PreparedGeneral::with_prepared_ast(prepared_ast, Vec::new()));
+            let text = self.session.statement_text(prepared_ast.sql()).into_owned();
+            return Ok(PreparedGeneral::with_prepared_ast(prepared_ast, &text, Vec::new()));
         }
         // Go reports a query's result columns at PREPARE time from the
         // prepared plan schema. It does not execute the query with every
@@ -2014,8 +2015,10 @@ impl<'s> ClusterServerSession<'s> {
             // fallback. Such shapes remain on the ordinary execute path.
             Err(_) => Vec::new(),
         };
+        let text = self.session.statement_text(prepared_ast.sql()).into_owned();
         Ok(PreparedGeneral::with_prepared_ast(
             prepared_ast,
+            &text,
             result_columns,
         ))
     }
@@ -2149,8 +2152,11 @@ impl<'s> ClusterServerSession<'s> {
         };
         if let Some(template) = effective {
             if matches!(template, Stmt::Query(_)) {
-                // Go `executePlanCacheStmt`'s `ContextWithInitializedExecDetails`.
-                self.session.context_with_initialized_exec_details(&sql);
+                // Go `executePlanCacheStmt`'s `ContextWithInitializedExecDetails`,
+                // with the digest PREPARE computed (`InitSQLDigest`).
+                let (normalized, digest) = statement.normalized_digest();
+                self.session
+                    .context_with_initialized_prepared_exec_details(&sql, normalized, digest);
                 self.session.on_stmt_start(template);
             } else if is_write {
                 // Session finishes its scratch execution inside the durable
