@@ -127,7 +127,12 @@ struct LazyStatement {
     /// `tidb_generate_binary_plan` as the statement finished.
     binary_plan_enabled: bool,
     plan_digest: String,
-    plan_hint: String,
+    /// Go `getEncodedPlan`'s hints: the ones that reproduce the plan, then
+    /// the statement's own hints of the kinds Go keeps, rendered once when the
+    /// summary first asks. A routed or internal statement has neither.
+    plan_hints: Option<tidb_stmtctx::PlanHintsSource>,
+    statement_hints: Vec<tidb_ast::Hint>,
+    plan_hint: std::sync::OnceLock<String>,
     binding_source: Option<Arc<BindingSource>>,
     /// The binding SQL and digest, normalized once, when the summary first
     /// asks (Go `LazyInfo.GetBindingSQLAndDigest`, which only a new summary
@@ -139,13 +144,25 @@ impl LazyStatement {
         self.rendered_plan
             .get_or_init(|| self.plan_source.as_ref().map(crate::PlanSource::render).unwrap_or_default())
     }
+
+    fn plan_hint(&self) -> &str {
+        self.plan_hint.get_or_init(|| {
+            let mut hints = self
+                .plan_hints
+                .as_ref()
+                .map(tidb_stmtctx::PlanHintsSource::generate)
+                .unwrap_or_default();
+            hints.extend(self.statement_hints.iter().cloned());
+            tidb_hint::restore_optimizer_hints(&hints)
+        })
+    }
 }
 impl StmtExecLazyInfo for LazyStatement {
     fn original_sql(&self) -> String {
         self.sql.clone()
     }
     fn encoded_plan(&self) -> Result<(String, String), EncodedPlanError> {
-        Ok((self.rendered().0.clone(), self.plan_hint.clone()))
+        Ok((self.rendered().0.clone(), self.plan_hint().to_owned()))
     }
     fn binary_plan(&self) -> String {
         if !self.binary_plan_enabled {
@@ -784,34 +801,37 @@ pub trait ExecStmtObservation: crate::sessionctx::SessionContext {
             },
             plan_cache_unqualified: self.plan_cache_unqualified(),
             lazy_info: Arc::new(LazyStatement {
-                plan_hint: if observation.routed || internal {
-                    String::new()
+                plan_hints: if observation.routed || internal {
+                    None
+                } else {
+                    plan.plan_hints
+                },
+                statement_hints: if observation.routed || internal {
+                    Vec::new()
                 } else {
                     // Go `getEncodedPlan`: the hints reproducing the plan,
                     // then the statement's own hints of these kinds.
-                    let mut hints = plan.plan_hints.clone();
-                    hints.extend(
-                        observation
-                            .original_table_hints
-                            .iter()
-                            .filter(|hint| {
-                                matches!(
-                                    hint.lower_name().as_str(),
-                                    "memory_quota"
-                                        | "use_toja"
-                                        | "no_index_merge"
-                                        | "max_execution_time"
-                                        | "ignore_index"
-                                        | "read_from_storage"
-                                        | "merge"
-                                        | "semi_join_rewrite"
-                                        | "no_decorrelate"
-                                )
-                            })
-                            .cloned(),
-                    );
-                    tidb_hint::restore_optimizer_hints(&hints)
+                    observation
+                        .original_table_hints
+                        .iter()
+                        .filter(|hint| {
+                            matches!(
+                                hint.lower_name().as_str(),
+                                "memory_quota"
+                                    | "use_toja"
+                                    | "no_index_merge"
+                                    | "max_execution_time"
+                                    | "ignore_index"
+                                    | "read_from_storage"
+                                    | "merge"
+                                    | "semi_join_rewrite"
+                                    | "no_decorrelate"
+                            )
+                        })
+                        .cloned()
+                        .collect()
                 },
+                plan_hint: std::sync::OnceLock::new(),
                 binding_source: observation.binding_source.clone(),
                 binding: std::sync::OnceLock::new(),
                 sql: summary_sql,
