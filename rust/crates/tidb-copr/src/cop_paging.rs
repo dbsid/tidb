@@ -29,7 +29,8 @@ pub use cop_read_task_runtime::{
 };
 pub use native_transport::{NativeCopResponse, NativeCopTransport};
 pub use tikv_rpc_contract::{
-    build_tikv_unary_request, decode_tikv_unary_response, request_source, TikvUnaryRequest,
+    build_tikv_unary_request, decode_tikv_unary_response, request_source, tikv_unary_response,
+    TikvUnaryRequest,
 };
 
 use std::sync::Arc;

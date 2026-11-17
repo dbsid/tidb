@@ -55,12 +55,13 @@ pub struct PreparedCopReadTask {
     page_index: u32,
     task: RegionTaskEnvelope,
     request: CoprocessorRequestEnvelope,
-    /// The request's protobuf encoding, built once. A task re-sends the same
-    /// immutable envelope on every retry and every limiter-wake re-poll, and
-    /// a perf capture of the SF50 q10 index-join probe showed those repeated
-    /// encodes running inline on the waking worker (17.6% encode + 7% varint
-    /// of the whole query); caching the bytes turns a re-send into a clone.
-    encoded_request: std::sync::OnceLock<Vec<u8>>,
+    /// The request as the store's protobuf message, built once. A task
+    /// re-sends the same immutable envelope on every retry and every
+    /// limiter-wake re-poll, and a perf capture of the SF50 q10 index-join
+    /// probe showed those repeated encodes running inline on the waking
+    /// worker (17.6% encode + 7% varint of the whole query); caching the
+    /// message turns a re-send into a clone.
+    wire_request: std::sync::OnceLock<tidb_proto::CoprocessorRequest>,
     cache_key: Option<Vec<u8>>,
 }
 
@@ -98,11 +99,18 @@ impl PreparedCopReadTask {
         &self.request
     }
 
-    /// The request's protobuf bytes, encoded once and reused by every send.
-    #[must_use]
-    pub fn encoded_request(&self) -> &Vec<u8> {
-        self.encoded_request
-            .get_or_init(|| self.request.encode_to_vec())
+    /// The request as the store's protobuf message (Go's `copReq`), built
+    /// once and cloned by every send. The envelope's encoding is the one
+    /// contract for its fields (its batch tasks are already encoded), so the
+    /// message is that encoding, decoded.
+    pub fn wire_request(&self) -> Result<&tidb_proto::CoprocessorRequest, prost::DecodeError> {
+        if let Some(request) = self.wire_request.get() {
+            return Ok(request);
+        }
+        let request = <tidb_proto::CoprocessorRequest as prost::Message>::decode(
+            self.request.encode_to_vec().as_slice(),
+        )?;
+        Ok(self.wire_request.get_or_init(|| request))
     }
 
     /// Exact cache key retained with the matching in-flight lookup.
@@ -1381,7 +1389,7 @@ impl CopReadTaskRuntime {
             page_index,
             task,
             request,
-            encoded_request: std::sync::OnceLock::new(),
+            wire_request: std::sync::OnceLock::new(),
             cache_key: lookup.as_ref().map(|lookup| lookup.key().to_vec()),
         });
         self.prepared.push(prepared.clone());

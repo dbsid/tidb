@@ -42,8 +42,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use prost::Message as _;
-
 use crate::query_transport::{QueryOperation, QueryTransport};
 use tidb_txnkv::QueryResponseError;
 use tidb_txnkv::QueryResultSubset;
@@ -59,7 +57,7 @@ use tidb_txnkv::lock::SnapshotLockSet;
 use tidb_txnkv::UnaryCallContext;
 
 use super::{
-    build_tikv_unary_request, decode_tikv_unary_response, BatchedRemain, BatchedRemainCause,
+    build_tikv_unary_request, tikv_unary_response, BatchedRemain, BatchedRemainCause,
     CopPagingState, CopReadTaskError, CopReadTaskResponse, CopReadTaskRuntime, CopRuntimeConfig,
 };
 
@@ -548,7 +546,8 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             predicted_read_bytes,
             self.trace.as_ref(),
             self.cluster_id,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         // Go `handleTaskOnce`: `RunawayChecker.BeforeCopRequest(req)`.
         if let Some(checker) = &self.metadata.runaway_checker {
             checker.before_cop_request(&mut request.context).map_err(NativeCopError::Terror)?;
@@ -558,8 +557,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stamp(&mut request.context);
-        let mut wire = tidb_proto::CoprocessorRequest::decode(request.encoded_request.as_slice())
-            .map_err(|error| error.to_string())?;
+        let mut wire = std::mem::take(&mut request.request);
         wire.context = Some(request.context.clone());
         let backoffer = self.backoffer(logical_task_id);
         // Go `handleTaskOnce`: `worker.kvclient.Stats` collects the task's
@@ -568,7 +566,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
         let send_started = std::time::Instant::now();
         let sent = self.store.send(
             &backoffer,
-            &wire.encode_to_vec(),
+            wire,
             region,
             self.timeout.min(self.call.timeout()),
             &self.kv_context,
@@ -583,8 +581,8 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             (sent, _) => sent?,
         };
         let cost_time = send_started.elapsed();
-        let (encoded, address) = match sent {
-            NativeCopSend::Response(encoded, address) => (encoded, address.unwrap_or_default()),
+        let (response, address) = match sent {
+            NativeCopSend::Response(response, address) => (response, address.unwrap_or_default()),
             NativeCopSend::RegionError(error) => {
                 // No response reached the store: every batched child remains
                 // (Go `handleBatchRemainsOnErr` with an empty response).
@@ -602,8 +600,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
                 );
             }
         };
-        let response =
-            decode_tikv_unary_response(encoded.as_slice()).map_err(|error| error.to_string())?;
+        let response = tikv_unary_response(*response);
         // Go `copStats.ScanDetail.ProcessedKeys` of this response.
         let processed_keys = response
             .response_ref()

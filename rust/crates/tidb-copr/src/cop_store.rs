@@ -32,9 +32,9 @@ pub type CopBackoffer = Arc<tokio::sync::Mutex<tikv_client::tikv::Backoffer>>;
 /// What the store's sender answered for one task.
 #[derive(Debug)]
 pub enum NativeCopSend {
-    /// The response, encoded (`coprocessor.Response`), and the address of
-    /// the store that answered (client-go `rpcCtx.Addr`).
-    Response(Vec<u8>, Option<String>),
+    /// The response and the address of the store that answered (client-go
+    /// `rpcCtx.Addr`).
+    Response(Box<tidb_proto::CoprocessorResponse>, Option<String>),
     /// A region error the caller handles: the task's ranges are located again.
     RegionError(String),
 }
@@ -54,14 +54,14 @@ pub trait NativeCopStore: Send + Sync + 'static {
         kv_context: &tidb_txnkv::StatementKvContext,
     ) -> Result<Vec<tikv_client::RegionWithLeader>, tikv_client::Error>;
 
-    /// Go `KVStore.SendReq(bo, req, region, timeout)`, `request` encoded.
+    /// Go `KVStore.SendReq(bo, req, region, timeout)`.
     /// `kv_context` holds Go's `bo.GetCtx()` values: the
     /// `util.RUDetailsCtxKey` value the resource-control interceptor charges
     /// for each RPC and the `util.ExecDetailsKey` value.
     fn send(
         &self,
         backoffer: &CopBackoffer,
-        request: &[u8],
+        request: tidb_proto::CoprocessorRequest,
         region: (u64, u64, u64),
         timeout: Duration,
         kv_context: &tidb_txnkv::StatementKvContext,
@@ -198,14 +198,12 @@ impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
     fn send(
         &self,
         backoffer: &CopBackoffer,
-        request: &[u8],
+        request: tidb_proto::CoprocessorRequest,
         region: (u64, u64, u64),
         timeout: Duration,
         kv_context: &tidb_txnkv::StatementKvContext,
         stats: Option<Arc<tikv_client::RegionRequestRuntimeStats>>,
     ) -> Result<NativeCopSend, tikv_client::Error> {
-        let request = tikv_client::proto::coprocessor::Request::decode(request)
-            .map_err(|error| tikv_client::Error::StringError(error.to_string()))?;
         // Go `codecV2.EncodeRequest(CmdCop)`: prefix every unary/batched
         // range before dispatch. The native plan decodes response key fields.
         let request=match self.store().keyspace() {
@@ -222,9 +220,7 @@ impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
             .send_req_ctx_with_stats(Arc::clone(backoffer), request, &region, timeout, stats);
         let sent = self.block_on(with_statement_kv_context(kv_context, send));
         match sent {
-            Ok((response, address)) => {
-                Ok(NativeCopSend::Response(response.encode_to_vec(), address))
-            }
+            Ok((response, address)) => Ok(NativeCopSend::Response(Box::new(response), address)),
             Err(tikv_client::Error::RegionError(error)) => {
                 Ok(NativeCopSend::RegionError(format!("{error:?}")))
             }
@@ -326,5 +322,80 @@ impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
                 .await
                 .map_err(tikv_client::Error::from)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::sync::Mutex;
+
+    use tikv_client::mock::{MockKvClient, MockPdClient};
+
+    use super::*;
+
+    /// Go's coprocessor sends its `copReq` through `SendReqCtx` and reads the
+    /// `*coprocessor.Response` it returns: the store sends the request it is
+    /// handed and hands back the response it received, whose `data` is still
+    /// the transport's buffer, not a copy made by encoding the response again.
+    #[test]
+    fn a_cop_send_hands_back_the_response_it_received() {
+        let data = prost::bytes::Bytes::from_static(b"rows");
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&received);
+        let answer = data.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |request: &dyn Any| {
+                let request = request
+                    .downcast_ref::<tidb_proto::CoprocessorRequest>()
+                    .unwrap();
+                captured.lock().unwrap().push(request.clone());
+                Ok(Box::new(tidb_proto::CoprocessorResponse {
+                    data: answer.clone(),
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let runtime = tidb_txnkv::driver::tikv_store::store_runtime().unwrap();
+        let inner = runtime
+            .block_on(tikv_client::tikv::KvStore::new_with_pd_client(
+                pd_client,
+                Arc::new(tikv_client::tikv::MockSafePointKv::new()),
+                tikv_client::Config::default(),
+            ))
+            .unwrap();
+        let store = TikvStore::new(Arc::clone(&runtime), inner);
+        let backoffer: CopBackoffer =
+            Arc::new(tokio::sync::Mutex::new(tikv_client::tikv::Backoffer::new(
+                tikv_client::async_util::Cancellation::default(),
+                1000,
+            )));
+        let request = tidb_proto::CoprocessorRequest {
+            tp: 103,
+            data: b"dag".to_vec(),
+            start_ts: 100,
+            ..Default::default()
+        };
+
+        let sent = store
+            .send(
+                &backoffer,
+                request,
+                (1, 0, 0),
+                Duration::from_secs(10),
+                &tidb_txnkv::StatementKvContext::default(),
+                None,
+            )
+            .unwrap();
+
+        let NativeCopSend::Response(response, _) = sent else {
+            panic!("expected a response, got {sent:?}");
+        };
+        assert_eq!(response.data.as_ptr(), data.as_ptr());
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, b"dag");
+        assert_eq!(received[0].start_ts, 100);
+        assert_eq!(received[0].context.as_ref().unwrap().region_id, 1);
     }
 }

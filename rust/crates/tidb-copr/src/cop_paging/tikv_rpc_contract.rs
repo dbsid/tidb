@@ -16,8 +16,8 @@
 
 use prost::Message;
 use tidb_proto::{
-    CoprocessorResponse, KvrpcContext, KvrpcPeer, KvrpcRegionEpoch, KvrpcRequestOrigin,
-    KvrpcResourceControlContext,
+    CoprocessorRequest, CoprocessorResponse, KvrpcContext, KvrpcPeer, KvrpcRegionEpoch,
+    KvrpcRequestOrigin, KvrpcResourceControlContext,
 };
 use tidb_txnkv::{
     endpoint_type, inject_source_stmt, map_replica_read_type, ClientReplicaReadType, EndpointType,
@@ -28,7 +28,7 @@ use super::{CopReadTaskResponse, PreparedCopReadTask};
 use tidb_txnkv::KvRequestMetadata;
 use tidb_txnkv::RequestSource;
 
-/// Fully encoded unary coprocessor request plus wrapper-owned send metadata.
+/// Unary coprocessor request plus wrapper-owned send metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TikvUnaryRequest {
     /// Endpoint selected by TiDB's store-type mapping.
@@ -51,8 +51,8 @@ pub struct TikvUnaryRequest {
     pub timeout_override_ms: Option<u64>,
     /// Exact protobuf context encoded into the request body.
     pub context: KvrpcContext,
-    /// Exact encoded `coprocessor.Request` bytes.
-    pub encoded_request: Vec<u8>,
+    /// Exact `coprocessor.Request`; the send attaches `context` to it.
+    pub request: CoprocessorRequest,
 }
 
 /// Constructs the complete unary request owned before network dispatch.
@@ -67,7 +67,7 @@ pub fn build_tikv_unary_request(
     predicted_read_bytes: u64,
     trace: Option<&TraceInfo>,
     cluster_id: u64,
-) -> TikvUnaryRequest {
+) -> Result<TikvUnaryRequest, prost::DecodeError> {
     let task = prepared.task();
     let mut replica_read_type = map_replica_read_type(metadata.replica_read.raw());
     let mut replica_read = replica_read_type != ClientReplicaReadType::Leader;
@@ -142,7 +142,7 @@ pub fn build_tikv_unary_request(
     // RPCClient attaches it to the command body immediately before the send.
     // Preserve that single authority so a real transport cannot observe two
     // independently mutable context copies.
-    TikvUnaryRequest {
+    Ok(TikvUnaryRequest {
         // PreparedCopReadTask is produced only after the coordinator rejects
         // every non-TiKV store. TiFlash resource-group clearing and
         // disaggregated endpoint selection therefore remain outside this API.
@@ -157,34 +157,43 @@ pub fn build_tikv_unary_request(
         timeout_override_ms: (task.tikv_client_read_timeout_ms > 0)
             .then_some(task.tikv_client_read_timeout_ms),
         context,
-        encoded_request: prepared.encoded_request().clone(),
-    }
+        request: prepared.wire_request()?.clone(),
+    })
 }
 
-/// Decodes all response bytes before returning a coordinator envelope.
+/// Decodes all response bytes before returning a coordinator envelope
+/// ([`tikv_unary_response`]).
 ///
 /// Decode failure has no coordinator reference and therefore cannot mutate
-/// task/cache/paging state. Error precedence matches Go's unary response path:
-/// region, lock, other error, then batch or ordinary success.
+/// task/cache/paging state.
 pub fn decode_tikv_unary_response(
     raw_response: impl prost::bytes::Buf,
 ) -> Result<CopReadTaskResponse, prost::DecodeError> {
-    // Decoded from the transport's own buffer: the response `data` is a
-    // slice of it (`bytes` field), not a copy.
-    let response = CoprocessorResponse::decode(raw_response)?;
+    // Decoded from the caller's buffer: the response `data` is a slice of
+    // it (`bytes` field), not a copy.
+    Ok(tikv_unary_response(CoprocessorResponse::decode(
+        raw_response,
+    )?))
+}
+
+/// The coordinator envelope of a response the store returned. Error
+/// precedence matches Go's unary response path: region, lock, other error,
+/// then batch or ordinary success.
+#[must_use]
+pub fn tikv_unary_response(response: CoprocessorResponse) -> CopReadTaskResponse {
     if response.region_error.is_some() {
-        return Ok(CopReadTaskResponse::region_error(response));
+        return CopReadTaskResponse::region_error(response);
     }
     if response.locked.is_some() {
-        return Ok(CopReadTaskResponse::lock_error(response));
+        return CopReadTaskResponse::lock_error(response);
     }
     if !response.other_error.is_empty() {
         let message = response.other_error.clone();
-        return Ok(CopReadTaskResponse::other_error(response, message));
+        return CopReadTaskResponse::other_error(response, message);
     }
     // Batched children ride a successful parent; the coordinator serves them
     // (Go `handleBatchCopResponse`).
-    Ok(CopReadTaskResponse::success(response))
+    CopReadTaskResponse::success(response)
 }
 
 /// Go `RequestSource.GetRequestSource`: the request source a request's

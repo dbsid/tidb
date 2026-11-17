@@ -34,7 +34,7 @@ use tidb_txnkv::RequestType;
 use tidb_txnkv::RequestSource;
 use tidb_txnkv::ReplicaReadType;
 use tidb_proto::{
-    CoprocessorRequest, CoprocessorResponse, KvrpcLockInfo, KvrpcRequestOrigin, RegionError,
+    CoprocessorResponse, KvrpcLockInfo, KvrpcRequestOrigin, RegionError,
     StoreBatchTaskResponse,
 };
 use tidb_txnkv::{ClientReplicaReadType, EndpointType, TraceInfo};
@@ -124,7 +124,8 @@ fn checked_task_becomes_wire_ready_request_with_exact_context_and_wrapper_metada
             session_alias: "trace-alias".to_owned(),
         }),
         9001,
-    );
+    )
+    .unwrap();
 
     assert_eq!(request.endpoint, EndpointType::TiKv);
     assert_eq!(request.replica_read_type, ClientReplicaReadType::Mixed);
@@ -136,7 +137,7 @@ fn checked_task_becomes_wire_ready_request_with_exact_context_and_wrapper_metada
     assert_eq!(request.txn_scope, "global");
     assert_eq!(request.timeout_override_ms, Some(777));
 
-    let wire = CoprocessorRequest::decode(request.encoded_request.as_slice()).unwrap();
+    let wire = &request.request;
     assert_eq!(wire.tp, RequestType::Dag.raw());
     assert_eq!(wire.data, b"dag");
     assert_eq!(wire.start_ts, 100);
