@@ -146,6 +146,24 @@ impl Session {
     /// into the session data under one stage (an empty value deletes).
     /// [`Self::finish_temporary_data_commit`] releases the stage after a
     /// successful commit and cleans it up otherwise.
+    /// Whether committing an empty buffer still has work: a cached table
+    /// whose write lease the commit renews, or a modified temporary table
+    /// whose data it publishes.
+    pub(crate) fn empty_commit_has_work(&self) -> bool {
+        let cached = !self
+            .txn_cached_tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        cached
+            || self
+                .txn_temporary_tables
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(|table| table.get_modified())
+    }
+
     pub(crate) fn stage_temporary_data_commit(
         &self,
         buffer: &tidb_store_driver_txn::cluster_storage::MutationBuffer,
