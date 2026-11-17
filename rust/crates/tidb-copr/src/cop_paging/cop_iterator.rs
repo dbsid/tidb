@@ -31,7 +31,7 @@ use tidb_txnkv::QueryResultSubset;
 pub(crate) trait CopTaskSource: tidb_txnkv::Response {
     fn try_next(&mut self) -> Result<Option<QueryResultSubset>, QueryResponseError>;
     fn task_count(&self) -> usize;
-    fn has_remaining_work(&self) -> bool;
+    fn needs_task_worker(&self) -> bool;
     fn call(&self) -> UnaryCallContext;
     fn use_task_worker(&mut self);
     fn set_waker(&mut self, waker: Waker);
@@ -292,7 +292,7 @@ impl<R: CopTaskSource> tidb_txnkv::Response for CopIterator<R> {
         }
         if matches!(&result, Ok(Some(_))) {
             if let (Some(start), Driver::Inline(source)) = (self.start, &self.driver) {
-                if source.has_remaining_work() {
+                if source.needs_task_worker() {
                     let Driver::Inline(source) =
                         std::mem::replace(&mut self.driver, Driver::Closed)
                     else {
@@ -875,6 +875,83 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn lite_cop_starts_a_worker_only_for_a_remaining_page() {
+        use crate::cop_paging::{CopRuntimeConfig, NativeCopTransport};
+        use crate::query_transport::{QueryOperation, QueryTransport};
+        use tidb_txnkv::{
+            CancelHandle, KeyRange, KvRequestMetadata, PartitionedKeyRanges, RequestType,
+            TransportBinding, TransportRequest,
+        };
+        use tikv_client::mock::{MockKvClient, MockPdClient};
+
+        for has_second_page in [false, true] {
+            let first = AtomicBool::new(true);
+            let pd = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+                move |_| {
+                    let is_first = first.swap(false, Ordering::Relaxed);
+                    Ok(Box::new(tidb_proto::CoprocessorResponse {
+                        data: prost::bytes::Bytes::from_static(if is_first {
+                            b"first"
+                        } else {
+                            b"last"
+                        }),
+                        range: (is_first && has_second_page).then(|| {
+                            tidb_proto::CoprocessorKeyRange {
+                                start: vec![1],
+                                end: vec![2],
+                            }
+                        }),
+                        ..Default::default()
+                    }))
+                },
+            )));
+            let runtime = tidb_txnkv::driver::tikv_store::store_runtime().unwrap();
+            let store = runtime
+                .block_on(tikv_client::tikv::KvStore::new_with_pd_client(
+                    pd,
+                    Arc::new(tikv_client::tikv::MockSafePointKv::new()),
+                    tikv_client::Config::default(),
+                ))
+                .unwrap();
+            let store = tidb_txnkv::driver::tikv_store::TikvStore::new(runtime, store);
+            let mut transport =
+                NativeCopTransport::new(Arc::new(store), CopRuntimeConfig::default());
+            let mut metadata = KvRequestMetadata::default();
+            metadata.request_type = RequestType::Dag;
+            metadata.start_ts = 100;
+            metadata.keep_order = true;
+            metadata.paging.enabled = true;
+            metadata.paging.min_size = 1;
+            metadata.paging.max_size = 2;
+            metadata.key_ranges = Some(Arc::new(PartitionedKeyRanges::new_non_partitioned(vec![
+                KeyRange::new(vec![1].into(), vec![3].into()),
+            ])));
+            let token = Arc::new(AtomicBool::new(false));
+            let request = TransportRequest::new(metadata, Arc::new(CancelHandle::default()))
+                .with_cop_lite_worker(Arc::clone(&token))
+                .bind(TransportBinding::new())
+                .unwrap();
+            let mut it = transport
+                .send(&request, QueryOperation::Select)
+                .unwrap()
+                .unwrap();
+            assert!(token.load(Ordering::Acquire));
+            assert_eq!(it.next().unwrap().unwrap().data.as_ref(), b"first");
+            assert!(!token.load(Ordering::Acquire));
+            if has_second_page {
+                assert!(matches!(it.driver, Driver::Concurrent(_)));
+                assert_eq!(it.next().unwrap().unwrap().data.as_ref(), b"last");
+            } else {
+                assert!(
+                    matches!(it.driver, Driver::Inline(_)),
+                    "completed lite task started a worker"
+                );
+            }
+            assert!(it.next().unwrap().is_none());
+        }
+    }
+
     struct PendingSource {
         polls: u32,
         ready_after: u32,
@@ -905,7 +982,7 @@ mod tests {
             1
         }
 
-        fn has_remaining_work(&self) -> bool {
+        fn needs_task_worker(&self) -> bool {
             true
         }
 

@@ -1089,8 +1089,15 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopTaskSource for NativeCo
         self.logical_order.len()
     }
 
-    fn has_remaining_work(&self) -> bool {
-        !self.closed && self.logical_index < self.logical_order.len()
+    fn needs_task_worker(&self) -> bool {
+        // Go copIterator.Next drains buffered batch responses on the reader
+        // and starts a worker only if another task still needs an RPC.
+        !self.closed
+            && !self.active_attempts.is_empty()
+            && self
+                .logical_order
+                .get(self.logical_index)
+                .is_some_and(|id| !self.runtime.has_queued_response(*id))
     }
 
     fn call(&self) -> UnaryCallContext {
