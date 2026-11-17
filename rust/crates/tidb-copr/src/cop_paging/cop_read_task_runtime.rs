@@ -1297,6 +1297,13 @@ impl CopReadTaskRuntime {
         })
     }
 
+    /// Whether the reader can consume another result without sending a request.
+    pub(super) fn has_queued_response(&self, logical_task_id: u64) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.task.task_id == logical_task_id && task.paging.queued_responses > 0)
+    }
+
     /// Drains the next bounded response event for one logical task.
     pub fn next_response(
         &mut self,
