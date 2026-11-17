@@ -1561,3 +1561,62 @@ fn an_aggregate_over_a_correlated_exists_decorrelates() {
     .collect();
     assert_eq!(grouped, [["a", "3"], ["b", "7"]]);
 }
+
+/// Go `executorBuilder.corColInDistPlan`: a reader rebuilds its request's
+/// executors on every open only when a pushed-down filter reads the outer
+/// row, so a reader of any other statement builds its request once.
+#[test]
+fn only_a_pushed_down_filter_over_the_outer_row_marks_a_reader_correlated() {
+    use tidb_planner_core_operator_physicalop::{flatten_list_push_down_plan, PhysicalPlan};
+
+    fn readers_correlated(plan: &PhysicalPlan, found: &mut Vec<bool>) {
+        let pushed = match plan {
+            PhysicalPlan::TableReader(reader) => reader.table_plan.as_deref(),
+            PhysicalPlan::IndexReader(reader) => reader.index_plan.as_deref(),
+            _ => None,
+        };
+        if let Some(pushed) = pushed {
+            found.push(crate::builder_utils::cor_col_in_dist_plan(
+                &flatten_list_push_down_plan(pushed),
+            ));
+        }
+        for child in plan.children() {
+            readers_correlated(child, found);
+        }
+    }
+    let readers = |sql: &str, catalog: &SessionExtendedInfoSchema| {
+        let stmt = tidb_parser::parse(sql).unwrap();
+        let Stmt::Query(query) = &stmt else {
+            panic!("not a query");
+        };
+        let QueryStmt::Select(select) = &**query else {
+            panic!("not a SELECT");
+        };
+        let physical = crate::driver::planner_bridge::physical_select_plan(
+            select,
+            catalog,
+            "test",
+            &crate::StmtContext::for_query(),
+        )
+        .unwrap();
+        let mut found = Vec::new();
+        readers_correlated(&physical, &mut found);
+        found
+    };
+    let mut catalog = tidb_infoschema_perfschema::mock_catalog();
+    for ddl in [
+        "CREATE TABLE outer_rows (id INT PRIMARY KEY, pad CHAR(4))",
+        "CREATE TABLE inner_rows (id INT PRIMARY KEY, pad CHAR(4))",
+    ] {
+        crate::run_create_table_on(ddl, &mut catalog).unwrap();
+    }
+
+    let plain = readers("SELECT id FROM inner_rows WHERE pad > 'a'", &catalog);
+    assert_eq!(plain, vec![false]);
+    let correlated = readers(
+        "SELECT (SELECT id FROM inner_rows WHERE inner_rows.pad > outer_rows.pad LIMIT 1) FROM outer_rows",
+        &catalog,
+    );
+    assert!(correlated.contains(&true), "{correlated:?}");
+    assert!(correlated.contains(&false), "{correlated:?}");
+}

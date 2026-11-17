@@ -465,6 +465,28 @@ pub(crate) fn set_encode_type(dag_req: &mut tipb::DagRequest) {
     }
 }
 
+
+/// Go `executorBuilder.corColInDistPlan`: whether a pushed-down plan's
+/// filter, projection, order or late-materialization filter reads a
+/// correlated column, so its executors are rebuilt over the outer row on
+/// every open (Go `corColInFilter`).
+pub(crate) fn cor_col_in_dist_plan(plans: &[&PhysicalPlan]) -> bool {
+    let reads_outer_row =
+        |expr: &Expression| !tidb_expr::simple_expr::extract_cor_columns(expr).is_empty();
+    plans.iter().any(|plan| match plan {
+        PhysicalPlan::Selection(selection) => selection.conditions.iter().any(reads_outer_row),
+        PhysicalPlan::Projection(projection) => projection.exprs.iter().any(reads_outer_row),
+        PhysicalPlan::TopN(top_n) => top_n
+            .by_items
+            .iter()
+            .any(|item| reads_outer_row(&item.expr)),
+        PhysicalPlan::TableScan(scan) => scan
+            .late_materialization_filter_condition
+            .iter()
+            .any(reads_outer_row),
+        _ => false,
+    })
+}
 /// Go `ConstructDAGReq`: each plan's `ToPB` -- one tree for `kv.TiFlash`
 /// (`ConstructTreeBasedDistExec` over `plans[0]`), a list otherwise
 /// (`ConstructListBasedDistExec`) -- under the statement's zone, flags and

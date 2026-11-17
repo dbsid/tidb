@@ -158,8 +158,14 @@ type TaskDone = Receiver<Result<TaskRows, ExecError>>;
 pub struct IndexLookUpExecutor {
     meta: ExecutorMeta,
     shared: Arc<Shared>,
-    /// Go `idxPlans`.
-    index_plans: Vec<PhysicalPlan>,
+    /// Go `dagPB`: the index request built from `idxPlans` with the reader.
+    index_dag: tidb_proto::tipb::DagRequest,
+    /// Go `idxPlans` when `corColInIdxSide`: the index plans, whose
+    /// executors are rebuilt over the outer row on every open; `None`
+    /// otherwise.
+    correlated_index_plans: Option<Vec<PhysicalPlan>>,
+    /// The width of the index plans' output (their root's schema).
+    index_output_len: usize,
     /// Go `idxPlanUnNatureOrders` (`FlattenTreePushDownPlan`).
     index_plans_un_nature_orders: std::collections::BTreeMap<usize, usize>,
     /// Go `indexLookUpPushDown`: the index request looks the rows up in
@@ -255,7 +261,6 @@ impl IndexLookUpExecutor {
         let internal = |message: &'static str| ExecError::Internal(message.into());
         // Go `v.IndexPlans`, `v.IndexPlansUnNatureOrders` and `v.TablePlans`.
         let (index_plans, index_plans_un_nature_orders) = v.index_plans();
-        let index_plans: Vec<PhysicalPlan> = index_plans.into_iter().cloned().collect();
         let table_plans = v.table_plans();
         let Some(PhysicalPlan::IndexScan(scan)) = index_plans.first() else {
             return Err(internal("the lookup's index plans start with no index scan"));
@@ -366,6 +371,21 @@ impl IndexLookUpExecutor {
             plan.cop_avg_row_size(false, tidb_config::tikvcfg::get_global_config().tikv_client.enable_chunk_rpc)
         });
         let index_plan_ids: Vec<isize> = index_plans.iter().map(|plan| plan.id() as isize).collect();
+        // Go `buildIndexReq`: `ConstructDAGReq(b.ctx, v.IndexPlans, kv.TiKV)`
+        // once, and `corColInIdxSide` for `open` to rebuild it.
+        let index_dag = crate::builder_utils::construct_dag_req(
+            ctx,
+            &crate::remote_scan::pushdown_statement_context(ctx),
+            &index_plans,
+            tidb_kv::store_type::StoreType::TiKv,
+        )
+        .map_err(|error| ExecError::Internal(error.to_string().into()))?;
+        let correlated_index_plans = crate::builder_utils::cor_col_in_dist_plan(&index_plans)
+            .then(|| index_plans.iter().map(|plan| (*plan).clone()).collect());
+        let index_output_len = index_plans
+            .last()
+            .and_then(|plan| plan.schema())
+            .map_or(0, |schema| schema.len());
         let est_rows = index_plans[0].stats_count().map_or(0, |count| count as usize);
         let table_plan_ids: Vec<isize> = table_plans.iter().map(|plan| plan.id() as isize).collect();
         let shared = Shared {
@@ -428,7 +448,9 @@ impl IndexLookUpExecutor {
             shared: Arc::new(shared),
             index_plans_un_nature_orders,
             index_look_up_push_down: v.index_look_up_push_down,
-            index_plans: index_plans.clone(),
+            index_dag,
+            correlated_index_plans,
+            index_output_len,
             index_plan_ids,
             index_id: index.id,
             table_ids,
@@ -665,14 +687,21 @@ impl IndexLookUpExecutor {
     fn start_workers(&mut self, init_batch_size: usize) -> Result<(), ExecError> {
         let statement = crate::remote_scan::pushdown_statement_context(&self.shared.ctx);
         let kv_ranges = std::mem::take(&mut self.kv_ranges);
-        let plans: Vec<&PhysicalPlan> = self.index_plans.iter().collect();
-        let mut dag = crate::builder_utils::construct_dag_req(
-            &self.shared.ctx,
-            &statement,
-            &plans,
-            tidb_kv::store_type::StoreType::TiKv,
-        )
-        .map_err(|error| ExecError::Internal(error.to_string().into()))?;
+        // Go `dagPB`, its executors rebuilt over the outer row when
+        // `corColInIdxSide`.
+        let mut dag = match &self.correlated_index_plans {
+            Some(index_plans) => {
+                let plans: Vec<&PhysicalPlan> = index_plans.iter().collect();
+                crate::builder_utils::construct_dag_req(
+                    &self.shared.ctx,
+                    &statement,
+                    &plans,
+                    tidb_kv::store_type::StoreType::TiKv,
+                )
+                .map_err(|error| ExecError::Internal(error.to_string().into()))?
+            }
+            None => self.index_dag.clone(),
+        };
         let mut by_items = self.by_items.clone();
         let mut index_types = self.index_types.clone();
         // Go `tblScanIdxForRewritePartitionID`.
@@ -693,8 +722,7 @@ impl IndexLookUpExecutor {
                 executor_idx: intermediate_output_index as u32,
                 output_offsets: self.index_output_offsets.clone(),
             }];
-            let output_len = self.index_plans.last().and_then(|plan| plan.schema()).map_or(0, |schema| schema.len());
-            dag.output_offsets = (0..output_len as u32).collect();
+            dag.output_offsets = (0..self.index_output_len as u32).collect();
             if self.partition_table_mode {
                 tbl_scan_idx_for_rewrite_partition_id = Some(
                     dag.executors

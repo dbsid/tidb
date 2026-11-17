@@ -67,8 +67,11 @@ pub struct IndexReaderExecutor {
     ctx: crate::StmtContext,
     /// Go `dctx.Client`.
     client: Arc<dyn tidb_txnkv::Client>,
-    /// Go `plans` (`v.IndexPlans`), the index scan first.
-    index_plan: PhysicalPlan,
+    /// Go `dagPB`: the request built from the index plans with the reader.
+    dag: tidb_proto::tipb::DagRequest,
+    /// Go `plans` when `corColInFilter`: the index plans, whose executors
+    /// are rebuilt over the outer row on every open; `None` otherwise.
+    correlated_index_plan: Option<PhysicalPlan>,
     /// Go `getPhysicalPlanIDs(e.plans)`.
     plan_ids: Vec<isize>,
     /// Go `physicalTableID`, or the pruned partitions' ids (Go
@@ -200,6 +203,18 @@ impl IndexReaderExecutor {
                     .map_err(|_| ExecError::Internal("an index reader output column is absent from its plans".into()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Go `buildNoRangeIndexReader`: `ConstructDAGReq(b.ctx, v.IndexPlans,
+        // kv.TiKV)` once, and `corColInFilter` for `open` to rebuild it.
+        let mut dag = crate::builder_utils::construct_dag_req(
+            ctx,
+            &crate::remote_scan::pushdown_statement_context(ctx),
+            &plans,
+            tidb_kv::store_type::StoreType::TiKv,
+        )
+        .map_err(|error| ExecError::Internal(error.to_string().into()))?;
+        dag.output_offsets.clone_from(&output_offsets);
+        let correlated_index_plan =
+            crate::builder_utils::cor_col_in_dist_plan(&plans).then(|| index_plan.clone());
         let by_items = scan
             .by_items
             .iter()
@@ -224,7 +239,8 @@ impl IndexReaderExecutor {
             meta,
             ctx: ctx.clone(),
             client,
-            index_plan: index_plan.clone(),
+            dag,
+            correlated_index_plan,
             plan_ids: plans.iter().map(|plan| plan.id() as isize).collect(),
             table_ids,
             index_id: scan.index_id,
@@ -410,17 +426,24 @@ impl Executor for IndexReaderExecutor {
         let statement = crate::remote_scan::pushdown_statement_context(&self.ctx)
             .with_estimated_net_bytes(self.net_data_size);
         let mut kv_ranges = self.build_kv_ranges()?;
-        // Go `ConstructDAGReq(b.sctx, v.IndexPlans, kv.TiKV)`, rebuilt here,
-        // so a correlated filter reads the outer row as `corColInFilter` does.
-        let plans = tidb_planner_core_operator_physicalop::flatten_list_push_down_plan(&self.index_plan);
-        let mut dag = crate::builder_utils::construct_dag_req(
-            &self.ctx,
-            &statement,
-            &plans,
-            tidb_kv::store_type::StoreType::TiKv,
-        )
-        .map_err(|error| ExecError::Internal(error.to_string().into()))?;
-        dag.output_offsets.clone_from(&self.output_offsets);
+        // Go `dagPB`, its executors rebuilt over the outer row when
+        // `corColInFilter`.
+        let dag = match &self.correlated_index_plan {
+            Some(index_plan) => {
+                let plans =
+                    tidb_planner_core_operator_physicalop::flatten_list_push_down_plan(index_plan);
+                let mut dag = crate::builder_utils::construct_dag_req(
+                    &self.ctx,
+                    &statement,
+                    &plans,
+                    tidb_kv::store_type::StoreType::TiKv,
+                )
+                .map_err(|error| ExecError::Internal(error.to_string().into()))?;
+                dag.output_offsets.clone_from(&self.output_offsets);
+                dag
+            }
+            None => self.dag.clone(),
+        };
         self.result = None;
         // Treat temporary table as dummy table, avoid sending distsql request
         // to TiKV (its KV ranges are left in build order).
