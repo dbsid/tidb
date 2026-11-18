@@ -98,6 +98,7 @@ fn cached_prepared_index_lookup_uses_one_timestamp() {
         (8, vec![vec![Datum::Int(3), Datum::Int(30)]]),
         (9, Vec::new()),
     ] {
+        super::super::PREPARED_TEMPLATE_BINDS.with(|binds| binds.set(0));
         let observed = opens_of(&node, || {
             let GeneralExecuteOutcome::Rows(mut result) = session
                 .node_conn().execute_general(&statement, &[PreparedValue::SignedLongLong(value)])
@@ -117,6 +118,13 @@ fn cached_prepared_index_lookup_uses_one_timestamp() {
             assert_eq!(node.live.load(Ordering::Acquire), 0);
             source.close().unwrap();
         });
+        if value == 8 {
+            assert_eq!(
+                super::super::PREPARED_TEMPLATE_BINDS.with(std::cell::Cell::get),
+                0,
+                "a cached index lookup rebound its template to choose a snapshot"
+            );
+        }
         assert_eq!(observed, PAID, "index and record reads need one snapshot");
         assert_eq!(node.live.load(Ordering::Acquire), 0);
     }
@@ -124,6 +132,20 @@ fn cached_prepared_index_lookup_uses_one_timestamp() {
         rows(&mut session, "SELECT @@last_plan_from_cache"),
         vec![vec![Datum::Int(1)]],
         "timestamped prefix reads must retain cache reuse",
+    );
+
+    // The literal binder still rejects a binary FLOAT parameter. Reusing a
+    // timestamped plan must preserve that error.
+    let error = session
+        .node_conn()
+        .execute_general(&statement, &[PreparedValue::Float(8.0)])
+        .err()
+        .expect("unsupported FLOAT literal");
+    assert!(
+        error
+            .message
+            .contains("this subquery result kind is not supported yet"),
+        "{error:?}"
     );
 }
 

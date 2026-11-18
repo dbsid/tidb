@@ -1201,6 +1201,35 @@ pub(crate) fn prepared_parameter_types_compatible(
 }
 
 impl PreparedSelectExecution {
+    /// Whether this rebuilt plan already proves that the statement needs an
+    /// ordinary snapshot. Go's IsPointGetWithPKOrUniqueKeyByAutoCommit
+    /// considers only a single projection over a point get or a reader.
+    /// Locking reads and candidate point reads keep their session checks.
+    pub fn rules_out_point_snapshot(&self) -> bool {
+        use tidb_planner_core_operator_physicalop::PhysicalPlan;
+
+        let ruled_out = self.with_plan(|statement, physical| {
+            if matches!(statement, tidb_ast::Stmt::Query(query)
+                if matches!(query.as_ref(), tidb_ast::QueryStmt::Select(select) if select.lock.is_some()))
+            {
+                return false;
+            }
+            let mut root = physical.as_ref();
+            if let PhysicalPlan::Projection(_) = root {
+                let [child] = root.children() else { return false };
+                root = child;
+            }
+            !matches!(root, PhysicalPlan::PointGet(_) | PhysicalPlan::TableReader(_) | PhysicalPlan::IndexReader(_))
+        });
+        // A cache entry has already checked the marker count. The wire binder
+        // can still reject a datum as a SQL literal. In that case retain the
+        // ordinary path so the statement reports the same binding error.
+        ruled_out == Some(true)
+            && self.parameters.iter().all(|value| {
+                matches!(value, Datum::Int(_) | Datum::UInt(_)) || datum_to_literal(value).is_ok()
+            })
+    }
+
     /// Values owned by this execution, independent of later cache rebuilds.
     #[must_use]
     pub fn parameters(&self) -> Arc<[Datum]> {

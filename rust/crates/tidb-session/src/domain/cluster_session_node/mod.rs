@@ -2241,12 +2241,16 @@ impl<'s> ClusterServerSession<'s> {
             });
         let direct_dml = cached_dml.is_some();
         let direct = fast || fast_select || direct_dml;
-        let bound_template = if direct && !fast_select {
-            None
-        } else {
+        let needs_bound_template = !direct
+            || cached_select
+                .as_ref()
+                .is_some_and(|select| !select.rules_out_point_snapshot());
+        let bound_template = if needs_bound_template {
             // A statement whose values do not bind fails inside the
             // lifecycle that opens below, like a plan `Compile` refuses.
             effective.and_then(|template| {
+                #[cfg(test)]
+                PREPARED_TEMPLATE_BINDS.with(|binds| binds.set(binds.get() + 1));
                 tidb_executor::bind_statement(template.clone(), &params)
                     .map_err(|error| {
                         generate_new_plan_error =
@@ -2257,14 +2261,15 @@ impl<'s> ClusterServerSession<'s> {
                     })
                     .ok()
             })
+        } else {
+            None
         };
         let shape = if fast {
             point_read_shape.unwrap_or(StatementReadShape::Unknown)
         } else if fast_select {
-            // A retained physical SELECT still needs the locking statement's
-            // fresh for-update snapshot and lock-value cache on every replay.
-            // Classify this execution's values, not the unbound PREPARE
-            // markers: a complete point key may use MaxTS even on cache hits.
+            // Only a locking or potentially single-read plan needs its
+            // execute-time values classified here. Other physical roots
+            // already require the ordinary transaction snapshot.
             bound_template
                 .as_ref()
                 .map_or(StatementReadShape::Unknown, |bound| {
@@ -3547,6 +3552,11 @@ pub fn build_tiflash_replica_poll(
             None
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARED_TEMPLATE_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
