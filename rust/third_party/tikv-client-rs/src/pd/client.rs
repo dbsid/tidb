@@ -98,6 +98,10 @@ pub trait PdClient: Send + Sync + 'static {
         ))
     }
 
+    /// True when grouping one key can use `region_for_key` directly. A custom
+    /// PD client can specialize `group_keys_by_region` and keeps that path by default.
+    const DIRECT_SINGLE_KEY_LOOKUP: bool = false;
+
     /// In transactional API, the key and returned region are both decoded (keys in raw format).
     async fn region_for_key(&self, key: &Key) -> Result<RegionWithLeader>;
 
@@ -1481,6 +1485,8 @@ where
     P: RetryClientTrait + Send + Sync + 'static,
 {
     type KvClient = KvC::KvClient;
+
+    const DIRECT_SINGLE_KEY_LOOKUP: bool = true;
 
     async fn split_regions(
         self: Arc<Self>,

@@ -59,6 +59,8 @@ where
 {
     type KvClient = C::KvClient;
 
+    const DIRECT_SINGLE_KEY_LOOKUP: bool = true;
+
     async fn map_region_to_store(self: Arc<Self>, region: RegionWithLeader) -> Result<RegionStore> {
         self.inner.clone().map_region_to_store(region).await
     }

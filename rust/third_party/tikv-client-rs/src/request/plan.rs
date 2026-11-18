@@ -1313,6 +1313,11 @@ pub struct RetryableMultiRegion<P: Plan, PdC: PdClient, R: RegionRetryState = Ba
     pub(crate) snapshot_async_batch_get: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SHARD_STREAMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn multi_region_shard_error<T>(result: &Result<Vec<Result<T>>>) -> Option<&Error> {
     match result {
         Err(error) => Some(error),
@@ -1359,6 +1364,35 @@ impl<P: Plan + Shardable, PdC: PdClient, R: RegionRetryState> RetryableMultiRegi
 where
     P::Result: HasKeyErrors + HasRegionError,
 {
+    /// Send a single located shard on its owner's Backoffer. Both a request
+    /// located directly and a grouped request with one shard use this path.
+    fn send_only_shard<'a>(
+        pd_client: Arc<PdC>,
+        plan: &'a mut P,
+        region: RegionWithLeader,
+        backoff: &'a mut R,
+        permits: &'a Arc<Semaphore>,
+        preserve_region_results: bool,
+        one_region: Option<bool>,
+    ) -> impl Future<Output = Result<<Self as Plan>::Result>> + 'a {
+        plan.set_async_batch_get_metrics(false);
+        if let Some(owner) = backoff.snapshot_retry_owner() {
+            plan.set_snapshot_retry_owner(owner);
+        }
+        // Get, one-region BatchGet, and scanner refills use their owning
+        // backoffer directly in client-go. Forking is fanout-only.
+        Self::traced_single_shard_handler(
+            pd_client,
+            plan,
+            region,
+            backoff,
+            permits,
+            preserve_region_results,
+            one_region,
+            false,
+        )
+    }
+
     // A plan may involve multiple shards. client-go's sender borrows the
     // request and Backoffer its caller owns (`SendReqCtx(bo, req, ...)`), so
     // this handler and the senders below work on the caller's plan and
@@ -1375,6 +1409,36 @@ where
         snapshot_async_batch_get: bool,
         relocated_from: Option<crate::region::RegionVerId>,
     ) -> Result<<Self as Plan>::Result> {
+        let target = match current_plan.single_region_target() {
+            Some(crate::request::SingleRegionTarget::Key(_)) if !PdC::DIRECT_SINGLE_KEY_LOOKUP => {
+                None
+            }
+            target => target,
+        };
+        if let Some(target) = target {
+            let region = target.locate(&*pd_client).await?;
+            if relocated_from
+                .as_ref()
+                .is_none_or(|previous| &region.ver_id() != previous)
+            {
+                current_plan.observe_grouping(1, 1, relocated_from.is_some());
+            }
+            if let Some(internal) = snapshot_region_scope {
+                crate::stats::observe_snapshot_regions(internal, 1);
+            }
+            return Self::send_only_shard(
+                pd_client,
+                current_plan,
+                region,
+                backoff,
+                permits,
+                preserve_region_results,
+                one_region,
+            )
+            .await;
+        }
+        #[cfg(test)]
+        SHARD_STREAMS.with(|count| count.set(count.get() + 1));
         let mut shards = current_plan.shards(&pd_client).collect::<Vec<_>>().await;
         // client-go `doActionOnGroupMutations` on the request's grouping. A
         // region error's `batch.relocate` retries a batch whose first key
@@ -1440,23 +1504,15 @@ where
                 .expect("all shard lookups were validated before dispatch");
             // client-go sends a one-region request as the request it built:
             // the shard goes on the caller's plan in place.
-            let plan = current_plan;
-            plan.apply_shard(shard);
-            plan.set_async_batch_get_metrics(false);
-            if let Some(owner) = backoff.snapshot_retry_owner() {
-                plan.set_snapshot_retry_owner(owner);
-            }
-            // Get, one-region BatchGet, and scanner refills use their owning
-            // backoffer directly in client-go. Forking is fanout-only.
-            return Self::traced_single_shard_handler(
+            current_plan.apply_shard(shard);
+            return Self::send_only_shard(
                 pd_client,
-                plan,
+                current_plan,
                 region,
                 backoff,
                 permits,
                 preserve_region_results,
                 one_region,
-                false,
             )
             .await;
         }
