@@ -62,6 +62,19 @@ fn fill_default_request_origin(context: &mut kvrpcpb::Context) {
     }
 }
 
+fn dispatch_context_matches(
+    context: Option<&kvrpcpb::Context>,
+    trace_id: Option<&[u8]>,
+    trace_flags: u64,
+) -> bool {
+    context.is_some_and(|context| {
+        context.trace_control_flags == trace_flags
+            && trace_id.is_none_or(|id| id == context.trace_id)
+            && (context.request_origin != kvrpcpb::RequestOrigin::Unknown as i32
+                || get_default_request_origin() == kvrpcpb::RequestOrigin::Unknown)
+    })
+}
+
 pub(super) fn fill_context_default_request_origin(context: &mut Option<kvrpcpb::Context>) {
     fill_default_request_origin(context.get_or_insert_with(kvrpcpb::Context::default));
 }
@@ -414,6 +427,12 @@ pub trait Request: Any + Sync + Send + 'static {
     /// streaming requests deliberately retain the no-context default.
     fn tikv_context(&self) -> Option<&kvrpcpb::Context> {
         None
+    }
+
+    /// Whether attaching the attempt's trace fields and default origin would leave
+    /// the request unchanged. Custom request types retain their attachment hook.
+    fn dispatch_context_matches(&self, _trace_id: Option<&[u8]>, _trace_flags: u64) -> bool {
+        false
     }
 
     /// Replaces the concrete protobuf context at the transport boundary.
@@ -985,6 +1004,10 @@ macro_rules! impl_request {
                 self.context.as_ref()
             }
 
+            fn dispatch_context_matches(&self, trace_id: Option<&[u8]>, trace_flags: u64) -> bool {
+                $accepts_context && dispatch_context_matches(self.context.as_ref(), trace_id, trace_flags)
+            }
+
             fn attach_context(&mut self, mut context: kvrpcpb::Context) -> bool {
                 if !$accepts_context {
                     return false;
@@ -1508,6 +1531,10 @@ impl Request for coprocessor::Request {
 
     fn tikv_context(&self) -> Option<&kvrpcpb::Context> {
         self.context.as_ref()
+    }
+
+    fn dispatch_context_matches(&self, trace_id: Option<&[u8]>, trace_flags: u64) -> bool {
+        dispatch_context_matches(self.context.as_ref(), trace_id, trace_flags)
     }
 
     fn attach_context(&mut self, mut context: kvrpcpb::Context) -> bool {
@@ -2344,6 +2371,21 @@ mod tests {
 
         set_default_request_origin(kvrpcpb::RequestOrigin::TiDb);
         assert_eq!(get_default_request_origin(), kvrpcpb::RequestOrigin::TiDb);
+        let mut request = kvrpcpb::GetRequest {
+            context: Some(kvrpcpb::Context::default()),
+            ..Default::default()
+        };
+        assert!(!request.dispatch_context_matches(None, 0));
+        assert!(request.attach_context(kvrpcpb::Context {
+            trace_id: b"existing".to_vec(),
+            trace_control_flags: 7,
+            ..Default::default()
+        }));
+        assert!(request.dispatch_context_matches(None, 7));
+        assert!(request.dispatch_context_matches(Some(b"existing"), 7));
+        assert!(!request.dispatch_context_matches(Some(b"new"), 7));
+        assert!(!request.dispatch_context_matches(None, 0));
+
         for mut request in [
             Box::new(kvrpcpb::GetRequest::default()) as Box<dyn Request>,
             Box::new(kvrpcpb::ScanLockRequest::default()),

@@ -1,5 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use std::sync::atomic::AtomicI64;
@@ -421,18 +422,20 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
                 )
             })
             .transpose()?;
-        let mut request = self.request.clone();
+        let mut request = Cow::Borrowed(&self.request);
         if let Some(prepare) = &self.request_preparer {
-            prepare(&mut request)?;
+            prepare(request.to_mut())?;
         }
-        let mut tikv_context = request.tikv_context().cloned().unwrap_or_default();
-        if let Some(trace_id) = self.trace_context.trace_id() {
-            if !trace_id.is_empty() {
-                tikv_context.trace_id = trace_id.to_vec();
+        let trace_id = self.trace_context.trace_id().filter(|id| !id.is_empty());
+        let trace_flags = crate::trace::trace_control_flags(&self.trace_context).0;
+        if !request.dispatch_context_matches(trace_id, trace_flags) {
+            let mut context = request.tikv_context().cloned().unwrap_or_default();
+            if let Some(id) = trace_id {
+                context.trace_id = id.to_vec();
             }
+            context.trace_control_flags = trace_flags;
+            request.to_mut().attach_context(context);
         }
-        tikv_context.trace_control_flags = crate::trace::trace_control_flags(&self.trace_context).0;
-        request.attach_context(tikv_context);
         let resource_control = self
             .resource_control
             .clone()
@@ -440,7 +443,7 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
         let selected_resource_control = resource_control.as_ref().and_then(|controller| {
             crate::resource_control::select(
                 controller,
-                &request,
+                request.as_ref(),
                 self.resource_control_replica_number,
                 self.resource_control_access_location,
                 self.predicted_read_bytes,
@@ -468,7 +471,7 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
                 &self.trace_context,
                 crate::trace::Category::KvRequest,
                 "kv.request.send",
-                &request_trace_fields(self, &request),
+                &request_trace_fields(self, request.as_ref()),
             );
         }
         let started_at = Instant::now();
@@ -482,11 +485,13 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
                     if let Some(ru_details) = self.ru_details() {
                         ru_details.update(&result.consumption, result.wait_duration);
                     }
+                    let request = request.to_mut();
                     request.set_resource_control_penalty(result.penalty);
                     request.set_resource_control_priority_if_unset(result.priority);
                 }),
             None => Ok(()),
         };
+        let request = request.as_ref();
         let client = self
             .kv_client
             .as_ref()
@@ -501,7 +506,7 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
                 let dispatch = crate::trace::with_rpc_send_async(
                     async_first_send,
                     client.dispatch_with_timeout_and_forwarded_host(
-                        &request,
+                        request,
                         self.request_timeout,
                         &self.forwarded_host,
                     ),
@@ -528,7 +533,7 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
         };
         let result = match admission_result {
             Ok(()) => match &interceptor {
-                Some(interceptor) => interceptor.dispatch(&self.target, &request, next).await,
+                Some(interceptor) => interceptor.dispatch(&self.target, request, next).await,
                 None => next().await,
             },
             Err(error) => Err(error),
@@ -572,9 +577,9 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
                 .clone()
                 .or_else(crate::traffic::current_network_traffic_details),
         };
-        network_collector.on_request(&request);
+        network_collector.on_request(request);
         if let Ok(response) = &result {
-            network_collector.on_response(&request, response.as_ref());
+            network_collector.on_response(request, response.as_ref());
         }
         let result = match result {
             Ok(response) => match selected_resource_control {
@@ -4284,6 +4289,46 @@ mod test {
         assert_eq!(
             dispatches.load(Ordering::SeqCst),
             if cfg!(feature = "nextgen") { 6 } else { 5 }
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_reuses_an_already_contextualized_get() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&seen);
+        let client = MockKvClient::with_dispatch_hook(move |req| {
+            let req = req.downcast_ref::<kvrpcpb::GetRequest>().unwrap();
+            observed.store(req.key.as_ptr() as usize, Ordering::SeqCst);
+            assert_eq!(
+                req.context.as_ref().unwrap().request_origin,
+                kvrpcpb::RequestOrigin::TiDb as i32
+            );
+            Ok(Box::new(kvrpcpb::GetResponse::default()))
+        });
+        let plan = PlanBuilder::new(
+            Arc::new(MockPdClient::default()),
+            Keyspace::Disable,
+            kvrpcpb::GetRequest {
+                key: b"prepared point".to_vec(),
+                context: Some(kvrpcpb::Context {
+                    request_origin: kvrpcpb::RequestOrigin::TiDb as i32,
+                    trace_control_flags: crate::trace::TraceControlFlags::TIKV_CATEGORY_REQUEST.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .single_region_with_store(RegionStore::new(MockPdClient::region1(), Arc::new(client)))
+        .await
+        .unwrap()
+        .plan();
+        let key = plan.request.key.as_ptr() as usize;
+        plan.execute().await.unwrap();
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            key,
+            "dispatch copied a request whose context already matched"
         );
     }
 
