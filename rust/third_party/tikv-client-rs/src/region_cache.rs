@@ -18,7 +18,6 @@ use futures::{
 use rand::Rng;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
-use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::async_util::Cancellation;
@@ -998,7 +997,8 @@ impl RegionCacheMap {
 }
 
 pub struct RegionCache<Client = RetryClient<Cluster>> {
-    region_cache: RwLock<RegionCacheMap>,
+    // Go RegionCache.mu. Only in-memory index operations hold this lock.
+    region_cache: StdRwLock<RegionCacheMap>,
     store_cache: StdRwLock<HashMap<StoreId, CachedStore>>,
     store_resolve_locks: AsyncMutex<HashMap<StoreId, Arc<AsyncMutex<()>>>>,
     tiflash_compute_store_cache: TiFlashComputeStoreCache,
@@ -1016,9 +1016,21 @@ pub struct RegionCache<Client = RetryClient<Cluster>> {
 }
 
 impl<Client> RegionCache<Client> {
+    fn read_regions(&self) -> std::sync::RwLockReadGuard<'_, RegionCacheMap> {
+        self.region_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_regions(&self) -> std::sync::RwLockWriteGuard<'_, RegionCacheMap> {
+        self.region_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn new(inner_client: Arc<Client>) -> RegionCache<Client> {
         RegionCache {
-            region_cache: RwLock::new(RegionCacheMap::new()),
+            region_cache: StdRwLock::new(RegionCacheMap::new()),
             store_cache: StdRwLock::new(HashMap::new()),
             store_resolve_locks: AsyncMutex::new(HashMap::new()),
             tiflash_compute_store_cache: TiFlashComputeStoreCache::default(),
@@ -1137,7 +1149,7 @@ impl<C: Send + Sync> RegionCache<C> {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let mut cache = self.region_cache.write().await;
+        let mut cache = self.write_regions();
         let candidates = cache
             .key_to_ver_id
             .range(cursor..)
@@ -1650,35 +1662,36 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     ) -> Result<RegionWithLeader> {
         // Source `searchCachedRegionByKey`: `mu.RLock`; the entry's TTL and
         // sync flags are atomics.
-        let region_cache_guard = self.region_cache.read().await;
-        let res = {
-            region_cache_guard
-                .key_to_ver_id
-                .range::<Key, _>(..=key)
-                .next_back()
-                .map(|(x, y)| (x.clone(), y.clone()))
-        };
+        let reload = {
+            let region_cache_guard = self.read_regions();
+            let res = {
+                region_cache_guard
+                    .key_to_ver_id
+                    .range::<Key, _>(..=key)
+                    .next_back()
+                    .map(|(x, y)| (x.clone(), y.clone()))
+            };
 
-        let reload = if let Some((_, candidate_region_ver_id)) = res {
-            let region = region_cache_guard
-                .ver_id_to_region
-                .get(&candidate_region_ver_id)
-                .unwrap();
+            if let Some((_, candidate_region_ver_id)) = res {
+                let region = region_cache_guard
+                    .ver_id_to_region
+                    .get(&candidate_region_ver_id)
+                    .unwrap();
 
-            if region.region.contains(key) && region.check_ttl(now_epoch_secs()) {
-                let flags =
-                    region.take_sync_flags(NEED_RELOAD_ON_ACCESS | NEED_DELAYED_RELOAD_READY);
-                if flags == 0 {
-                    return Ok(region.region.clone());
+                if region.region.contains(key) && region.check_ttl(now_epoch_secs()) {
+                    let flags =
+                        region.take_sync_flags(NEED_RELOAD_ON_ACCESS | NEED_DELAYED_RELOAD_READY);
+                    if flags == 0 {
+                        return Ok(region.region.clone());
+                    }
+                    Some((candidate_region_ver_id, region.region.clone()))
+                } else {
+                    None
                 }
-                Some((candidate_region_ver_id, region.region.clone()))
             } else {
                 None
             }
-        } else {
-            None
         };
-        drop(region_cache_guard);
         // Keep the cache-hit path allocation-free; only a PD load needs its
         // own cancellation state and retry accounting.
         let mut default_backoffer;
@@ -1709,10 +1722,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                     Ok(region)
                 }
                 Err(_) => {
-                    if let Some(region) = self
-                        .region_cache
-                        .write()
-                        .await
+                    if let Some(region) = self.write_regions()
                         .ver_id_to_region
                         .get_mut(&ver_id)
                     {
@@ -1802,31 +1812,32 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     /// by reverse scans so an exact region boundary belongs to the preceding
     /// region rather than the following one.
     pub async fn get_region_by_end_key(&self, key: &Key) -> Result<RegionWithLeader> {
-        let region_cache_guard = self.region_cache.read().await;
-        let candidate = region_cache_guard
-            .key_to_ver_id
-            .range::<Key, _>(..key)
-            .next_back()
-            .map(|(_, version)| version.clone());
-        let reload = if let Some(candidate) = candidate {
-            let region = region_cache_guard.ver_id_to_region.get(&candidate).unwrap();
-            if region.region.start_key() < *key
-                && (region.region.end_key().is_empty() || *key <= region.region.end_key())
-                && region.check_ttl(now_epoch_secs())
-            {
-                let flags =
-                    region.take_sync_flags(NEED_RELOAD_ON_ACCESS | NEED_DELAYED_RELOAD_READY);
-                if flags == 0 {
-                    return Ok(region.region.clone());
+        let reload = {
+            let region_cache_guard = self.read_regions();
+            let candidate = region_cache_guard
+                .key_to_ver_id
+                .range::<Key, _>(..key)
+                .next_back()
+                .map(|(_, version)| version.clone());
+            if let Some(candidate) = candidate {
+                let region = region_cache_guard.ver_id_to_region.get(&candidate).unwrap();
+                if region.region.start_key() < *key
+                    && (region.region.end_key().is_empty() || *key <= region.region.end_key())
+                    && region.check_ttl(now_epoch_secs())
+                {
+                    let flags =
+                        region.take_sync_flags(NEED_RELOAD_ON_ACCESS | NEED_DELAYED_RELOAD_READY);
+                    if flags == 0 {
+                        return Ok(region.region.clone());
+                    }
+                    Some((candidate, region.region.clone()))
+                } else {
+                    None
                 }
-                Some((candidate, region.region.clone()))
             } else {
                 None
             }
-        } else {
-            None
         };
-        drop(region_cache_guard);
         if let Some((ver_id, old_region)) = reload {
             let loaded = self
                 .query_region_with_backoff(
@@ -1852,10 +1863,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                     Ok(region)
                 }
                 Err(_) => {
-                    if let Some(region) = self
-                        .region_cache
-                        .write()
-                        .await
+                    if let Some(region) = self.write_regions()
                         .ver_id_to_region
                         .get_mut(&ver_id)
                     {
@@ -1874,57 +1882,53 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
     pub async fn get_region_by_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         for _ in 0..=MAX_RETRY_WAITING_CONCURRENT_REQUEST {
-            let region_cache_guard = self.region_cache.read().await;
-
-            // check cache
-            let ver_id = region_cache_guard.id_to_ver_id.get(&id).cloned();
-            if let Some(ver_id) = ver_id {
-                let region = region_cache_guard.ver_id_to_region.get(&ver_id).unwrap();
-                if region.check_ttl(now_epoch_secs()) {
+            let (reload, notified) = {
+                let regions = self.read_regions();
+                let cached = regions.id_to_ver_id.get(&id).and_then(|version| {
+                    let region = regions.ver_id_to_region.get(version).unwrap();
+                    region.check_ttl(now_epoch_secs()).then_some((version, region))
+                });
+                if let Some((version, region)) = cached {
                     let flags =
                         region.take_sync_flags(NEED_RELOAD_ON_ACCESS | NEED_DELAYED_RELOAD_READY);
                     if flags == 0 {
                         return Ok(region.region.clone());
                     }
-                    let old_region = region.region.clone();
-                    drop(region_cache_guard);
-                    let loaded = crate::trace::detached_client_span(
-                        "loadRegionByID",
-                        pd_region_meta_call(
-                            self.inner_client.clone().get_region_by_id_with_buckets(id),
-                        ),
-                    )
-                    .await;
-                    let loaded = match loaded {
-                        Ok(region) => self.prepare_region_from_pd(region).await,
-                        Err(error) => Err(error),
-                    };
-                    return match loaded {
-                        Ok(mut region) => {
-                            self.insert_region_to_cache(&mut region).await;
-                            Ok(region)
-                        }
-                        Err(_) => {
-                            if let Some(region) = self
-                                .region_cache
-                                .write()
-                                .await
-                                .ver_id_to_region
-                                .get_mut(&ver_id)
-                            {
-                                region.set_sync_flags(NEED_RELOAD_ON_ACCESS);
-                            }
-                            Ok(old_region)
-                        }
-                    };
+                    (Some((version.clone(), region.region.clone())), None)
+                } else {
+                    // Register under the index lock, before a loader can notify its waiters.
+                    let notified = regions.on_my_way_id.get(&id).cloned().map(Notify::notified_owned);
+                    (None, notified)
                 }
+            };
+            if let Some((ver_id, old_region)) = reload {
+                let loaded = crate::trace::detached_client_span(
+                    "loadRegionByID",
+                    pd_region_meta_call(
+                        self.inner_client.clone().get_region_by_id_with_buckets(id),
+                    ),
+                )
+                .await;
+                let loaded = match loaded {
+                    Ok(region) => self.prepare_region_from_pd(region).await,
+                    Err(error) => Err(error),
+                };
+                return match loaded {
+                    Ok(mut region) => {
+                        self.insert_region_to_cache(&mut region).await;
+                        Ok(region)
+                    }
+                    Err(_) => {
+                        if let Some(region) = self.write_regions()
+                            .ver_id_to_region
+                            .get_mut(&ver_id)
+                        {
+                            region.set_sync_flags(NEED_RELOAD_ON_ACCESS);
+                        }
+                        Ok(old_region)
+                    }
+                };
             }
-
-            // check concurrent requests
-            let notify = region_cache_guard.on_my_way_id.get(&id).cloned();
-            let notified = notify.as_ref().map(|notify| notify.notified());
-            drop(region_cache_guard);
-
             if let Some(n) = notified {
                 n.await;
                 continue;
@@ -2340,7 +2344,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                 .insert(version, CachedRegion::new(region, epochs, now));
         }
 
-        let mut current = self.region_cache.write().await;
+        let mut current = self.write_regions();
         refreshed.on_my_way_id = std::mem::take(&mut current.on_my_way_id);
         *current = refreshed;
         *self.gc_cursor.lock().unwrap() = None;
@@ -2502,7 +2506,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     /// Cache-only counterpart of client-go's `TryLocateKey`. It does not issue
     /// a PD request and returns `None` for expired or reload-marked metadata.
     pub async fn try_locate_key(&self, key: &Key) -> Option<RegionWithLeader> {
-        let mut cache = self.region_cache.write().await;
+        let mut cache = self.write_regions();
         let version = cache
             .key_to_ver_id
             .range::<Key, _>(..=key)
@@ -2518,9 +2522,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     /// Returns the exact cached version without applying TTL or reload flags,
     /// matching `GetCachedRegionWithRLock`'s diagnostic/internal contract.
     pub async fn get_cached_region(&self, ver_id: &RegionVerId) -> Option<RegionWithLeader> {
-        self.region_cache
-            .read()
-            .await
+        self.read_regions()
             .ver_id_to_region
             .get(ver_id)
             .map(|region| region.region.clone())
@@ -2535,7 +2537,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         if limit == 0 {
             return Vec::new();
         }
-        let mut cache = self.region_cache.write().await;
+        let mut cache = self.write_regions();
         let entries = cache
             .key_to_ver_id
             .range(start_key.clone()..)
@@ -2774,7 +2776,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         // put a notify to let others know the region id is being queried
         let notify = Arc::new(Notify::new());
         {
-            let mut region_cache_guard = self.region_cache.write().await;
+            let mut region_cache_guard = self.write_regions();
             region_cache_guard.on_my_way_id.insert(id, notify.clone());
         }
 
@@ -2795,7 +2797,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         // Notify waiters even when PD failed. Leaving the singleflight entry
         // behind would strand every subsequent by-ID lookup indefinitely.
         {
-            let mut region_cache_guard = self.region_cache.write().await;
+            let mut region_cache_guard = self.write_regions();
             notify.notify_waiters();
             region_cache_guard.on_my_way_id.remove(&id);
         }
@@ -2869,7 +2871,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                 })
                 .collect::<HashMap<_, _>>()
         };
-        let mut cache = self.region_cache.write().await;
+        let mut cache = self.write_regions();
         let new_ver_id = region.ver_id();
 
         let start_key = region.start_key();
@@ -2993,7 +2995,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         ver_id: crate::region::RegionVerId,
         leader: metapb::Peer,
     ) -> Result<()> {
-        let mut cache = self.region_cache.write().await;
+        let mut cache = self.write_regions();
         let Some(region) = cache.ver_id_to_region.get(&ver_id) else {
             return Ok(());
         };
@@ -3036,7 +3038,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         version: u64,
         keys: Vec<Vec<u8>>,
     ) {
-        let mut cache = self.region_cache.write().await;
+        let mut cache = self.write_regions();
         let Some(cached) = cache.ver_id_to_region.get_mut(&ver_id) else {
             return;
         };
@@ -3083,7 +3085,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         tasks.push(tokio::spawn(async move {
             let _refresh_guard = refresh_guard;
             let needs_refresh = {
-                let regions = cache.region_cache.read().await;
+                let regions = cache.read_regions();
                 let Some(region) = regions.ver_id_to_region.get(&ver_id) else {
                     return;
                 };
@@ -3119,26 +3121,25 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         ver_id: crate::region::RegionVerId,
         reason: InvalidReason,
     ) {
-        let mut cache = self.region_cache.write().await;
+        let mut cache = self.write_regions();
         if let Some(cached_region) = cache.ver_id_to_region.get_mut(&ver_id) {
             cached_region.invalidate(reason, true);
         }
     }
 
     /// The reason the cached region `ver_id` was invalidated, if cached.
-    pub async fn invalid_reason(&self, ver_id: &crate::region::RegionVerId) -> Option<InvalidReason> {
-        self.region_cache
-            .read()
-            .await
+    pub async fn invalid_reason(
+        &self,
+        ver_id: &crate::region::RegionVerId,
+    ) -> Option<InvalidReason> {
+        self.read_regions()
             .ver_id_to_region
             .get(ver_id)
             .map(|cached_region| cached_region.invalid_reason)
     }
 
     pub(crate) async fn mark_region_reload_on_access(&self, ver_id: &RegionVerId) -> bool {
-        self.region_cache
-            .write()
-            .await
+        self.write_regions()
             .ver_id_to_region
             .get_mut(ver_id)
             .is_some_and(|region| {
@@ -3152,9 +3153,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         ver_id: &RegionVerId,
         proxy_store_id: Option<StoreId>,
     ) -> bool {
-        self.region_cache
-            .write()
-            .await
+        self.write_regions()
             .ver_id_to_region
             .get_mut(ver_id)
             .is_some_and(|region| {
@@ -3164,9 +3163,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     }
 
     pub(crate) async fn mark_region_delayed_reload(&self, ver_id: &RegionVerId) -> bool {
-        self.region_cache
-            .write()
-            .await
+        self.write_regions()
             .ver_id_to_region
             .get_mut(ver_id)
             .is_some_and(|region| {
@@ -3475,10 +3472,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         ver_id: &RegionVerId,
         store_id: StoreId,
     ) -> bool {
-        let expected = self
-            .region_cache
-            .read()
-            .await
+        let expected = self.read_regions()
             .ver_id_to_region
             .get(ver_id)
             .and_then(|region| region.store_epochs.get(&store_id).copied());
@@ -3502,10 +3496,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         ver_id: &RegionVerId,
         store_id: StoreId,
     ) -> bool {
-        let expected = self
-            .region_cache
-            .read()
-            .await
+        let expected = self.read_regions()
             .ver_id_to_region
             .get(ver_id)
             .and_then(|region| region.store_epochs.get(&store_id).copied());
@@ -3686,10 +3677,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             }
         }
         let leader_peer_id = region.leader.as_ref().map(|leader| leader.id);
-        let store_epochs = self
-            .region_cache
-            .read()
-            .await
+        let store_epochs = self.read_regions()
             .ver_id_to_region
             .get(&region.ver_id())
             .map(|cached| cached.store_epochs.clone())
@@ -3842,7 +3830,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         let mut all_stores = vec![current_store];
         let mut non_pending_stores = Vec::new();
         let (cached_region, store_epochs) = {
-            let mut regions = self.region_cache.write().await;
+            let mut regions = self.write_regions();
             let Some(cached) = regions.ver_id_to_region.get_mut(ver_id) else {
                 return (all_stores, non_pending_stores);
             };
@@ -3922,7 +3910,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         matches: &(dyn Fn(&[metapb::StoreLabel]) -> bool + Send + Sync),
     ) -> std::result::Result<(metapb::Peer, metapb::Store), TiFlashSelectionError> {
         let (cached_region, cursor, store_epochs) = {
-            let mut regions = self.region_cache.write().await;
+            let mut regions = self.write_regions();
             let Some(cached) = regions.ver_id_to_region.get_mut(&region.ver_id()) else {
                 return Err(TiFlashSelectionError::unavailable(
                     TiFlashRpcContextUnavailableReason::CachedRegionMissing,
@@ -4071,7 +4059,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         has_error: bool,
     ) -> bool {
         let (cursor, peers) = {
-            let regions = self.region_cache.read().await;
+            let regions = self.read_regions();
             let Some(cached) = regions.ver_id_to_region.get(ver_id) else {
                 return false;
             };
@@ -4125,7 +4113,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     ) -> (Vec<StoreId>, Vec<StoreId>) {
         let mut all = vec![current_store_id];
         let cached_region = {
-            let mut regions = self.region_cache.write().await;
+            let mut regions = self.write_regions();
             regions
                 .ver_id_to_region
                 .get_mut(&region.ver_id())
@@ -4267,10 +4255,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             self.set_region_proxy_store(&region.ver_id(), None).await;
             return Ok(None);
         }
-        let cached_proxy_store_id = self
-            .region_cache
-            .read()
-            .await
+        let cached_proxy_store_id = self.read_regions()
             .ver_id_to_region
             .get(&region.ver_id())
             .and_then(|cached| cached.proxy_store_id);
@@ -4719,7 +4704,7 @@ mod test {
         assert_eq!(backoffer.total_backoff_times(), 1);
         assert_eq!(client.get_region_count.load(SeqCst), 2);
         assert_eq!(backoffer.latest_errors().len(), 1);
-        assert!(cache.region_cache.read().await.ver_id_to_region.is_empty());
+        assert!(cache.read_regions().ver_id_to_region.is_empty());
     }
 
     #[tokio::test]
@@ -5001,9 +4986,9 @@ mod test {
             cache.get_region_by_id(42).await.unwrap_err().to_string(),
             "injected PD failure"
         );
-        assert!(cache.region_cache.read().await.on_my_way_id.is_empty());
+        assert!(cache.read_regions().on_my_way_id.is_empty());
         assert_eq!(cache.get_region_by_id(42).await.unwrap().id(), 42);
-        assert!(cache.region_cache.read().await.on_my_way_id.is_empty());
+        assert!(cache.read_regions().on_my_way_id.is_empty());
     }
 
     /// client-go builds its `RegionCache` on the store over any `pd.Client`
@@ -5031,6 +5016,25 @@ mod test {
         assert_eq!(client.clone().region_for_key(&key).await?.id(), 1);
         assert_eq!(pd.get_region_count.load(SeqCst), 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn warm_region_lookups_complete_without_using_the_async_lock_budget() -> Result<()> {
+        use futures::FutureExt;
+
+        let cache = RegionCache::new(Arc::new(MockRetryClient::default()));
+        cache.add_region(region(1, vec![], vec![])).await;
+        tokio::spawn(async move {
+            let key = vec![1].into();
+            for lookup in 0..512 {
+                let located = cache.get_region_by_key(&key).now_or_never();
+                assert!(located.is_some(), "warm lookup {lookup} suspended");
+                assert_eq!(located.unwrap()?.id(), 1);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -5158,25 +5162,33 @@ mod test {
             .lock()
             .await
             .insert(1, region_with_leader(1, b"", b""));
-        let cache = RegionCache::new(client.clone());
+        let cache = Arc::new(RegionCache::new(client.clone()));
         let located = cache
             .get_region_by_key(&Key::from(b"a".to_vec()))
             .await
             .unwrap();
 
-        let reader = cache.region_cache.read().await;
-        let wait = Duration::from_secs(1);
-        let by_key =
-            tokio::time::timeout(wait, cache.get_region_by_key(&Key::from(b"a".to_vec()))).await;
-        let by_end_key =
-            tokio::time::timeout(wait, cache.get_region_by_end_key(&Key::from(b"b".to_vec())))
-                .await;
-        let by_id = tokio::time::timeout(wait, cache.get_region_by_id(located.id())).await;
-        drop(reader);
+        // A blocked synchronous lock cannot be interrupted by a Tokio timer.
+        // Hold the other reader on a separate thread so a writer regression fails promptly.
+        let (ready, held) = std::sync::mpsc::channel();
+        let (release, finished) = std::sync::mpsc::channel();
+        let other = Arc::clone(&cache);
+        let reader = std::thread::spawn(move || {
+            let _guard = other.read_regions();
+            ready.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(5))
+        });
+        held.recv().unwrap();
+        let by_key = cache.get_region_by_key(&Key::from(b"a".to_vec())).await;
+        let by_end_key = cache.get_region_by_end_key(&Key::from(b"b".to_vec())).await;
+        let by_id = cache.get_region_by_id(located.id()).await;
+        let _ = release.send(());
+        reader
+            .join()
+            .unwrap()
+            .expect("a cache hit waited for the reader");
 
         for (lookup, found) in [("key", by_key), ("end key", by_end_key), ("id", by_id)] {
-            let found =
-                found.unwrap_or_else(|_| panic!("the {lookup} lookup waited for the reader"));
             assert_eq!(found.unwrap().ver_id(), located.ver_id(), "{lookup}");
         }
     }
@@ -5202,7 +5214,7 @@ mod test {
             Some(super::InvalidReason::EpochNotMatch)
         );
         assert_eq!(
-            cache.region_cache.read().await.ver_id_to_region[&located.ver_id()].ttl(),
+            cache.read_regions().ver_id_to_region[&located.ver_id()].ttl(),
             super::EXPIRED_TTL
         );
         // Source `GetCachedRegionWithRLock` still answers the invalid region.
@@ -5227,11 +5239,11 @@ mod test {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "receive Region with no available peer");
-        assert!(cache.region_cache.read().await.ver_id_to_region.is_empty());
+        assert!(cache.read_regions().ver_id_to_region.is_empty());
 
         let error = cache.get_region_by_id(1).await.unwrap_err();
         assert_eq!(error.to_string(), "receive Region with no available peer");
-        assert!(cache.region_cache.read().await.ver_id_to_region.is_empty());
+        assert!(cache.read_regions().ver_id_to_region.is_empty());
 
         let client = Arc::new(MockRetryClient::default());
         client.stores.lock().await.extend([
@@ -5324,10 +5336,7 @@ mod test {
         client.regions.lock().await.insert(3, unavailable);
         let error = cache.get_region_by_id(3).await.unwrap_err();
         assert!(error.to_string().contains("no available peers, region:"));
-        assert!(!cache
-            .region_cache
-            .read()
-            .await
+        assert!(!cache.read_regions()
             .id_to_ver_id
             .contains_key(&3));
     }
@@ -5439,7 +5448,7 @@ mod test {
         });
         let ver_id = original.ver_id();
         assert!(cache.add_region(original.clone()).await);
-        cache.region_cache.write().await.ver_id_to_region[&ver_id]
+        cache.write_regions().ver_id_to_region[&ver_id]
             .tiflash_cursor
             .store(7, SeqCst);
 
@@ -5447,7 +5456,7 @@ mod test {
         missing_buckets.buckets = None;
         assert!(cache.add_region(missing_buckets).await);
         {
-            let regions = cache.region_cache.read().await;
+            let regions = cache.read_regions();
             let cached = &regions.ver_id_to_region[&ver_id];
             assert_eq!(cached.region.buckets_version(), 2);
             assert_eq!(cached.tiflash_cursor.load(SeqCst), 7);
@@ -5457,7 +5466,7 @@ mod test {
         stale_buckets.buckets.as_mut().unwrap().version = 1;
         assert!(cache.add_region(stale_buckets).await);
         assert_eq!(
-            cache.region_cache.read().await.ver_id_to_region[&ver_id]
+            cache.read_regions().ver_id_to_region[&ver_id]
                 .region
                 .buckets_version(),
             2
@@ -5467,7 +5476,7 @@ mod test {
         fresh_buckets.buckets.as_mut().unwrap().version = 3;
         assert!(cache.add_region(fresh_buckets).await);
         {
-            let regions = cache.region_cache.read().await;
+            let regions = cache.read_regions();
             let cached = &regions.ver_id_to_region[&ver_id];
             assert_eq!(cached.region.buckets_version(), 3);
             assert_eq!(cached.tiflash_cursor.load(SeqCst), 7);
@@ -5484,14 +5493,14 @@ mod test {
         });
         let containing_ver_id = containing.ver_id();
         assert!(cache.add_region(containing).await);
-        cache.region_cache.write().await.ver_id_to_region[&containing_ver_id]
+        cache.write_regions().ver_id_to_region[&containing_ver_id]
             .tiflash_cursor
             .store(9, SeqCst);
 
         let replacement = region(3, vec![25], vec![30]);
         let replacement_ver_id = replacement.ver_id();
         assert!(cache.add_region(replacement).await);
-        let regions = cache.region_cache.read().await;
+        let regions = cache.read_regions();
         let cached = &regions.ver_id_to_region[&replacement_ver_id];
         assert_eq!(cached.region.buckets_version(), 4);
         assert_eq!(cached.tiflash_cursor.load(SeqCst), 9);
@@ -5609,10 +5618,7 @@ mod test {
         );
         assert_eq!(client.get_region_count.load(SeqCst), 2);
         assert_eq!(
-            cache
-                .region_cache
-                .read()
-                .await
+            cache.read_regions()
                 .key_to_ver_id
                 .keys()
                 .cloned()
@@ -5654,7 +5660,7 @@ mod test {
 
         let now = now_epoch_secs();
         {
-            let mut guard = cache.region_cache.write().await;
+            let mut guard = cache.write_regions();
             guard
                 .ver_id_to_region
                 .get_mut(&cached.ver_id())
@@ -5664,12 +5670,12 @@ mod test {
         }
         assert_eq!(cache.get_region_by_key(&vec![1].into()).await?, cached);
         {
-            let guard = cache.region_cache.read().await;
+            let guard = cache.read_regions();
             assert!(guard.ver_id_to_region[&cached.ver_id()].ttl() >= now + REGION_CACHE_TTL_SECS);
         }
 
         {
-            let mut guard = cache.region_cache.write().await;
+            let mut guard = cache.write_regions();
             guard
                 .ver_id_to_region
                 .get_mut(&cached.ver_id())
@@ -5705,7 +5711,7 @@ mod test {
 
         assert_eq!(cache.gc_round_at(now_epoch_secs(), 50).await, (1, 0, false));
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&old.ver_id()]
+            cache.read_regions().ver_id_to_region[&old.ver_id()]
                 .has_sync_flags(NEED_DELAYED_RELOAD_READY)
         );
 
@@ -5714,7 +5720,7 @@ mod test {
         assert_eq!(cache.get_region_by_id(1).await.unwrap(), old);
         assert_eq!(client.get_region_count.load(SeqCst), 1);
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&old.ver_id()]
+            cache.read_regions().ver_id_to_region[&old.ver_id()]
                 .has_sync_flags(NEED_RELOAD_ON_ACCESS)
         );
 
@@ -5735,7 +5741,7 @@ mod test {
         assert_eq!(cache.get_region_by_id(1).await.unwrap(), expected);
         assert_eq!(client.get_region_count.load(SeqCst), 2);
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&expected.ver_id()]
+            cache.read_regions().ver_id_to_region[&expected.ver_id()]
                 .sync_flags
                 .load(std::sync::atomic::Ordering::Relaxed)
                 == 0
@@ -5756,10 +5762,7 @@ mod test {
         });
         assert!(cache.add_region(cached.clone()).await);
         let now = now_epoch_secs();
-        cache
-            .region_cache
-            .write()
-            .await
+        cache.write_regions()
             .ver_id_to_region
             .get_mut(&cached.ver_id())
             .unwrap()
@@ -5767,7 +5770,7 @@ mod test {
             .store(now, std::sync::atomic::Ordering::Relaxed);
 
         assert_eq!(cache.get_region_by_id(1).await.unwrap(), cached);
-        let regions = cache.region_cache.read().await;
+        let regions = cache.read_regions();
         let cached = &regions.ver_id_to_region[&cached.ver_id()];
         assert_eq!(cached.ttl(), now);
         assert!(cached.has_sync_flags(NEED_EXPIRE_AFTER_TTL));
@@ -5797,10 +5800,7 @@ mod test {
         assert!(cache.add_region(last.clone()).await);
 
         let now = now_epoch_secs();
-        cache
-            .region_cache
-            .write()
-            .await
+        cache.write_regions()
             .ver_id_to_region
             .get_mut(&first.ver_id())
             .unwrap()
@@ -5811,25 +5811,19 @@ mod test {
         assert_eq!(cache.gc_round_at(now, 1).await, (1, 1, true));
         assert_eq!(cache.gc_round_at(now, 1).await, (1, 0, true));
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&unhealthy.ver_id()]
+            cache.read_regions().ver_id_to_region[&unhealthy.ver_id()]
                 .has_sync_flags(NEED_EXPIRE_AFTER_TTL)
         );
         assert_eq!(cache.gc_round_at(now, 1).await, (1, 0, false));
 
-        cache
-            .region_cache
-            .write()
-            .await
+        cache.write_regions()
             .ver_id_to_region
             .get_mut(&unhealthy.ver_id())
             .unwrap()
             .ttl
             .store(now - 1, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(cache.gc_round_at(now, 1).await, (1, 1, true));
-        assert!(!cache
-            .region_cache
-            .read()
-            .await
+        assert!(!cache.read_regions()
             .ver_id_to_region
             .contains_key(&unhealthy.ver_id()));
 
@@ -5850,16 +5844,13 @@ mod test {
         }
         let cache = Arc::new(RegionCache::new(client));
         assert!(cache.add_region(region_with_leader(99, b"x", b"z")).await);
-        cache
-            .region_cache
-            .write()
-            .await
+        cache.write_regions()
             .on_my_way_id
             .insert(7, Arc::new(Notify::new()));
 
         let mut backoffer = RetryBackoffer::noop(Cancellation::default());
         cache.refresh_region_index(&mut backoffer).await?;
-        let index = cache.region_cache.read().await;
+        let index = cache.read_regions();
         assert_eq!(
             index
                 .key_to_ver_id
@@ -5878,10 +5869,7 @@ mod test {
         periodic.start_background_refresh(Duration::from_millis(5));
         tokio::time::timeout(Duration::from_millis(200), async {
             loop {
-                if periodic
-                    .region_cache
-                    .read()
-                    .await
+                if periodic.read_regions()
                     .id_to_ver_id
                     .contains_key(&8)
                 {
@@ -6943,10 +6931,7 @@ mod test {
                 .store_epoch_is_stale(&region.ver_id(), leader.store_id)
                 .await
         );
-        assert!(cache
-            .region_cache
-            .read()
-            .await
+        assert!(cache.read_regions()
             .ver_id_to_region
             .get(&region.ver_id())
             .unwrap()
@@ -7422,7 +7407,7 @@ mod test {
             .await
             .unwrap();
         assert!(
-            !cache.region_cache.read().await.ver_id_to_region[&region.ver_id()]
+            !cache.read_regions().ver_id_to_region[&region.ver_id()]
                 .has_sync_flags(NEED_DELAYED_RELOAD_PENDING)
         );
 
@@ -7432,7 +7417,7 @@ mod test {
             .await
             .unwrap();
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&region.ver_id()]
+            cache.read_regions().ver_id_to_region[&region.ver_id()]
                 .has_sync_flags(NEED_DELAYED_RELOAD_PENDING)
         );
     }
@@ -7644,7 +7629,7 @@ mod test {
         cache: &RegionCache<MockRetryClient>,
         expected_cache: &BTreeMap<Key, RegionWithLeader>,
     ) {
-        let guard = cache.region_cache.read().await;
+        let guard = cache.read_regions();
         let mut actual_keys = guard
             .ver_id_to_region
             .values()
@@ -8107,10 +8092,7 @@ mod test {
         );
 
         let version = region_with_leader(3, b"b", b"c").ver_id();
-        cache
-            .region_cache
-            .write()
-            .await
+        cache.write_regions()
             .ver_id_to_region
             .get_mut(&version)
             .unwrap()
@@ -8175,14 +8157,9 @@ mod test {
 
         let uncached = RegionCache::new(client);
         assert_eq!(uncached.load_region_by_id_from_pd(3).await?.id(), 3);
-        assert!(uncached
-            .region_cache
-            .read()
-            .await
-            .ver_id_to_region
-            .is_empty());
+        assert!(uncached.read_regions().ver_id_to_region.is_empty());
         assert_eq!(uncached.get_region_by_id(3).await?.id(), 3);
-        assert_eq!(uncached.region_cache.read().await.ver_id_to_region.len(), 1);
+        assert_eq!(uncached.read_regions().ver_id_to_region.len(), 1);
         Ok(())
     }
 
@@ -8310,7 +8287,7 @@ mod test {
         let cached = region(1, vec![], vec![]);
         assert!(cache.add_region(cached.clone()).await);
         assert!(
-            !cache.region_cache.read().await.ver_id_to_region[&cached.ver_id()]
+            !cache.read_regions().ver_id_to_region[&cached.ver_id()]
                 .has_sync_flags(NEED_RELOAD_ON_ACCESS)
         );
     }
@@ -8396,7 +8373,7 @@ mod test {
         assert!(cache.add_region(region(1, vec![], vec![])).await);
         assert!(cache.add_region(region(2, vec![], vec![10])).await);
         assert!(cache.add_region(region(3, vec![10], vec![])).await);
-        assert_eq!(cache.region_cache.read().await.ver_id_to_region.len(), 2);
+        assert_eq!(cache.read_regions().ver_id_to_region.len(), 2);
     }
 
     #[tokio::test]
@@ -8408,7 +8385,7 @@ mod test {
         assert!(cache.add_region(region(1, vec![], vec![10])).await);
         assert!(cache.add_region(region(2, vec![10], vec![])).await);
         assert!(cache.add_region(region(3, vec![], vec![])).await);
-        assert_eq!(cache.region_cache.read().await.ver_id_to_region.len(), 1);
+        assert_eq!(cache.read_regions().ver_id_to_region.len(), 1);
     }
 
     #[tokio::test]
@@ -8425,7 +8402,7 @@ mod test {
             assert!(cache.add_region(region(id, start, end)).await);
         }
         assert!(cache.add_region(region(4, vec![5], vec![25])).await);
-        assert_eq!(cache.region_cache.read().await.ver_id_to_region.len(), 1);
+        assert_eq!(cache.read_regions().ver_id_to_region.len(), 1);
     }
 
     #[tokio::test]
@@ -8468,7 +8445,7 @@ mod test {
         assert!(cache.add_region(cached.clone()).await);
         assert!(cache.mark_region_reload_on_access(&cached.ver_id()).await);
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&cached.ver_id()]
+            cache.read_regions().ver_id_to_region[&cached.ver_id()]
                 .has_sync_flags(NEED_RELOAD_ON_ACCESS)
         );
     }
@@ -8495,7 +8472,7 @@ mod test {
         assert!(cache.add_region(cached.clone()).await);
         assert!(cache.mark_region_delayed_reload(&cached.ver_id()).await);
         assert!(
-            cache.region_cache.read().await.ver_id_to_region[&cached.ver_id()]
+            cache.read_regions().ver_id_to_region[&cached.ver_id()]
                 .has_sync_flags(NEED_DELAYED_RELOAD_PENDING)
         );
     }
@@ -8903,10 +8880,7 @@ mod test {
         let cache = RegionCache::new(client);
         let mut backoffer = RetryBackoffer::noop(Cancellation::default());
         cache.refresh_region_index(&mut backoffer).await?;
-        assert!(cache
-            .region_cache
-            .read()
-            .await
+        assert!(cache.read_regions()
             .id_to_ver_id
             .contains_key(&1));
         Ok(())
@@ -8927,7 +8901,7 @@ mod test {
         assert!(cache.add_region(region_with_leader(99, b"x", b"z")).await);
         let mut backoffer = RetryBackoffer::noop(Cancellation::default());
         cache.refresh_region_index(&mut backoffer).await?;
-        let index = cache.region_cache.read().await;
+        let index = cache.read_regions();
         assert!(index.id_to_ver_id.contains_key(&1));
         assert!(!index.id_to_ver_id.contains_key(&99));
         Ok(())
@@ -8959,7 +8933,7 @@ mod test {
         );
         first?;
         second?;
-        assert_eq!(cache.region_cache.read().await.id_to_ver_id.len(), 1);
+        assert_eq!(cache.read_regions().id_to_ver_id.len(), 1);
         Ok(())
     }
 
