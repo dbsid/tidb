@@ -68,10 +68,17 @@ fn logic_function(
     args: Vec<Expression>,
     pb_code: ScalarFuncSig,
 ) -> Result<BaseBuiltinFunc, EvalError> {
-    let args = args
-        .into_iter()
-        .map(|arg| wrap_with_is_true(ctx, true, arg, false))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Go's wrapWithIsTrue returns each integer argument unchanged.
+    // Keep that common case in its existing slice.
+    let args = if args.iter().all(|arg| {
+        arg.static_type().is_some_and(|tp| tp.eval_type() == EvalType::Int)
+    }) {
+        args
+    } else {
+        args.into_iter()
+            .map(|arg| wrap_with_is_true(ctx, true, arg, false))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let mut bf = new_base_builtin_func_with_tp(
         ctx,
         func_name,
@@ -450,5 +457,74 @@ impl FunctionClass for IsNullFunctionClass {
             }
         };
         Ok(bf)
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use tidb_datatype::FieldType;
+
+    use super::*;
+    use crate::{
+        builtin::{ARGUMENT_REPLACEMENTS, UnfoldedBuildContext},
+        column::Column,
+    };
+
+    #[test]
+    fn logical_signatures_keep_integer_operands_in_place() {
+        for (name, sig) in [
+            ("and", ScalarFuncSig::LogicalAnd),
+            ("or", ScalarFuncSig::LogicalOr),
+            ("xor", ScalarFuncSig::LogicalXor),
+        ] {
+            let args = [7, 9]
+                .into_iter()
+                .map(|id| Expression::Column(Column::new(id, FieldType::new(FieldTypeCode::Long))))
+                .collect::<Vec<_>>();
+            let buffer = args.as_ptr();
+            ARGUMENT_REPLACEMENTS.with(|count| count.set(0));
+            let built = logic_function(&UnfoldedBuildContext, name, args, sig).unwrap();
+            assert_eq!(built.pb_code, sig);
+            assert_eq!(built.args.as_ptr(), buffer);
+            assert_eq!(ARGUMENT_REPLACEMENTS.with(|count| count.get()), 0);
+            for (arg, id) in built.args.iter().zip([7, 9]) {
+                assert!(matches!(arg, Expression::Column(column) if column.unique_id == id));
+            }
+        }
+    }
+
+    #[test]
+    fn logical_strings_and_enum_integer_casts_keep_their_conversions() {
+        let column = |id, code| Expression::Column(Column::new(id, FieldType::new(code)));
+        let mixed = logic_function(
+            &UnfoldedBuildContext,
+            "and",
+            vec![
+                column(1, FieldTypeCode::Long),
+                column(2, FieldTypeCode::VarString),
+            ],
+            ScalarFuncSig::LogicalAnd,
+        )
+        .unwrap();
+        assert!(matches!(mixed.args[0], Expression::Column(_)));
+        assert!(matches!(mixed.args[1], Expression::ScalarFunction(_)));
+
+        let cast = new_base_builtin_func_with_tp(
+            &UnfoldedBuildContext,
+            "eq",
+            vec![
+                column(1, FieldTypeCode::Enum),
+                column(2, FieldTypeCode::Long),
+            ],
+            EvalType::Int,
+            &[EvalType::Int, EvalType::Int],
+        )
+        .unwrap();
+        assert!(
+            cast.args[0]
+                .static_type()
+                .unwrap()
+                .has_flag(FieldTypeFlags::ENUM_SET_AS_INT)
+        );
     }
 }

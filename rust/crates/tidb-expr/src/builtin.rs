@@ -757,6 +757,20 @@ fn new_return_field_type_for_base_builtin_func(
     field_type
 }
 
+/// Go's WrapWithCastAsInt returns an already-integer operand. ENUM must
+/// still go through the wrapper so it receives the ENUM_SET_AS_INT flag.
+fn keeps_integer_argument(arg: &Expression, target: EvalType) -> bool {
+    target == EvalType::Int
+        && arg.static_type().is_some_and(|source| {
+            source.code() != FieldTypeCode::Enum && source.eval_type() == EvalType::Int
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static ARGUMENT_REPLACEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Go `newBaseBuiltinFuncWithTp`: the builtin function over `args` cast to
 /// `arg_tps`, returning `ret_type`.
 ///
@@ -784,6 +798,11 @@ pub(crate) fn new_base_builtin_func_with_tp(
         ctx.connection_charset_info(),
     )?;
     for (arg, arg_tp) in args.iter_mut().zip(arg_tps) {
+        if keeps_integer_argument(arg, *arg_tp) {
+            continue;
+        }
+        #[cfg(test)]
+        ARGUMENT_REPLACEMENTS.with(|count| count.set(count.get() + 1));
         let given = std::mem::replace(arg, Expression::Constant(Constant::new_null()));
         *arg = match arg_tp {
             EvalType::Int => wrap_with_cast_as_int(ctx, given, None)?,
@@ -839,6 +858,11 @@ pub(crate) fn new_base_builtin_func_with_field_types(
         ctx.connection_charset_info(),
     )?;
     for (arg, arg_tp) in args.iter_mut().zip(arg_tps) {
+        if keeps_integer_argument(arg, arg_tp.eval_type()) {
+            continue;
+        }
+        #[cfg(test)]
+        ARGUMENT_REPLACEMENTS.with(|count| count.set(count.get() + 1));
         let given = std::mem::replace(arg, Expression::Constant(Constant::new_null()));
         *arg = match arg_tp.eval_type() {
             EvalType::Int => wrap_with_cast_as_int(ctx, given, Some(arg_tp))?,
