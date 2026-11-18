@@ -70,6 +70,11 @@ pub struct CoprocessorRequestEnvelope {
     pub execute_batch_tasks_serially: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static ENVELOPE_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CoprocessorRequestEnvelope {
     /// Projects request metadata and caller-owned task ranges.
     ///
@@ -143,6 +148,47 @@ impl CoprocessorRequestEnvelope {
         self
     }
 
+    /// Go `copIteratorWorker.handleTaskOnce` builds the message passed to
+    /// the region sender directly. Only the stored batch children arrive as
+    /// protobuf bytes.
+    pub(crate) fn to_wire_request(
+        &self,
+    ) -> Result<tidb_proto::CoprocessorRequest, prost::DecodeError> {
+        use prost::Message;
+
+        Ok(tidb_proto::CoprocessorRequest {
+            context: self.context.clone(),
+            tp: self.tp,
+            data: self.data.to_vec(),
+            ranges: self
+                .ranges
+                .iter()
+                .map(|range| tidb_proto::CoprocessorKeyRange {
+                    start: range.start_key.to_vec(),
+                    end: range.end_key.to_vec(),
+                })
+                .collect(),
+            is_cache_enabled: self.is_cache_enabled,
+            cache_if_match_version: self.cache_if_match_version,
+            start_ts: self.start_ts,
+            schema_ver: self.schema_ver,
+            is_trace_enabled: self.is_trace_enabled,
+            paging_size: self.paging_size,
+            tasks: self
+                .tasks
+                .iter()
+                .map(|task| tidb_proto::StoreBatchTask::decode(task.as_slice()))
+                .collect::<Result<_, _>>()?,
+            connection_id: self.connection_id,
+            connection_alias: self.connection_alias.clone(),
+            max_keys_read: self.max_keys_read,
+            paging_size_bytes: self.paging_size_bytes,
+            allow_batch_task_data_merge: self.allow_batch_task_data_merge,
+            execute_batch_tasks_serially: self.execute_batch_tasks_serially,
+            ..Default::default()
+        })
+    }
+
     /// Serializes the exact protobuf field numbers owned by this projection.
     ///
     /// The bytes are those `prost` derives for `coprocessor.Request`
@@ -152,6 +198,8 @@ impl CoprocessorRequestEnvelope {
     /// costs one copy of its bytes, not one `Vec` per range boundary.
     #[must_use]
     pub fn encode_to_vec(&self) -> Vec<u8> {
+        #[cfg(test)]
+        ENVELOPE_ENCODINGS.with(|count| count.set(count.get() + 1));
         let mut buf = Vec::with_capacity(self.encoded_len());
         self.encode_raw(&mut buf);
         buf

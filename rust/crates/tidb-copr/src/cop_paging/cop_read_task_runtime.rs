@@ -100,16 +100,12 @@ impl PreparedCopReadTask {
     }
 
     /// The request as the store's protobuf message (Go's `copReq`), built
-    /// once and cloned by every send. The envelope's encoding is the one
-    /// contract for its fields (its batch tasks are already encoded), so the
-    /// message is that encoding, decoded.
+    /// once from the envelope fields and cloned by every send.
     pub fn wire_request(&self) -> Result<&tidb_proto::CoprocessorRequest, prost::DecodeError> {
         if let Some(request) = self.wire_request.get() {
             return Ok(request);
         }
-        let request = <tidb_proto::CoprocessorRequest as prost::Message>::decode(
-            self.request.encode_to_vec().as_slice(),
-        )?;
+        let request = self.request.to_wire_request()?;
         Ok(self.wire_request.get_or_init(|| request))
     }
 
@@ -1527,6 +1523,67 @@ fn bucket_keys_are_current(region: &RegionTaskTopology) -> bool {
 #[cfg(test)]
 mod tests {
     use super::allocate_paging_task_index;
+
+    #[test]
+    fn a_prepared_wire_request_uses_the_task_fields_without_serializing_the_envelope() {
+        use prost::Message;
+
+        use super::*;
+        use crate::coprocessor_request::ENVELOPE_ENCODINGS;
+
+        let mut attempt = PreparedCopReadTask {
+            attempt_id: 1,
+            logical_task_id: 1,
+            page_index: 0,
+            task: RegionTaskEnvelope::default(),
+            request: CoprocessorRequestEnvelope {
+                context: Some(tidb_proto::KvrpcContext {
+                    region_id: 43,
+                    ..Default::default()
+                }),
+                tp: 103,
+                start_ts: 144,
+                schema_ver: -9,
+                data: prost::bytes::Bytes::from_static(b"statement DAG"),
+                ranges: vec![KeyRange {
+                    start_key: vec![0, 3].into(),
+                    end_key: Vec::new().into(),
+                }],
+                tasks: vec![
+                    tidb_proto::StoreBatchTask {
+                        region_id: 44,
+                        task_id: 2,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ],
+                is_cache_enabled: true,
+                cache_if_match_version: 12,
+                is_trace_enabled: true,
+                paging_size: 7,
+                connection_id: 19,
+                connection_alias: "worker".into(),
+                max_keys_read: 128,
+                paging_size_bytes: 4096,
+                allow_batch_task_data_merge: true,
+                execute_batch_tasks_serially: true,
+            },
+            wire_request: Default::default(),
+            cache_key: None,
+        };
+        let expected =
+            tidb_proto::CoprocessorRequest::decode(attempt.request.encode_to_vec().as_slice())
+                .unwrap();
+        ENVELOPE_ENCODINGS.with(|count| count.set(0));
+        let wire = attempt.wire_request().unwrap();
+        assert_eq!(wire, &expected);
+        assert!(std::ptr::eq(wire, attempt.wire_request().unwrap()));
+        assert_eq!(ENVELOPE_ENCODINGS.with(|count| count.get()), 0);
+
+        attempt.wire_request.take();
+        attempt.request.tasks.push(vec![0xff]);
+        assert!(attempt.wire_request().is_err());
+    }
 
     #[test]
     fn transport_only_prepares_dispatched_region_requests() {
