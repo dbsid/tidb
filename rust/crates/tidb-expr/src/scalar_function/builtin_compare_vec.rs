@@ -269,7 +269,7 @@ pub(super) fn compare(
     input: &Chunk,
     result: &mut Column,
 ) -> Result<(), EvalError> {
-    let Kernel::Compare(op, domain) = function.pb_builtin.kernel else {
+    let Kernel::Compare(op, domain) = function.builtin.pb_builtin.kernel else {
         unreachable!()
     };
     let left = vec_eval::argument(&function.args[0], domain, ctx, input)?;
@@ -298,14 +298,14 @@ pub(super) fn in_list(
     input: &Chunk,
     result: &mut Column,
 ) -> Result<(), EvalError> {
-    let Kernel::In(domain) = function.pb_builtin.kernel else {
+    let Kernel::In(domain) = function.builtin.pb_builtin.kernel else {
         unreachable!()
     };
     let first = &function.args[0];
     let left = vec_eval::argument(first, domain, ctx, input)?;
     result.resize_int64(input.num_rows(), true);
     result.with_int64s_mut(|values| values.fill(0));
-    let cache = function.in_cache.as_deref();
+    let cache = function.builtin.in_cache.as_deref();
     let mut has_null = vec![cache.is_some_and(|cache| cache.has_null); input.num_rows()];
     let candidates: Vec<_> = if let Some(cache) = cache.filter(|cache| !cache.is_empty()) {
         let collator = tidb_datatype::get_collator(function.derived_collation().name());

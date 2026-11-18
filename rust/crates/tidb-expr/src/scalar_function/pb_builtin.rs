@@ -115,7 +115,7 @@ fn rand_const_row(function: &ScalarFunction, ctx: &dyn Columns, _: Row<'_>) -> R
 
 /// Go `builtinRandSig.evalReal` / `vecEvalReal`: the signature's generator.
 pub(super) fn rand_next(function: &ScalarFunction, ctx: &dyn Columns) -> Result<Datum, EvalError> {
-    if let Some(generator) = &function.rand_rng { return Ok(Datum::Real(generator.0.gen())); }
+    if let Some(generator) = &function.builtin.rand_rng { return Ok(Datum::Real(generator.0.gen())); }
     ctx.rand_next().map(Datum::Real).ok_or(EvalError::Unsupported("RAND requires a session"))
 }
 
@@ -212,7 +212,7 @@ fn sub_time_method(function: &ScalarFunction, values: &[Datum], ctx: &dyn Column
 
 /// Go `builtinTimestamp1ArgSig` / `builtinTimestamp2ArgsSig`.
 fn timestamp_method(function: &ScalarFunction, values: &[Datum], ctx: &dyn Columns) -> Result<Datum, EvalError> {
-    let is_float = function.sig == crate::builtin::SigFields::Timestamp { is_float: true };
+    let is_float = function.builtin.sig == crate::builtin::SigFields::Timestamp { is_float: true };
     let result = crate::time_fn::add_sub::timestamp(values, is_float, ctx)?;
     crate::cast::parse_computed_time(&result, ctx, tidb_datatype::TimeType::DateTime, None)
 }
@@ -383,6 +383,7 @@ fn grouping_method(function: &ScalarFunction, values: &[Datum], _: &dyn Columns)
         return Ok(Datum::Null);
     };
     let metadata = function
+        .builtin
         .grouping_metadata
         .as_ref()
         .ok_or(EvalError::Unsupported("Meta data is not initialized"))?;
@@ -1336,7 +1337,7 @@ impl PbBuiltin {
                             crate::convert_charset::from_binary(
                                 value,
                                 charset,
-                                function.cannot_convert_string_as_warning,
+                                function.builtin.cannot_convert_string_as_warning,
                                 ctx,
                             )
                         } else {
@@ -1426,7 +1427,7 @@ impl PbBuiltin {
                             &values,
                             &types,
                             ctx,
-                            cache_paths.then_some(&function.json_modify_path_cache),
+                            cache_paths.then_some(&function.builtin.json_modify_path_cache),
                         )
                     }
                     _ => unreachable!("lazy kernels were handled before evaluating arguments"),
@@ -1676,7 +1677,7 @@ impl PbBuiltin {
                 if left.is_null() {
                     return Ok(Datum::Null);
                 }
-                let cache = function.in_cache.as_deref();
+                let cache = function.builtin.in_cache.as_deref();
                 let mut has_null = cache.is_some_and(|cache| cache.has_null);
                 let candidates: Vec<_> = if let Some(cache) = cache.filter(|cache| !cache.is_empty()) {
                     let collator = tidb_datatype::get_collator(function.derived_collation().name());

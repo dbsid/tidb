@@ -15,7 +15,7 @@ pub(super) fn logic(
     input: &Chunk,
     result: &mut Column,
 ) -> Result<(), EvalError> {
-    let Kernel::Logic(op) = function.pb_builtin.kernel else {
+    let Kernel::Logic(op) = function.builtin.pb_builtin.kernel else {
         unreachable!()
     };
     let before_left = ctx.warning_count();
@@ -53,7 +53,7 @@ pub(super) fn predicate(
     input: &Chunk,
     result: &mut Column,
 ) -> Result<(), EvalError> {
-    let domain = match function.pb_builtin.kernel {
+    let domain = match function.builtin.pb_builtin.kernel {
         Kernel::IsNull(t) | Kernel::Truth { domain: t, .. } => t,
         _ => unreachable!(),
     };
@@ -70,7 +70,7 @@ pub(super) fn predicate(
         } else {
             &buffer
         };
-        let value = match function.pb_builtin.kernel {
+        let value = match function.builtin.pb_builtin.kernel {
             Kernel::IsNull(_) => Datum::Int(i64::from(source.is_null(i))),
             Kernel::Truth {
                 negate,
@@ -99,7 +99,7 @@ pub(super) fn unary(
     input: &Chunk,
     result: &mut Column,
 ) -> Result<(), EvalError> {
-    let Kernel::Unary(op) = function.pb_builtin.kernel else {
+    let Kernel::Unary(op) = function.builtin.pb_builtin.kernel else {
         unreachable!()
     };
     let domain = function.get_static_type().expect("unary type").eval_type();

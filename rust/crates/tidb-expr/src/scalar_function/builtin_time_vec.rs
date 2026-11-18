@@ -14,14 +14,14 @@ use tidb_proto::tipb::ScalarFuncSig;
 pub(super) fn supported(function: &ScalarFunction) -> bool {
     use ScalarFuncSig::*;
     if matches!(
-        function.sig,
+        function.builtin.sig,
         crate::builtin::SigFields::TimeLiteral { .. }
             | crate::builtin::SigFields::DurationLiteral { .. }
     ) {
         return true;
     }
     matches!(
-        function.pb_builtin.kernel,
+        function.builtin.pb_builtin.kernel,
         super::Kernel::DateArithmetic { .. }
     ) || matches!(
         function.pb_code(),
@@ -116,7 +116,7 @@ pub(super) fn eval(
 ) -> Result<(), EvalError> {
     use ScalarFuncSig::*;
     let sig = function.pb_code();
-    if let super::Kernel::DateArithmetic { subtract } = function.pb_builtin.kernel {
+    if let super::Kernel::DateArithmetic { subtract } = function.builtin.pb_builtin.kernel {
         return date_arithmetic::eval(function, subtract, ctx, input, result);
     }
     if week::supported(function) {
@@ -158,7 +158,10 @@ pub(super) fn eval(
         return with_row_fallback(function, ctx, input, result);
     }
     if function.args.is_empty() {
-        let value = function.pb_builtin.eval_values(function, Vec::new(), ctx)?;
+        let value = function
+            .builtin
+            .pb_builtin
+            .eval_values(function, Vec::new(), ctx)?;
         let domain = function
             .get_static_type()
             .expect("time result type")
@@ -209,7 +212,10 @@ pub(super) fn eval(
                 ctx,
             );
         }
-        function.pb_builtin.eval_values(function, values, ctx)
+        function
+            .builtin
+            .pb_builtin
+            .eval_values(function, values, ctx)
     })
 }
 
@@ -260,7 +266,10 @@ fn with_row_fallback(
                 function.args[1].static_type(),
             ));
         }
-        let value = function.pb_builtin.eval_values(function, values, ctx)?;
+        let value = function
+            .builtin
+            .pb_builtin
+            .eval_values(function, values, ctx)?;
         vec_eval::put(result, row, domain, &value)?;
     }
     Ok(())

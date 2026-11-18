@@ -270,7 +270,7 @@ fn append_canonical_args_reversed(output: &mut Vec<u8>, args: &[Vec<u8>]) {
 /// `from_binary` errors where the root-side one would warn.
 pub fn into_coprocessor_form(expr: &mut Expression) {
     if let Expression::ScalarFunction(function) = expr {
-        function.cannot_convert_string_as_warning = false;
+        function.builtin.cannot_convert_string_as_warning = false;
         function.args.iter_mut().for_each(into_coprocessor_form);
     }
 }
@@ -288,20 +288,29 @@ impl std::fmt::Debug for RandGenerator {
 /// Go `ScalarFunction`: the application of a built-in function to arguments.
 #[derive(Clone, Debug)]
 pub struct ScalarFunction {
-    in_cache: Option<std::sync::Arc<crate::builtin_other::InHashSet>>,
     /// Go `FuncName` (an `ast.CIStr`): the function's name.
     pub func_name: CiString,
     /// Go `RetType` (a `*types.FieldType`; `None` mirrors a nil pointer).
     pub ret_type: Option<FieldType>,
     /// The function arguments. In Go these live inside `Function.getArgs()`.
     pub args: Vec<Expression>,
+    /// Lazily-filled `HashCode` cache (Go `hashcode`).
+    hashcode: Vec<u8>,
+    /// Go embedded collation state (via the `Function`'s `collationInfo`).
+    pub collation: CollationInfo,
+    builtin: Box<BuiltinSignature>,
+}
+
+/// Concrete state behind Go ScalarFunction.Function. Moving a scalar expression
+/// carries a single handle to its evaluator, metadata and per-signature caches.
+#[derive(Clone, Debug)]
+struct BuiltinSignature {
+    in_cache: Option<std::sync::Arc<crate::builtin_other::InHashSet>>,
     /// Go `Function`: the builtin signature a function class's `getFunction`
     /// or `getSignatureByPB` returned. Every node has one.
     pb_builtin: PbBuiltin,
     /// Go `builtinRandSig.mysqlRng`; Clone shares its generator.
     rand_rng: Option<RandGenerator>,
-    /// Lazily-filled `HashCode` cache (Go `hashcode`).
-    hashcode: Vec<u8>,
     /// Go `BuiltinGroupingImplSig` metadata installed by `SetMetadata`.
     ///
     /// Grouping is built through `NewFunctionWithInit`, so carrying the
@@ -327,9 +336,6 @@ pub struct ScalarFunction {
     fts_modifier: tidb_ast::MatchModifier,
     /// The fields of the Go signature struct `getFunction` built.
     sig: crate::builtin::SigFields,
-
-    /// Go embedded collation state (via the `Function`'s `collationInfo`).
-    pub collation: CollationInfo,
     /// Go `builtinInStringSig.hashSet`, prepared after collation derivation.
     /// Only strict string/byte literals enter it; every other argument keeps
     /// the ordinary evaluation path so casts, warnings and errors are not
@@ -579,7 +585,7 @@ impl ScalarFunction {
 
     /// Go `builtinInternalFromBinarySig.cannotConvertStringAsWarning`.
     pub(crate) fn set_cannot_convert_string_as_warning(&mut self, warning: bool) {
-        self.cannot_convert_string_as_warning = warning;
+        self.builtin.cannot_convert_string_as_warning = warning;
     }
 
     /// Go `BuildJSONSumCrc32FunctionWithCheck`'s node: a `BIGINT` result over
@@ -592,13 +598,14 @@ impl ScalarFunction {
         // Go `builtinJSONSumCRC32Sig.evalInt`, which reads the signature's `tp`.
         let f = f.evaluated_by(Kernel::Method(|function, values, _| {
             let array_type = function
+                .builtin
                 .json_sum_crc32_type
                 .as_ref()
                 .expect("a json_sum_crc32 node carries its ARRAY type");
             crate::cast::eval_json_sum_crc32(values[0].clone(), array_type)
         }));
         let mut function = Self::from_builtin_func(CiString::new("json_sum_crc32"), ret_type, f);
-        function.json_sum_crc32_type = Some(array_type);
+        function.builtin.json_sum_crc32_type = Some(array_type);
         function
     }
 
@@ -612,7 +619,7 @@ impl ScalarFunction {
 
     /// Go `extensionFuncSig.FunctionDef`.
     pub(crate) fn extension_def(&self) -> Option<&'static tidb_extension::FunctionDef> {
-        match self.sig {
+        match self.builtin.sig {
             crate::builtin::SigFields::Extension(crate::extension::ExtensionSig(def)) => Some(def),
             _ => None,
         }
@@ -631,7 +638,7 @@ impl ScalarFunction {
             f.collation,
             f.sig,
         );
-        function.in_cache = f.in_cache;
+        function.builtin.in_cache = f.in_cache;
         function
     }
 
@@ -648,30 +655,34 @@ impl ScalarFunction {
             func_name,
             ret_type: Some(ret_type),
             args,
-            pb_builtin,
-            in_cache: None,
-            rand_rng: match sig {
-                crate::builtin::SigFields::Rand { seed } => Some(RandGenerator(std::sync::Arc::new(crate::MysqlRng::new_with_seed(seed)))),
-                _ => None,
-            },
             hashcode: Vec::new(),
-            grouping_metadata: None,
-            cannot_convert_string_as_warning: false,
-            json_sum_crc32_type: None,
-            gl_signature: None,
-            fts_modifier: Default::default(),
-            sig,
             collation,
-            in_string_hash_set: None,
-            in_string_non_const_args: Vec::new(),
-            in_string_has_null: false,
-            json_schema_cache: Default::default(),
-            json_modify_path_cache: Default::default(),
-            find_in_set_cache: Default::default(),
-            regexp_cache: Default::default(),
-            regexp_replace_instruction_cache: Default::default(),
-            like_pattern_cache: Default::default(),
-            ilike_pattern_cache: Default::default(),
+            builtin: Box::new(BuiltinSignature {
+                pb_builtin,
+                in_cache: None,
+                rand_rng: match sig {
+                    crate::builtin::SigFields::Rand { seed } => Some(RandGenerator(
+                        std::sync::Arc::new(crate::MysqlRng::new_with_seed(seed)),
+                    )),
+                    _ => None,
+                },
+                grouping_metadata: None,
+                cannot_convert_string_as_warning: false,
+                json_sum_crc32_type: None,
+                gl_signature: None,
+                fts_modifier: Default::default(),
+                sig,
+                in_string_hash_set: None,
+                in_string_non_const_args: Vec::new(),
+                in_string_has_null: false,
+                json_schema_cache: Default::default(),
+                json_modify_path_cache: Default::default(),
+                find_in_set_cache: Default::default(),
+                regexp_cache: Default::default(),
+                regexp_replace_instruction_cache: Default::default(),
+                like_pattern_cache: Default::default(),
+                ilike_pattern_cache: Default::default(),
+            }),
         }
     }
 
@@ -717,12 +728,14 @@ impl ScalarFunction {
     }
 
     /// Go the concrete builtin signature's fields.
-    pub(crate) fn signature_fields(&self) -> crate::builtin::SigFields { self.sig }
+    pub(crate) fn signature_fields(&self) -> crate::builtin::SigFields {
+        self.builtin.sig
+    }
 
     /// Go `Function.PbCode()`.
     #[must_use]
     pub fn pb_code(&self) -> tidb_proto::tipb::ScalarFuncSig {
-        self.pb_builtin.signature()
+        self.builtin.pb_builtin.signature()
     }
 
     /// Go `FuncName.L == ast.Cast`.
@@ -732,7 +745,7 @@ impl ScalarFunction {
 
     /// Go `baseBuiltinCastFunc.inUnion`.
     pub fn cast_in_union(&self) -> bool {
-        self.pb_builtin.cast_in_union()
+        self.builtin.pb_builtin.cast_in_union()
     }
 
     /// A cast to JSON, as opposed to one to a typed array.
@@ -745,7 +758,7 @@ impl ScalarFunction {
 
     /// Go `builtinValues*Sig.offset`.
     fn values_offset(&self) -> Option<usize> {
-        match self.sig {
+        match self.builtin.sig {
             crate::builtin::SigFields::Values { offset } => Some(offset),
             _ => None,
         }
@@ -753,7 +766,7 @@ impl ScalarFunction {
 
     /// Go `builtinAes*Sig.aesModeAttr`.
     fn aes_mode(&self) -> Option<tidb_exprctx::BlockEncryptionMode> {
-        match self.sig {
+        match self.builtin.sig {
             crate::builtin::SigFields::Aes { mode } => Some(mode),
             _ => None,
         }
@@ -766,18 +779,18 @@ impl ScalarFunction {
     /// argument-derived cache must be discarded before the rebound tree is
     /// used by ranger or executor code.
     pub fn invalidate_cached_arguments(&mut self) {
-        self.in_cache = None;
+        self.builtin.in_cache = None;
         self.hashcode.clear();
-        self.in_string_hash_set = None;
-        self.in_string_non_const_args.clear();
-        self.in_string_has_null = false;
-        self.json_schema_cache = Default::default();
-        self.json_modify_path_cache = Default::default();
-        self.find_in_set_cache = Default::default();
-        self.regexp_cache = Default::default();
-        self.regexp_replace_instruction_cache = Default::default();
-        self.like_pattern_cache = Default::default();
-        self.ilike_pattern_cache = Default::default();
+        self.builtin.in_string_hash_set = None;
+        self.builtin.in_string_non_const_args.clear();
+        self.builtin.in_string_has_null = false;
+        self.builtin.json_schema_cache = Default::default();
+        self.builtin.json_modify_path_cache = Default::default();
+        self.builtin.find_in_set_cache = Default::default();
+        self.builtin.regexp_cache = Default::default();
+        self.builtin.regexp_replace_instruction_cache = Default::default();
+        self.builtin.like_pattern_cache = Default::default();
+        self.builtin.ilike_pattern_cache = Default::default();
     }
 
     /// Go `BuiltinGroupingImplSig.SetMetadata`: install validated grouping
@@ -790,15 +803,16 @@ impl ScalarFunction {
         grouping_marks: Vec<BTreeSet<u64>>,
     ) -> Result<(), GroupingMetadataError> {
         self.clean_hash_code();
-        self.grouping_metadata = None;
+        self.builtin.grouping_metadata = None;
         let metadata = GroupingMetadata::new(mode, grouping_marks)?;
-        self.grouping_metadata = Some(metadata);
+        self.builtin.grouping_metadata = Some(metadata);
         Ok(())
     }
 
     /// Returns the validated grouping metadata installed on this function.
     pub fn grouping_metadata(&self) -> Result<&GroupingMetadata, GroupingMetadataError> {
-        self.grouping_metadata
+        self.builtin
+            .grouping_metadata
             .as_ref()
             .ok_or(GroupingMetadataError::Uninitialized)
     }
@@ -806,7 +820,7 @@ impl ScalarFunction {
     /// Whether this function has completed the source `SetMetadata` step.
     #[must_use]
     pub fn has_grouping_metadata(&self) -> bool {
-        self.grouping_metadata.is_some()
+        self.builtin.grouping_metadata.is_some()
     }
 
     /// Go `ScalarFunction.Decorrelate`: recursively decorrelate every
@@ -878,6 +892,7 @@ impl ScalarFunction {
         }
         if name == "grouping" {
             let metadata = self
+                .builtin
                 .grouping_metadata
                 .as_ref()
                 .expect("grouping metadata is not initialized");
@@ -1238,9 +1253,9 @@ impl ScalarFunction {
                 _ => non_const_args.push(index),
             }
         }
-        self.in_string_hash_set = Some(hash_set);
-        self.in_string_non_const_args = non_const_args;
-        self.in_string_has_null = has_null;
+        self.builtin.in_string_hash_set = Some(hash_set);
+        self.builtin.in_string_non_const_args = non_const_args;
+        self.builtin.in_string_has_null = has_null;
     }
 
     /// The user-variable name a `getvar`/`setvar` call carries in its first
@@ -1258,7 +1273,7 @@ impl ScalarFunction {
     /// type -- see [`Self::coerce_to_ret_type`] for why that is the whole
     /// point of Go's `Eval` and not an afterthought.
     pub fn eval(&self, ctx: &dyn Columns, row: Row<'_>) -> Result<Datum, EvalError> {
-        let value = self.pb_builtin.eval(self, ctx, row)?;
+        let value = self.builtin.pb_builtin.eval(self, ctx, row)?;
         // Go ScalarFunction.Eval interprets an evalInt carrier through
         // the wire result type, independently of the argument flags.
         let value = match (value, self.get_static_type()) {
@@ -1304,7 +1319,8 @@ impl ScalarFunction {
         let matched = if case_insensitive {
             if cache_pattern && cache_escape {
                 let cached =
-                    self.ilike_pattern_cache
+                    self.builtin
+                        .ilike_pattern_cache
                         .get_or_init_cache(ctx.context_id(), || {
                             Ok::<_, EvalError>(crate::like::CompiledIlikePattern::new(
                                 &pattern,
@@ -1324,7 +1340,7 @@ impl ScalarFunction {
         } else {
             if cache_pattern && cache_escape {
                 let cached = self
-                    .like_pattern_cache
+                    .builtin.like_pattern_cache
                     .get_or_init_cache(ctx.context_id(), || {
                         Ok::<_, EvalError>(crate::like::CompiledLikePattern::new(
                             &pattern,
@@ -1434,7 +1450,7 @@ impl ScalarFunction {
     /// The argument evaluation domain selected by Go's arithmetic builder.
     /// DIV returns Int but consumes Decimal unless both arguments are Int.
     fn numeric_operand_domain(&self) -> Option<EvalType> {
-        self.pb_builtin.numeric_domain()
+        self.builtin.pb_builtin.numeric_domain()
     }
 
     fn eval_binary_values(
@@ -1569,8 +1585,8 @@ impl ScalarFunction {
             cache_pattern && cache_match_type,
             cache_replacement,
             self.derived_collation(),
-            &self.regexp_cache,
-            &self.regexp_replace_instruction_cache,
+            &self.builtin.regexp_cache,
+            &self.builtin.regexp_replace_instruction_cache,
         )
         .expect("the native regexp family is registered")
     }
@@ -1629,7 +1645,7 @@ impl ScalarFunction {
         let cache_match_type =
             self.args.len() < 3 || self.args[2].const_level() >= ConstLevel::ONLY_IN_CONTEXT;
         let regex = crate::regexp::get_cached_regexp(
-            &self.regexp_cache,
+            &self.builtin.regexp_cache,
             ctx.context_id(),
             cache_pattern && cache_match_type,
             &pattern,
@@ -1712,7 +1728,7 @@ impl ScalarFunction {
                 "unexpected builtin signature for match_against: {signature:?}"
             )));
         }
-        self.fts_modifier = modifier;
+        self.builtin.fts_modifier = modifier;
         Ok(())
     }
 
@@ -1721,13 +1737,14 @@ impl ScalarFunction {
     #[must_use]
     pub fn fts_mysql_match_against_modifier(&self) -> Option<tidb_ast::MatchModifier> {
         (self.pb_code() == tidb_proto::tipb::ScalarFuncSig::FtsMatchExpression)
-            .then_some(self.fts_modifier)
+            .then_some(self.builtin.fts_modifier)
     }
 
     /// The GREATEST/LEAST signature: the one chosen at construction, else
     /// the one the arguments select.
     pub(crate) fn extremum_signature(&self) -> Option<crate::builtin_ext::GlSignature> {
-        self.gl_signature
+        self.builtin
+            .gl_signature
             .or_else(|| crate::builtin_ext::GlSignature::of_signature(self.pb_code()))
             .or_else(|| crate::rewriter::result_type::gl_signature(&self.args))
     }
@@ -2980,6 +2997,25 @@ mod tests {
     use tidb_datatype::{Datum, FieldType, FieldTypeCode};
 
     #[test]
+    fn moving_a_scalar_node_carries_one_handle_to_its_builtin() {
+        use std::mem::size_of;
+
+        // Go ScalarFunction carries a handle to its concrete builtin. Moving
+        // an expression must not carry every signature's state with it.
+        let node_bytes = size_of::<CiString>()
+            + size_of::<Option<FieldType>>()
+            + size_of::<Vec<Expression>>()
+            + size_of::<Vec<u8>>()
+            + size_of::<CollationInfo>()
+            + size_of::<usize>();
+        assert!(
+            size_of::<ScalarFunction>() <= node_bytes,
+            "scalar node is {} bytes, its fields and one builtin handle need {node_bytes}",
+            size_of::<ScalarFunction>()
+        );
+    }
+
+    #[test]
     fn string_division_preserves_go_decimal_parser_diagnostics() {
         struct Context {
             level: crate::ErrorLevel,
@@ -3849,8 +3885,11 @@ use tidb_charset::Collation;
         ).unwrap().into_scalar_function().unwrap();
         function.prepare_in_string_hash_set();
 
-        assert_eq!(function.in_string_hash_set.as_ref().unwrap().len(), 2);
-        assert!(function.in_string_non_const_args.is_empty());
+        assert_eq!(
+            function.builtin.in_string_hash_set.as_ref().unwrap().len(),
+            2
+        );
+        assert!(function.builtin.in_string_non_const_args.is_empty());
         let chunk = Chunk::new_chunk_with_capacity(&[], 1);
         assert_eq!(
             function.eval(&crate::NoColumns, chunk.get_row(0)).unwrap(),
@@ -3911,7 +3950,15 @@ use tidb_charset::Collation;
         }
         let mut large = crate::new_function::new_function_base(&crate::NoColumns, "in", ft(), many).unwrap().into_scalar_function().unwrap();
         large.prepare_in_string_hash_set();
-        assert!(large.in_string_hash_set.as_ref().unwrap().capacity() >= 1000);
+        assert!(
+            large
+                .builtin
+                .in_string_hash_set
+                .as_ref()
+                .unwrap()
+                .capacity()
+                >= 1000
+        );
     }
     /// The stock-level shape: `ge(ol_o_id, minus(d_next_o_id, 20))` over a
     /// joined chunk row -- the exact residual predicate class jTPCC's

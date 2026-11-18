@@ -24,7 +24,7 @@ pub(crate) fn has_kernel(function: &ScalarFunction) -> bool {
         return false;
     }
     matches!(
-        function.pb_builtin.kernel,
+        function.builtin.pb_builtin.kernel,
         Kernel::Binary(..)
             | Kernel::IntegerMultiply { .. }
             | Kernel::IntegerMod { .. }
@@ -258,7 +258,7 @@ pub(crate) fn eval_into(
             if super::builtin_compare_vec::supported(function.pb_code()) {
                 return super::builtin_compare_vec::extremum(function, ctx, input, result);
             }
-            return match function.pb_builtin.kernel {
+            return match function.builtin.pb_builtin.kernel {
                 Kernel::Compare(..) => {
                     super::builtin_compare_vec::compare(function, ctx, input, result)
                 }

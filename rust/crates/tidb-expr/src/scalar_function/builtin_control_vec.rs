@@ -33,7 +33,7 @@ pub(super) fn eval(
     input: &Chunk,
     result: &mut Column,
 ) -> Result<(), EvalError> {
-    let kernel = function.pb_builtin.kernel;
+    let kernel = function.builtin.pb_builtin.kernel;
     let domain = function
         .get_static_type()
         .expect("control type")

@@ -223,7 +223,10 @@ pub(crate) fn json_overlaps(function: &ScalarFunction, values: &[Datum], _: &dyn
 
 /// Go `builtinJSONSchemaValidSig`: the compiled schema is cached per node.
 pub(crate) fn json_schema_valid(function: &ScalarFunction, ctx: &dyn Columns, row: Row<'_>) -> Result<Datum, EvalError> {
-    function.json_schema_cache.eval(&function.args, ctx, row)
+    function
+        .builtin
+        .json_schema_cache
+        .eval(&function.args, ctx, row)
 }
 
 /// Go `builtinValues*Sig`: the statement's current insert row at the
@@ -261,7 +264,7 @@ pub(crate) fn benchmark(function: &ScalarFunction, ctx: &dyn Columns, row: Row<'
     let [count, expression] = function.args.as_slice() else {
         return Err(EvalError::Unsupported("BENCHMARK arguments"));
     };
-    let loop_count = match function.sig {
+    let loop_count = match function.builtin.sig {
         SigFields::Benchmark { const_loop_count } if const_loop_count > 0 => const_loop_count,
         _ => match crate::func::benchmark_loop_count(count.eval(ctx, row)?, count.static_type(), ctx)? {
             Some(value) => value,
@@ -384,7 +387,7 @@ pub(crate) fn weight_string_null(_: &ScalarFunction, _: &dyn Columns, _: Row<'_>
 
 /// Go `builtinWeightStringSig`.
 pub(crate) fn weight_string(function: &ScalarFunction, ctx: &dyn Columns, row: Row<'_>) -> Result<Datum, EvalError> {
-    let SigFields::WeightString { padding, length } = function.sig else {
+    let SigFields::WeightString { padding, length } = function.builtin.sig else {
         return Err(EvalError::Unsupported("weight_string is built by weightStringFunctionClass"));
     };
     let padding = match padding {
@@ -405,12 +408,14 @@ pub(crate) fn find_in_set(function: &ScalarFunction, ctx: &dyn Columns, row: Row
     let collation = function.derived_collation();
     let needle = function.args[0].eval(ctx, row)?;
     if function.args[1].const_level() >= ConstLevel::ONLY_IN_CONTEXT {
-        let lookup = function
-            .find_in_set_cache
-            .get_or_init_cache(ctx.context_id(), || {
-                let list = function.args[1].eval(ctx, Row::empty())?;
-                crate::builtin_ext::build_find_in_set_lookup(&list, collation)
-            })?;
+        let lookup =
+            function
+                .builtin
+                .find_in_set_cache
+                .get_or_init_cache(ctx.context_id(), || {
+                    let list = function.args[1].eval(ctx, Row::empty())?;
+                    crate::builtin_ext::build_find_in_set_lookup(&list, collation)
+                })?;
         return crate::builtin_ext::find_in_set_lookup(&needle, &lookup, collation);
     }
     let list = function.args[1].eval(ctx, row)?;

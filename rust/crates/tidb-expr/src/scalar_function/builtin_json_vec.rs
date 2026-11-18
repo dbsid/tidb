@@ -64,7 +64,10 @@ pub(super) fn eval(
         _ => (0..function.args.len()).collect(),
     };
     vec_eval::map_arguments_in_order(function, ctx, input, result, None, &order, |values| {
-        function.pb_builtin.eval_values(function, values, ctx)
+        function
+            .builtin
+            .pb_builtin
+            .eval_values(function, values, ctx)
     })
 }
 
@@ -116,7 +119,10 @@ fn object(
                 )
             })
             .collect();
-        let value = function.pb_builtin.eval_values(function, values, ctx)?;
+        let value = function
+            .builtin
+            .pb_builtin
+            .eval_values(function, values, ctx)?;
         vec_eval::put(result, row, EvalType::Json, &value)?;
     }
     Ok(())

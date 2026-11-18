@@ -16,7 +16,7 @@ pub(super) fn eval(
     input: &Chunk,
     result: &mut Column,
 ) -> Result<(), EvalError> {
-    let (op, domain) = match function.pb_builtin.kernel {
+    let (op, domain) = match function.builtin.pb_builtin.kernel {
         Kernel::Binary(op, domain) => (op, domain),
         Kernel::IntegerMultiply { .. } => (BinaryOp::Mul, EvalType::Int),
         Kernel::IntegerMod { .. } => (BinaryOp::Mod, EvalType::Int),
@@ -73,7 +73,7 @@ pub(super) fn eval(
         };
         let left = vec_eval::value(left, i, domain, function.args[0].static_type());
         let right = vec_eval::value(right, i, domain, function.args[1].static_type());
-        let value = match function.pb_builtin.kernel {
+        let value = match function.builtin.pb_builtin.kernel {
             Kernel::IntegerMultiply { unsigned } => {
                 let l = crate::arg_eval_type::eval_int(&left)?.unwrap();
                 let r = crate::arg_eval_type::eval_int(&right)?.unwrap();

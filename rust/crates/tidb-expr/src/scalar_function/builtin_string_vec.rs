@@ -119,7 +119,10 @@ pub(super) fn eval(
                 &values,
                 function.derived_collation(),
             ),
-            _ => function.pb_builtin.eval_values(function, values, ctx),
+            _ => function
+                .builtin
+                .pb_builtin
+                .eval_values(function, values, ctx),
         }
     })
 }
@@ -363,12 +366,14 @@ fn find_in_set(
     result.merge_nulls(&[&needle]);
     let collation = function.derived_collation();
     if function.args[1].const_level() >= crate::expression::ConstLevel::ONLY_IN_CONTEXT {
-        let lookup = function
-            .find_in_set_cache
-            .get_or_init_cache(ctx.context_id(), || {
-                let list = function.args[1].eval(ctx, tidb_chunk::row::Row::empty())?;
-                crate::builtin_ext::build_find_in_set_lookup(&list, collation)
-            })?;
+        let lookup =
+            function
+                .builtin
+                .find_in_set_cache
+                .get_or_init_cache(ctx.context_id(), || {
+                    let list = function.args[1].eval(ctx, tidb_chunk::row::Row::empty())?;
+                    crate::builtin_ext::build_find_in_set_lookup(&list, collation)
+                })?;
         for row in 0..input.num_rows() {
             let value = crate::builtin_ext::find_in_set_lookup(
                 &vec_eval::value(
