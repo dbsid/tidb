@@ -79,7 +79,10 @@ pub(super) fn eval(
     ) {
         result.reserve_string_with_size_hint(input.num_rows(), 36);
         for row in 0..input.num_rows() {
-            let value = function.pb_builtin.eval_values(function, Vec::new(), ctx)?;
+            let value = function
+                .builtin
+                .pb_builtin
+                .eval_values(function, Vec::new(), ctx)?;
             vec_eval::put(result, row, domain, &value)?;
         }
         return Ok(());
@@ -134,7 +137,10 @@ pub(super) fn eval(
             if result.is_null(i) {
                 continue;
             }
-            let value = function.pb_builtin.eval_values(function, vec![cell(0, i)], ctx)?;
+            let value = function
+                .builtin
+                .pb_builtin
+                .eval_values(function, vec![cell(0, i)], ctx)?;
             vec_eval::put(result, i, domain, &value)?;
         }
         return Ok(());
@@ -151,7 +157,10 @@ pub(super) fn eval(
         if bufs.len() == 2 {
             values.push(if bufs[1].is_null(i) { Datum::Int(0) } else { cell(1, i) });
         }
-        let value = function.pb_builtin.eval_values(function, values, ctx)?;
+        let value = function
+            .builtin
+            .pb_builtin
+            .eval_values(function, values, ctx)?;
         vec_eval::put(result, i, EvalType::String, &value)?;
     }
     Ok(())

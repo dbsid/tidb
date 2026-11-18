@@ -100,6 +100,7 @@ pub(super) fn eval(
         ),
         Conv => crate::math_fn::conv(&values),
         _ => function
+            .builtin
             .pb_builtin
             .eval_values(function, values, ctx)
             .map_err(|error| super::math_overflow_error(function, error, ctx)),

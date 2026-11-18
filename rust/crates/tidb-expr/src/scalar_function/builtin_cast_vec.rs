@@ -18,7 +18,7 @@ pub(super) fn eval(
         source,
         target,
         in_union,
-    } = function.pb_builtin.kernel
+    } = function.builtin.pb_builtin.kernel
     else {
         unreachable!()
     };
@@ -67,7 +67,10 @@ pub(super) fn eval(
                 super::cast_string_as_decimal(&bytes, field, ctx, true)?
             }
         } else {
-            function.pb_builtin.cast_value_in(function, value, true, ctx)?
+            function
+                .builtin
+                .pb_builtin
+                .cast_value_in(function, value, true, ctx)?
         };
         vec_eval::put(result, i, target, &value)?;
     }

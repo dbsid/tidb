@@ -10,7 +10,7 @@ use tidb_proto::tipb::ScalarFuncSig;
 
 /// Go information signatures' `vectorized` methods.
 pub(super) fn supported(function: &ScalarFunction) -> bool {
-    if let SigFields::Benchmark { const_loop_count } = function.sig {
+    if let SigFields::Benchmark { const_loop_count } = function.builtin.sig {
         return const_loop_count > 0;
     }
     matches!(
@@ -45,7 +45,7 @@ pub(super) fn eval(
         .get_static_type()
         .expect("builtin type")
         .eval_type();
-    if let SigFields::Benchmark { const_loop_count } = function.sig {
+    if let SigFields::Benchmark { const_loop_count } = function.builtin.sig {
         let expression = &function.args[1];
         crate::func::ensure_benchmark_eval_type(expression.static_type())?;
         let target = expression
@@ -81,12 +81,18 @@ pub(super) fn eval(
                 continue;
             }
             let key = vec_eval::value(&buf, i, EvalType::String, function.args[0].static_type());
-            let decoded = function.pb_builtin.eval_values(function, vec![key], ctx)?;
+            let decoded = function
+                .builtin
+                .pb_builtin
+                .eval_values(function, vec![key], ctx)?;
             vec_eval::put(result, i, EvalType::String, &decoded)?;
         }
         return Ok(());
     }
-    let value = function.pb_builtin.eval_values(function, Vec::new(), ctx)?;
+    let value = function
+        .builtin
+        .pb_builtin
+        .eval_values(function, Vec::new(), ctx)?;
     crate::chunk_executor::allocate(domain, input.num_rows(), result);
     for i in 0..input.num_rows() {
         vec_eval::put(result, i, domain, &value)?;
