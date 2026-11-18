@@ -1176,8 +1176,6 @@ where
     Req: crate::request::KvRequest + crate::request::Shardable<Shard = ()>,
     Req::Response: crate::store::HasRegionError,
 {
-    use crate::request::Plan;
-
     #[cfg(any(test, feature = "failpoints"))]
     if let Some(injected) = failpoint_send_req_result(crate::store::Request::label(&request)) {
         return injected.map(|response| (response, None));
@@ -1210,7 +1208,7 @@ where
                 as futures::future::BoxFuture<'_, crate::interceptor::RpcDispatchResult>
         },
     ));
-    let mut responses = crate::request::PlanBuilder::new(pd_client, keyspace, request)
+    let plan = crate::request::PlanBuilder::new(pd_client, keyspace, request)
         .rpc_interceptor(interceptors)
         .request_timeout(timeout)
         .region_request_runtime_stats(stats)
@@ -1218,9 +1216,10 @@ where
             backoffer,
             cancellation,
         ))
-        .plan()
-        .execute()
-        .await?;
+        .plan();
+    // SendReqCtx owns this request and backoffer. Keep the plan's future
+    // behind one pointer while tracing and transport poll the sender.
+    let mut responses = Box::pin(plan.execute_once()).await?;
     let response = match (responses.pop(), responses.is_empty()) {
         (Some(response), true) => response?,
         _ => {
@@ -1300,6 +1299,30 @@ mod send_req_tests {
             },
         )));
         (pd, sent)
+    }
+
+    #[tokio::test]
+    async fn a_region_send_runs_on_the_one_backoffer_it_was_given() {
+        let backoffer = Arc::new(tokio::sync::Mutex::new(crate::retry::RetryBackoffer::new(
+            crate::async_util::Cancellation::default(),
+            1_000,
+        )));
+        let observed = Arc::downgrade(&backoffer);
+        let (pd, _) = client(move |_| {
+            // The caller transferred its only handle. A second owner here
+            // means a copy of the sender plan is alive during the RPC.
+            assert_eq!(observed.strong_count(), 1);
+            coprocessor::Response::default()
+        });
+        send_req(
+            pd,
+            Keyspace::Disable,
+            request_to_region1(0),
+            backoffer,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
     }
 
     fn region_error(error: errorpb::Error) -> coprocessor::Response {
