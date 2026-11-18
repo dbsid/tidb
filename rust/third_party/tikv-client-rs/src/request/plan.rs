@@ -75,6 +75,12 @@ pub trait Plan: Sized + Clone + Sync + Send + 'static {
     /// Execute the plan.
     async fn execute(&self) -> Result<Self::Result>;
 
+    /// Whether this plan can send the snapshot's current lock hints without
+    /// updating its request. A plan that cannot inspect its hints is copied.
+    fn has_read_lock_context(&self, _resolved: &[u64], _committed: &[u64]) -> bool {
+        false
+    }
+
     /// Attach the source snapshot's lock-resolution hints to an imminent
     /// physical read. Plans that do not end in a TiKV context request retain
     /// the no-op default.
@@ -150,6 +156,10 @@ where
             }
         }
         Ok(response)
+    }
+
+    fn has_read_lock_context(&self, resolved: &[u64], committed: &[u64]) -> bool {
+        self.inner.has_read_lock_context(resolved, committed)
     }
 
     fn set_read_lock_context(&mut self, resolved_locks: Vec<u64>, committed_locks: Vec<u64>) {
@@ -701,6 +711,10 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
                 .decode_v1_response(&mut response, self.v1_response_codec.as_ref())?;
             Ok(response)
         })
+    }
+
+    fn has_read_lock_context(&self, resolved: &[u64], committed: &[u64]) -> bool {
+        self.request.has_read_lock_context(resolved, committed)
     }
 
     fn set_read_lock_context(&mut self, resolved_locks: Vec<u64>, committed_locks: Vec<u64>) {
@@ -3546,10 +3560,16 @@ impl<P: Plan, PdC: PdClient> ResolveLock<P, PdC> {
     }
 
     async fn execute_inner(&self) -> Result<(P::Result, Option<ReadLockHintsInRequest>)> {
-        let mut inner = self.inner.clone();
+        // ClientHelper.SendReqCtx reuses its request. Borrow the retained plan
+        // unless this attempt needs different resolved or committed locks.
+        let mut inner = std::borrow::Cow::Borrowed(&self.inner);
         let request_lock_hints = if let Some(read_lock_context) = &self.read_lock_context {
             let (resolved_locks, committed_locks, hints) = read_lock_context.snapshot_for_request();
-            inner.set_read_lock_context(resolved_locks, committed_locks);
+            if !inner.has_read_lock_context(&resolved_locks, &committed_locks) {
+                inner
+                    .to_mut()
+                    .set_read_lock_context(resolved_locks, committed_locks);
+            }
             Some(hints)
         } else {
             None
@@ -6740,6 +6760,79 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn a_snapshot_get_reuses_dispatch_when_its_lock_hints_match() {
+        let prepare = Arc::new(|_: &mut kvrpcpb::GetRequest| Ok(()));
+        let owners = Arc::downgrade(&prepare);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::clone(&attempts);
+        let client = MockKvClient::with_dispatch_hook(move |request| {
+            let context = request
+                .downcast_ref::<kvrpcpb::GetRequest>()
+                .unwrap()
+                .context
+                .as_ref()
+                .unwrap();
+            match sends.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    assert_eq!(
+                        owners.strong_count(),
+                        1,
+                        "the unchanged dispatch owns its preparer"
+                    );
+                    assert!(context.resolved_locks.is_empty());
+                    assert!(context.committed_locks.is_empty());
+                }
+                1 => {
+                    assert_eq!(context.resolved_locks, [31]);
+                    assert_eq!(context.committed_locks, [41]);
+                }
+                2 => {
+                    assert!(context.resolved_locks.is_empty());
+                    assert!(context.committed_locks.is_empty());
+                }
+                _ => panic!("unexpected physical Get"),
+            }
+
+            Ok(Box::<kvrpcpb::GetResponse>::default())
+        });
+        let request = kvrpcpb::GetRequest::default();
+        let hints = ReadLockContext::default();
+        let mut plan = PlanBuilder::new(
+            Arc::new(MockPdClient::default()),
+            Keyspace::Disable,
+            request,
+        )
+        .single_region_with_store(RegionStore::new(MockPdClient::region1(), Arc::new(client)))
+        .await
+        .unwrap()
+        .resolve_lock_for_read(
+            Timestamp::default(),
+            Backoff::no_backoff(),
+            Keyspace::Disable,
+            hints.clone(),
+            ResolveLocksContext::default(),
+            None,
+            Arc::new(Variables::default()),
+        )
+        .plan();
+        plan.inner.request_preparer = Some(prepare);
+        plan.execute().await.unwrap();
+        // A retained request may contain older hints. Each physical send must
+        // carry the snapshot's current hints, including after they are cleared.
+        plan.inner.request.set_resolved_locks(vec![11]);
+        plan.inner.request.set_committed_locks(vec![21]);
+        hints.add_resolved(31);
+        hints.add_committed(41);
+        plan.execute().await.unwrap();
+        plan.read_lock_context = Some(ReadLockContext::default());
+        plan.execute().await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let original = plan.inner.request.context.as_ref().unwrap();
+        assert_eq!(original.resolved_locks, [11]);
+        assert_eq!(original.committed_locks, [21]);
+    }
+
     /// client-go resends a request only after its response reports a lock:
     /// a lock-free response costs no copy of the lock-retry state.
     #[tokio::test]
@@ -6767,9 +6860,7 @@ mod test {
             pessimistic_lock_wait: None,
         };
         plan.execute().await.unwrap();
-        // The one copy is `execute_inner`'s, which carries the request's
-        // read-lock context.
-        assert_eq!(clones.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(clones.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

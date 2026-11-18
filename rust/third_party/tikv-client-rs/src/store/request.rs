@@ -400,6 +400,12 @@ pub trait Request: Any + Sync + Send + 'static {
         0
     }
 
+    /// Whether the request already carries both lock lists. Only request
+    /// types whose setters write these context fields opt in to reuse.
+    fn has_read_lock_context(&self, _resolved: &[u64], _committed: &[u64]) -> bool {
+        false
+    }
+
     /// Transactions whose locks have been determined rolled back, or whose
     /// commit timestamp is newer than this read, can be ignored by TiKV.
     /// Context-free requests deliberately retain the no-op default.
@@ -967,6 +973,12 @@ macro_rules! impl_request {
                 self.context
                     .as_ref()
                     .map_or(0, |context| context.max_execution_duration_ms)
+            }
+
+            fn has_read_lock_context(&self, resolved: &[u64], committed: &[u64]) -> bool {
+                self.context.as_ref().is_some_and(|ctx| {
+                    ctx.resolved_locks == resolved && ctx.committed_locks == committed
+                })
             }
 
             fn set_resolved_locks(&mut self, resolved_locks: Vec<u64>) {
