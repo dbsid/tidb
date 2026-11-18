@@ -42,6 +42,7 @@ var (
 	embeddedTiKVConfig      = new(embedded.Config)
 	embeddedTiKVReadyWait   *time.Duration
 	embeddedTiKVStopTimeout *time.Duration
+	embeddedTiKVLocalCall   *bool
 	embeddedTiKVStore       *embedded.Store
 )
 
@@ -58,6 +59,8 @@ func registerEmbeddedTiKVFlags(fset *flag.FlagSet) {
 	fset.StringVar(&c.Capacity, "tikv.capacity", "", "embedded TiKV: store capacity")
 	embeddedTiKVReadyWait = fset.Duration("tikv.ready-timeout", 10*time.Minute, "embedded TiKV: startup timeout")
 	embeddedTiKVStopTimeout = fset.Duration("tikv.stop-timeout", time.Minute, "embedded TiKV: shutdown timeout")
+	embeddedTiKVLocalCall = fset.Bool("tikv.local-call", true,
+		"embedded TiKV: serve requests for the local store in process; false sends them over loopback gRPC (for comparison)")
 }
 
 // startEmbeddedTiKV starts the embedded TiKV and routes local requests to it.
@@ -79,7 +82,11 @@ func startEmbeddedTiKV() {
 		os.Exit(exitCodeErr)
 	}
 	embeddedTiKVStore = s
-	tikv.SetDefaultLocalStore(s)
+	if *embeddedTiKVLocalCall {
+		tikv.SetDefaultLocalStore(s)
+	} else {
+		logutil.BgLogger().Warn("embedded TiKV local call is disabled; local requests use gRPC")
+	}
 	// Publish the co-located store in the server labels (visible in
 	// /info/all and the etcd topology) so a proxy can send a transaction to
 	// the TiDB that runs next to the Region leader it touches.
