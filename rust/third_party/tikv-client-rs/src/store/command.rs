@@ -333,9 +333,12 @@ pub(crate) enum BatchResponseDisposition {
     Outdated,
 }
 
+/// The native protobuf message passed from the receive loop to the waiting RPC.
+pub(crate) type BatchResponsePayload = Box<dyn Any + Send>;
+
 struct BatchPendingResponse {
     forwarded_host: String,
-    sender: oneshot::Sender<Result<BatchCommandResponse>>,
+    sender: oneshot::Sender<Result<BatchResponsePayload>>,
     telemetry: Arc<BatchRequestTelemetry>,
     stream_metrics: Option<BatchStreamMetricLabels>,
 }
@@ -507,7 +510,7 @@ impl BatchPendingResponses {
         &self,
         id: u64,
         forwarded_host: impl Into<String>,
-    ) -> oneshot::Receiver<Result<BatchCommandResponse>> {
+    ) -> oneshot::Receiver<Result<BatchResponsePayload>> {
         assert_ne!(id, 0, "batch request ID zero is reserved");
         let (sender, receiver) = oneshot::channel();
         self.register_sender_with_telemetry(
@@ -525,7 +528,7 @@ impl BatchPendingResponses {
         &self,
         id: u64,
         forwarded_host: impl Into<String>,
-        sender: oneshot::Sender<Result<BatchCommandResponse>>,
+        sender: oneshot::Sender<Result<BatchResponsePayload>>,
         telemetry: Arc<BatchRequestTelemetry>,
         stream_metrics: Option<BatchStreamMetricLabels>,
     ) {
@@ -585,7 +588,7 @@ impl BatchPendingResponses {
         id: u64,
         response: Result<BatchCommandResponse>,
         observe: impl FnOnce(&BatchRequestTelemetry),
-        cancelled: impl FnOnce(&BatchRequestTelemetry, Option<BatchCommandResponse>),
+        cancelled: impl FnOnce(&BatchRequestTelemetry, Option<BatchResponsePayload>),
     ) -> BatchResponseDisposition {
         match self.entries.lock().unwrap().remove(&id) {
             Some(entry) => {
@@ -596,7 +599,7 @@ impl BatchPendingResponses {
                     metrics.increment(BatchStreamRequestCounter::Retired);
                 }
                 match response {
-                    Ok(response) => match entry.sender.send(Ok(response)) {
+                    Ok(response) => match entry.sender.send(Ok(response.into_any())) {
                         Ok(()) => {
                             entry.telemetry.complete(None);
                             BatchResponseDisposition::Delivered
@@ -967,7 +970,7 @@ pub enum BatchCommandResponse {
 impl BatchCommandResponse {
     /// Erases a successfully correlated batch response into the same native
     /// response carrier used by the existing unary physical dispatch path.
-    pub(crate) fn into_any(self) -> Box<dyn Any> {
+    pub(crate) fn into_any(self) -> BatchResponsePayload {
         macro_rules! response_variant {
             ($($variant:ident),+ $(,)?) => {
                 match self { $(Self::$variant(response) => Box::new(response),)+ }
@@ -1268,6 +1271,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_completed_batch_delivers_a_pointer_to_the_native_response() {
+        let pending = BatchPendingResponses::new();
+        let receiver = pending.register(1, "");
+        let response = BatchCommandResponse::Get(kvrpcpb::GetResponse {
+            value: vec![7; 256],
+            ..Default::default()
+        });
+        assert_eq!(
+            pending.complete(1, response),
+            BatchResponseDisposition::Delivered
+        );
+        let received = receiver.await.unwrap().unwrap();
+        assert_eq!(
+            std::mem::size_of_val(&received),
+            std::mem::size_of::<Box<dyn Any + Send>>(),
+            "batch completion carried the whole response enum",
+        );
+        let get = received.downcast::<kvrpcpb::GetResponse>().unwrap();
+        assert_eq!(get.value, vec![7; 256]);
+    }
+
+    #[tokio::test]
     async fn batch_pending_responses_match_ids_once_and_ignore_outdated_responses() {
         let pending = BatchPendingResponses::new();
         let receiver = pending.register(7, "");
@@ -1279,7 +1304,7 @@ mod tests {
             BatchResponseDisposition::Delivered
         );
         assert!(
-            matches!(receiver.await, Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 7)
+            matches!(receiver.await, Ok(Ok(response)) if response.downcast_ref::<tikvpb::BatchCommandsEmptyResponse>().unwrap().test_id == 7)
         );
         assert_eq!(
             pending.complete(

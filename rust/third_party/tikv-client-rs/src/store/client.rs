@@ -16,8 +16,8 @@ use tonic::IntoRequest;
 use tonic::Request as TonicRequest;
 
 use super::batch::{BatchCommandsDispatcher, BatchCommandsWorker, BatchRequestStageMetrics};
+use super::BatchCommandRequest;
 use super::Request;
-use super::{BatchCommandRequest, BatchCommandResponse};
 use crate::proto::debugpb::debug_client::DebugClient;
 use crate::proto::kvrpcpb;
 use crate::proto::tikvpb::tikv_client::TikvClient;
@@ -2060,8 +2060,7 @@ impl KvRpcClient {
             }
             .map_err(|error| self.wrap_connection_error(error));
             return match response {
-                Ok(response) => {
-                    let mut response = BatchCommandResponse::into_any(response);
+                Ok(mut response) => {
                     store_metrics.rpc.observe(
                         request,
                         Some(response.as_ref()),

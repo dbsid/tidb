@@ -23,7 +23,8 @@ use tokio::task::JoinHandle;
 use super::client::{ClientEventListener, KvClient, KvRpcClient, TIKV_DIAL_TIMEOUT};
 use super::command::BatchRequestIdAllocator;
 use super::command::{
-    BatchPendingResponses, BatchResponseDisposition, BatchStreamMetricLabels, BatchStreamProgress,
+    BatchPendingResponses, BatchResponseDisposition, BatchResponsePayload, BatchStreamMetricLabels,
+    BatchStreamProgress,
 };
 use super::priority_queue::{PriorityItem, PriorityQueue};
 use super::BatchCommandRequest;
@@ -324,7 +325,7 @@ impl BatchCommandCancellation {
 /// path still retires the source request ID when its response arrives.
 pub(crate) struct BatchCommandSubmission {
     pub(crate) cancellation: BatchCommandCancellation,
-    response: oneshot::Receiver<Result<BatchCommandResponse>>,
+    response: oneshot::Receiver<Result<BatchResponsePayload>>,
     telemetry: Arc<BatchRequestTelemetry>,
 }
 
@@ -333,14 +334,14 @@ impl BatchCommandSubmission {
     /// until the caller has finished observing it.
     pub(crate) async fn recv(
         &mut self,
-    ) -> std::result::Result<Result<BatchCommandResponse>, oneshot::error::RecvError> {
+    ) -> std::result::Result<Result<BatchResponsePayload>, oneshot::error::RecvError> {
         (&mut self.response).await
     }
 
     #[cfg(test)]
     fn try_recv(
         &mut self,
-    ) -> std::result::Result<Result<BatchCommandResponse>, oneshot::error::TryRecvError> {
+    ) -> std::result::Result<Result<BatchResponsePayload>, oneshot::error::TryRecvError> {
         self.response.try_recv()
     }
 
@@ -901,7 +902,7 @@ pub(crate) struct BatchCommandEntry {
     priority: u64,
     forwarded_host: String,
     cancellation: Arc<AtomicBool>,
-    response_sender: oneshot::Sender<Result<BatchCommandResponse>>,
+    response_sender: oneshot::Sender<Result<BatchResponsePayload>>,
     arrived_at: Instant,
     telemetry: Arc<BatchRequestTelemetry>,
 }
@@ -1436,7 +1437,6 @@ fn receive_batch_response_logged(
                     return;
                 }
                 let tikv_details = response
-                    .map(BatchCommandResponse::into_any)
                     .and_then(|response| {
                         super::request::exec_details_v2(response.as_ref())
                             .and_then(|details| details.time_detail_v2.as_ref())
@@ -2597,6 +2597,13 @@ impl BatchCommandsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_response_id(response: &dyn std::any::Any) -> u64 {
+        response
+            .downcast_ref::<tikvpb::BatchCommandsEmptyResponse>()
+            .unwrap()
+            .test_id
+    }
     use crate::proto::kvrpcpb;
     use crate::proto::tikvpb::tikv_client::TikvClient;
     use crate::store::KvClient;
@@ -3699,7 +3706,7 @@ mod tests {
         );
         assert!(matches!(
             received.await,
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 1
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 1
         ));
     }
 
@@ -3752,7 +3759,7 @@ mod tests {
         assert_eq!(error.summary.outdated, 0);
         assert!(matches!(
             first.try_recv(),
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 1
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 1
         ));
         assert!(matches!(
             missing.try_recv(),
@@ -3787,7 +3794,7 @@ mod tests {
         );
         assert!(matches!(
             submitted.recv().await,
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 1
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 1
         ));
 
         let mut submitted = builder.push(empty(2), 0, "");
@@ -3992,7 +3999,7 @@ mod tests {
         assert_eq!(transport_layer_load.load(Ordering::Acquire), 42);
         assert!(matches!(
             direct_completed.await,
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 1
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 1
         ));
         assert!(matches!(
             direct_failed.await,
@@ -4177,7 +4184,7 @@ mod tests {
         assert!(matches!(exit, BatchReceiveLoopExit::Failed(_)));
         assert!(matches!(
             receiver.await,
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 2
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 2
         ));
         assert_eq!(pending.len(), 0);
     }
@@ -4233,7 +4240,7 @@ mod tests {
         ));
         assert!(matches!(
             completed_after_recovery.await,
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 42
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 42
         ));
         assert_eq!(pending.len(), 0);
     }
@@ -4279,11 +4286,11 @@ mod tests {
         assert!(matches!(exit, BatchReceiveLoopExit::Failed(_)));
         assert!(matches!(
             first.await,
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 1
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 1
         ));
         assert!(matches!(
             second.await,
-            Ok(Ok(BatchCommandResponse::Empty(response))) if response.test_id == 2
+            Ok(Ok(response)) if empty_response_id(response.as_ref()) == 2
         ));
         assert_eq!(pending.len(), 0);
     }
@@ -4341,7 +4348,7 @@ mod tests {
         for submission in [&mut collected_before_panic, &mut wake_recovered_loop] {
             assert!(matches!(
                 tokio::time::timeout(Duration::from_secs(1), submission.recv()).await,
-                Ok(Ok(Ok(BatchCommandResponse::Empty(_))))
+                Ok(Ok(Ok(response))) if response.is::<tikvpb::BatchCommandsEmptyResponse>()
             ));
         }
 
@@ -4526,11 +4533,11 @@ mod tests {
         let mut forwarded = worker.submit(empty(22), 0, "store-2").await;
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), direct.recv()).await,
-            Ok(Ok(Ok(BatchCommandResponse::Empty(response)))) if response.test_id == 0
+            Ok(Ok(Ok(response))) if empty_response_id(response.as_ref()) == 0
         ));
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), forwarded.recv()).await,
-            Ok(Ok(Ok(BatchCommandResponse::Empty(response)))) if response.test_id == 0
+            Ok(Ok(Ok(response))) if empty_response_id(response.as_ref()) == 0
         ));
 
         // The first server-side stream closes after responding. A later
@@ -4539,7 +4546,7 @@ mod tests {
         let mut reopened = worker.submit(empty(33), 0, "").await;
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), reopened.recv()).await,
-            Ok(Ok(Ok(BatchCommandResponse::Empty(response)))) if response.test_id == 0
+            Ok(Ok(Ok(response))) if empty_response_id(response.as_ref()) == 0
         ));
         // client-go `recreateStreamingClientOnce`'s success line. The
         // recreated stream opens once a request reaches it (the test server
