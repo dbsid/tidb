@@ -657,7 +657,7 @@ struct RegionCacheMap {
 }
 
 struct CachedStore {
-    meta: Store,
+    meta: Arc<Store>,
     resolve_state: AtomicU8,
     health_status: Arc<StoreHealthStatus>,
     epoch: AtomicU32,
@@ -860,7 +860,7 @@ impl CachedStore {
         };
         Self {
             health_status: Arc::new(StoreHealthStatus::new(meta.id)),
-            meta,
+            meta: Arc::new(meta),
             resolve_state: AtomicU8::new(resolve_state as u8),
             epoch: AtomicU32::new(0),
             liveness: AtomicU8::new(StoreLiveness::Reachable as u8),
@@ -929,7 +929,7 @@ impl CachedStore {
     }
 
     fn update_metadata(&mut self, meta: Store) {
-        self.meta = meta;
+        self.meta = Arc::new(meta);
     }
 
     fn update_server_load(&self, estimated_wait_ms: u32, now: Instant) {
@@ -1562,7 +1562,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         &self,
         store_id: StoreId,
         advance_epoch_for_tombstone: bool,
-    ) -> Result<Option<Store>> {
+    ) -> Result<Option<Arc<Store>>> {
         let store = match self.inner_client.clone().get_store(store_id).await {
             Ok(store) => store,
             Err(error) if is_store_not_found_error(&error) => None,
@@ -1626,7 +1626,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         }
         cached.set_resolve_state(StoreResolveState::Resolved);
         cached.update_liveness_metric();
-        Ok(Some(cached.meta.clone()))
+        Ok(Some(Arc::clone(&cached.meta)))
     }
 
     // Retrieve cache entry by key. If there's no entry, query PD and update cache.
@@ -1951,12 +1951,20 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     }
 
     pub async fn get_store_by_id(&self, id: StoreId) -> Result<Store> {
+        self.shared_store_by_id(id)
+            .await
+            .map(|store| store.as_ref().clone())
+    }
+
+    /// Go's replica selector retains the resolved store. A metadata refresh
+    /// publishes a new snapshot while existing routes retain theirs.
+    pub(crate) async fn shared_store_by_id(&self, id: StoreId) -> Result<Arc<Store>> {
         if let Some((state, store)) = self
             .store_cache
             .read()
             .unwrap()
             .get(&id)
-            .map(|store| (store.resolve_state(), store.meta.clone()))
+            .map(|store| (store.resolve_state(), Arc::clone(&store.meta)))
         {
             match state {
                 StoreResolveState::Resolved | StoreResolveState::NeedCheck => return Ok(store),
@@ -2803,7 +2811,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         result
     }
 
-    async fn read_through_store_by_id(&self, id: StoreId) -> Result<Option<Store>> {
+    async fn read_through_store_by_id(&self, id: StoreId) -> Result<Option<Arc<Store>>> {
         let resolve_lock = self.store_resolve_lock(id).await;
         let _resolve = resolve_lock.lock().await;
         if let Some((state, store)) = self
@@ -2811,7 +2819,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             .read()
             .unwrap()
             .get(&id)
-            .map(|store| (store.resolve_state(), store.meta.clone()))
+            .map(|store| (store.resolve_state(), Arc::clone(&store.meta)))
         {
             match state {
                 StoreResolveState::Resolved | StoreResolveState::NeedCheck => {
@@ -2837,7 +2845,9 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     pub(crate) async fn refresh_store_by_id(&self, id: StoreId) -> Result<Option<Store>> {
         let resolve_lock = self.store_resolve_lock(id).await;
         let _resolve = resolve_lock.lock().await;
-        self.fetch_and_update_store(id, true).await
+        self.fetch_and_update_store(id, true)
+            .await
+            .map(|store| store.map(|meta| meta.as_ref().clone()))
     }
 
     /// Insert a PD region unless it is older than the cached region epoch.
@@ -3181,7 +3191,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             .read()
             .unwrap()
             .get(&store_id)
-            .map(|store| store.meta.clone());
+            .map(|store| store.meta.as_ref().clone());
         self.mark_store_need_check(store_id);
         store
     }
@@ -3231,7 +3241,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                 store.resolve_state() == StoreResolveState::Resolved
                     && EndpointType::from_store(&store.meta) == endpoint_type
             })
-            .map(|store| store.meta.clone())
+            .map(|store| store.meta.as_ref().clone())
             .collect()
     }
 
@@ -3247,7 +3257,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                         EndpointType::TiKv | EndpointType::TiFlash
                     )
             })
-            .map(|store| store.meta.clone())
+            .map(|store| store.meta.as_ref().clone())
             .collect()
     }
 
@@ -3261,7 +3271,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                     && EndpointType::from_store(&store.meta) == EndpointType::TiFlash
                     && store_labels_match(&store.meta.labels, labels)
             })
-            .map(|store| store.meta.clone())
+            .map(|store| store.meta.as_ref().clone())
             .collect()
     }
 
@@ -3911,7 +3921,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                     && EndpointType::from_store(&store.meta) == EndpointType::TiFlash
                     && filter.matches(&store.meta.labels)
             })
-            .map(|store| store.meta.clone())
+            .map(|store| store.meta.as_ref().clone())
             .collect()
     }
 
@@ -3967,7 +3977,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
                         .then(|| {
                             (
                                 peer.clone(),
-                                store.meta.clone(),
+                                store.meta.as_ref().clone(),
                                 store.resolve_state(),
                                 store.epoch.load(Ordering::Acquire),
                                 store_epochs.get(&peer.store_id).copied().unwrap_or(0),
@@ -6127,6 +6137,28 @@ mod test {
         assert_eq!(health.detail().tikv_side_slow_score, 80);
         health.tick(start + Duration::from_secs(15));
         assert_eq!(health.detail().tikv_side_slow_score, 75);
+    }
+
+    #[tokio::test]
+    async fn resolved_routes_share_store_metadata_until_a_new_address_is_published() -> Result<()> {
+        let client = Arc::new(MockRetryClient::default());
+        client.stores.lock().await.push(metapb::Store {
+            id: 7,
+            address: "old-address".into(),
+            ..Default::default()
+        });
+        let cache = RegionCache::new(client.clone());
+        let first = cache.shared_store_by_id(7).await?;
+        let second = cache.shared_store_by_id(7).await?;
+        assert!(Arc::ptr_eq(&first, &second));
+
+        client.stores.lock().await[0].address = "new-address".into();
+        cache.refresh_store_by_id(7).await?;
+        let refreshed = cache.shared_store_by_id(7).await?;
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(first.address, "old-address");
+        assert_eq!(refreshed.address, "new-address");
+        Ok(())
     }
 
     async fn source_store_reresolve_updates_metadata_without_resetting_runtime_state() -> Result<()>
