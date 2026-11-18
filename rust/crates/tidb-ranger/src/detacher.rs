@@ -643,7 +643,9 @@ pub fn extract_eq_and_in_condition_in<'a, C: std::borrow::Borrow<Expression>>(
     eval_expression: &ExpressionEvaluator<'_>,
 ) -> EqAndInExtraction<'a> {
     let mut builder = Builder::new(eval_expression);
-    let mut accesses: Vec<Option<Expression>> = vec![None; cols.len()];
+    // Go keeps the original expression pointer until intersection synthesizes
+    // an EQ/IN. Most candidate inequalities never become prefix accesses.
+    let mut accesses: Vec<Option<Cow<'_, Expression>>> = vec![None; cols.len()];
     let mut points: Vec<Vec<Point>> = vec![Vec::new(); cols.len()];
     let mut merged: Vec<bool> = vec![false; cols.len()];
     let mut new_conditions = Vec::with_capacity(conditions.len());
@@ -662,7 +664,7 @@ pub fn extract_eq_and_in_condition_in<'a, C: std::borrow::Borrow<Expression>>(
         }
         let offset = offset as usize;
         if accesses[offset].is_none() {
-            accesses[offset] = Some(cond.borrow().clone());
+            accesses[offset] = Some(Cow::Borrowed(cond.borrow()));
             continue;
         }
         // Multiple eq/in for one column: intersect their points.
@@ -700,8 +702,6 @@ pub fn extract_eq_and_in_condition_in<'a, C: std::borrow::Borrow<Expression>>(
     let mut parameters_overwritten = false;
     for i in 0..cols.len() {
         if !merged[i] {
-            // Taken rather than cloned: the two arms that reject the access
-            // drop it, and only the surviving arm needs a second copy.
             if let Some(access) = accesses[i].take() {
                 if all_eq_or_in(&access) {
                     column_values[i] = extract_value_info(&access);
@@ -714,7 +714,7 @@ pub fn extract_eq_and_in_condition_in<'a, C: std::borrow::Borrow<Expression>>(
                         .and_then(|info| info.value.as_ref())
                         .is_some_and(|value| matches!(value, Datum::Null))
                     {
-                        new_conditions.push(Cow::Owned(access.clone()));
+                        new_conditions.push(access.clone());
                         accesses[i] = Some(access);
                     }
                 }
@@ -753,7 +753,7 @@ pub fn extract_eq_and_in_condition_in<'a, C: std::borrow::Borrow<Expression>>(
                         });
                     }
                 }
-                accesses[i] = Some(rebuilt);
+                accesses[i] = Some(Cow::Owned(rebuilt));
                 // `a=@x and a=@y` collapses to `a=@x` only while @x == @y.
                 parameters_overwritten |= contains_mutable_const(conditions);
             }
@@ -766,12 +766,11 @@ pub fn extract_eq_and_in_condition_in<'a, C: std::borrow::Borrow<Expression>>(
             new_conditions.push(Cow::Borrowed(conditions[i].borrow()));
         }
     }
-    // The equality chain is the longest all-set PREFIX. `accesses` is dead
-    // after this, so its members are moved into the chain rather than cloned;
-    // only a prefix-index access, which must also filter, needs a copy.
+    // Only the leading equality chain must own its expressions in the result.
     let mut chain: Vec<Expression> = Vec::new();
     for (i, access) in accesses.into_iter().enumerate() {
         let Some(access) = access else { break };
+        let access = access.into_owned();
         // A prefix-index access condition also filters.
         let is_full_length = lengths[i] == UNSPECIFIED_LENGTH
             || cols[i]
@@ -2225,6 +2224,8 @@ mod tests {
         let result = extract_eq_and_in_condition(&conds, &cols, &lengths, true);
         assert!(result.accesses.is_empty());
         assert_eq!(result.new_conditions.len(), 1);
+
+        assert!(std::ptr::eq(result.new_conditions[0].as_ref(), &conds[0]));
 
         // a = 1 AND a = 2: provably empty.
         let conds = vec![
