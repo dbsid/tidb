@@ -18,6 +18,9 @@
 //! over the batch's handles -- and to the result channel, which `Next` drains
 //! in index order.
 
+mod worker_pool;
+
+use self::worker_pool::LookupWorkerPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -154,6 +157,50 @@ struct LookupTask {
 /// One task on the result channel: Go `lookupTableTask.doneCh`.
 type TaskDone = Receiver<Result<TaskRows, ExecError>>;
 
+/// The index worker publishes tasks in index order. Only tasks that carry
+/// unresolved handles need to be submitted to the lookup worker pool.
+struct LookupTaskSender {
+    results: SyncSender<TaskDone>,
+    workers: Arc<LookupWorkerPool>,
+    shared: Arc<Shared>,
+    table_request: Arc<tidb_proto::tipb::DagRequest>,
+}
+
+impl LookupTaskSender {
+    fn submit_table(&self, task: LookupTask) {
+        let shared = Arc::clone(&self.shared);
+        let request = Arc::clone(&self.table_request);
+        let job = tidb_executor_internal_exec::ruv2::inherit_goroutine(move || {
+            if shared.finished.load(Ordering::Acquire) {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let done = task.done.clone();
+            let rows = execute_table_task(&shared, &request, task);
+            if let (Some(stats), Ok(rows)) = (shared.stats.as_ref(), rows.as_ref()) {
+                stats
+                    .table_task_recorder()
+                    .record_table_task(started, rows.order.len());
+            }
+            let _ = done.send(rows);
+        });
+        self.workers.submit("idxlookup-table", job);
+    }
+
+    fn publish(&self, task: TaskDone) -> bool {
+        match self.results.try_send(task) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            Err(std::sync::mpsc::TrySendError::Full(task)) => {
+                // The reader may be waiting on a table job in this worker's
+                // queue. Complete an earlier FIFO job before waiting for room.
+                self.workers.run_one_queued_job();
+                self.results.send(task).is_ok()
+            }
+        }
+    }
+}
+
 /// Go `IndexLookUpExecutor`.
 pub struct IndexLookUpExecutor {
     meta: ExecutorMeta,
@@ -217,9 +264,8 @@ pub struct IndexLookUpExecutor {
     /// Go `resultCh`, `resultCurr` and its cursor.
     result_ch: Option<Receiver<TaskDone>>,
     result_curr: Option<(TaskRows, usize)>,
-    /// Go's index and table worker goroutines, joined by their ends.
-    workers: Vec<Receiver<()>>,
-    worker_started: bool,
+    /// Go `pool`, present between the first Next and Close.
+    workers: Option<Arc<LookupWorkerPool>>,
     /// Go `dummy`: not a real reader, only the KV ranges a union scan reads
     /// the cached or temporary table's rows over (`setDummy`).
     dummy: bool,
@@ -475,8 +521,7 @@ impl IndexLookUpExecutor {
             kv_ranges: Vec::new(),
             result_ch: None,
             result_curr: None,
-            workers: Vec::new(),
-            worker_started: false,
+            workers: None,
             dummy,
         }))
     }
@@ -748,9 +793,6 @@ impl IndexLookUpExecutor {
         let batch_size = self.calculate_batch_size(init_batch_size, max_batch_size);
         let (result_tx, result_rx) = sync_channel::<TaskDone>(LOOKUP_TABLE_TASK_CHANNEL_SIZE);
         self.result_ch = Some(result_rx);
-        // Go's workerPool: up to `indexLookupConcurrency` table workers.
-        let (work_tx, work_rx) = sync_channel::<LookupTask>(LOOKUP_TABLE_TASK_CHANNEL_SIZE);
-        let work_rx = Arc::new(Mutex::new(work_rx));
         // Go `tableRequest` (`buildTableReq`), rebuilt on `open` for
         // `corColInTblSide`.
         let table_plans: Vec<&PhysicalPlan> = self.shared.table_plans.iter().collect();
@@ -762,32 +804,13 @@ impl IndexLookUpExecutor {
         )
         .map_err(|error| ExecError::Internal(error.to_string().into()))?;
         table_request.output_offsets = (0..self.meta.schema().columns.len() as u32).collect();
-        let table_request = Arc::new(table_request);
-        for _ in 0..self.index_lookup_concurrency.max(1) {
-            let shared = Arc::clone(&self.shared);
-            let work_rx = Arc::clone(&work_rx);
-            let table_request = Arc::clone(&table_request);
-            // Go's table workers run under `e.workerCtx`, the context of the
-            // `Next` that started them.
-            let worker = tidb_executor_internal_exec::ruv2::inherit_goroutine(move || loop {
-                let next = work_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
-                let Ok(task) = next else {
-                    return;
-                };
-                if shared.finished.load(Ordering::Acquire) {
-                    return;
-                }
-                let started = std::time::Instant::now();
-                let done = task.done.clone();
-                let rows = execute_table_task(&shared, &table_request, task);
-                // Go `execTableTask`'s `TableRowScan` / `TableTaskNum`.
-                if let (Some(stats), Ok(rows)) = (shared.stats.as_ref(), rows.as_ref()) {
-                    stats.table_task_recorder().record_table_task(started, rows.order.len());
-                }
-                let _ = done.send(rows);
-            });
-            self.workers.push(tidb_goruntime::worker_pool::spawn_lane("idxlookup-table", worker));
-        }
+        let workers = LookupWorkerPool::new(self.index_lookup_concurrency);
+        let sender = LookupTaskSender {
+            results: result_tx,
+            workers: Arc::clone(&workers),
+            shared: Arc::clone(&self.shared),
+            table_request: Arc::new(table_request),
+        };
         // Go `startIndexWorker`: the index worker's tracker, which its
         // requests charge (`SetMemTracker(tracker)`).
         let index_mem_tracker = tidb_memory::Tracker::new(tidb_memory::LABEL_FOR_INDEX_WORKER, -1);
@@ -818,10 +841,10 @@ impl IndexLookUpExecutor {
             tbl_scan_idx_for_rewrite_partition_id,
         };
         let worker = tidb_executor_internal_exec::ruv2::inherit_goroutine(move || {
-            index_worker.run(&result_tx, &work_tx);
+            index_worker.run(&sender);
         });
-        self.workers.push(tidb_goruntime::worker_pool::spawn_lane("idxlookup-index", worker));
-        self.worker_started = true;
+        workers.submit("idxlookup-index", worker);
+        self.workers = Some(workers);
         Ok(())
     }
 
@@ -908,21 +931,17 @@ impl IndexWorker {
     /// Go `startIndexWorker`'s goroutine: the handles of every key range,
     /// one result at a time (or, for a merge, every range merged by the
     /// order-by columns), cut into table tasks.
-    fn run(
-        mut self,
-        result_tx: &SyncSender<TaskDone>,
-        work_tx: &SyncSender<LookupTask>,
-    ) {
+    fn run(mut self, sender: &LookupTaskSender) {
         let total = self.kv_ranges.len();
         let ranges = std::mem::take(&mut self.kv_ranges);
         let fail = |error: ExecError| {
             // Go `syncErr`: a failed task that carries the error.
             let (done_tx, done_rx) = sync_channel(1);
             let _ = done_tx.send(Err(error));
-            let _ = result_tx.send(done_rx);
+            sender.publish(done_rx);
         };
         if self.index_look_up_push_down {
-            if let Err(error) = self.run_push_down(ranges, result_tx, work_tx) {
+            if let Err(error) = self.run_push_down(ranges, sender) {
                 fail(error);
             }
             return;
@@ -962,7 +981,7 @@ impl IndexWorker {
         for (idx, source) in results.iter_mut().enumerate() {
             // Go `tableLookUpTask.partitionTable = prunedPartitions[curResultIdx]`.
             let partition = self.partition_table_mode.then(|| self.table_ids[idx % self.table_ids.len()]);
-            match self.fetch_handles(source.as_mut(), partition, &mut chk, &handle_offsets, result_tx, work_tx) {
+            match self.fetch_handles(source.as_mut(), partition, &mut chk, &handle_offsets, sender) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
@@ -1060,8 +1079,7 @@ impl IndexWorker {
         partition: Option<i64>,
         chk: &mut Chunk,
         handle_offsets: &[usize],
-        result_tx: &SyncSender<TaskDone>,
-        work_tx: &SyncSender<LookupTask>,
+        sender: &LookupTaskSender,
     ) -> Result<bool, ExecError> {
         loop {
             if let Some(limit) = self.pushed_limit {
@@ -1082,7 +1100,8 @@ impl IndexWorker {
             let (done_tx, done_rx) = sync_channel(1);
             let task = LookupTask { id: self.next_task_id, handles, handles_cap, partition, idx_rows, done: done_tx };
             self.next_task_id += 1;
-            if work_tx.send(task).is_err() || result_tx.send(done_rx).is_err() {
+            sender.submit_table(task);
+            if !sender.publish(done_rx) {
                 return Ok(false);
             }
             // Go `buildAndDispatchLookupTasks`' `FetchHandle`, `TaskWait`,
@@ -1099,8 +1118,7 @@ impl IndexWorker {
     fn run_push_down(
         &mut self,
         ranges: Vec<Vec<tidb_txnkv::KeyRange>>,
-        result_tx: &SyncSender<TaskDone>,
-        work_tx: &SyncSender<LookupTask>,
+        sender: &LookupTaskSender,
     ) -> Result<(), ExecError> {
         let total = ranges.len();
         let mut results = Vec::with_capacity(total);
@@ -1146,7 +1164,7 @@ impl IndexWorker {
                         mem_usage: 0,
                         mem_tracker,
                     }));
-                    if result_tx.send(done_rx).is_err() {
+                    if !sender.publish(done_rx) {
                         break 'results;
                     }
                 }
@@ -1155,7 +1173,8 @@ impl IndexWorker {
                     let handles_cap = handles.capacity();
                     let task = LookupTask { id: self.next_task_id, handles, handles_cap, partition, idx_rows: None, done: done_tx };
                     self.next_task_id += 1;
-                    if work_tx.send(task).is_err() || result_tx.send(done_rx).is_err() {
+                    sender.submit_table(task);
+                    if !sender.publish(done_rx) {
                         break 'results;
                     }
                 }
@@ -1726,7 +1745,7 @@ impl Executor for IndexLookUpExecutor {
             req.reset();
             return Ok(());
         }
-        if !self.worker_started {
+        if self.workers.is_none() {
             self.start_workers(req.required_rows())?;
         }
         req.reset();
@@ -1755,10 +1774,9 @@ impl Executor for IndexLookUpExecutor {
         if let Some(result_ch) = self.result_ch.take() {
             while result_ch.recv().is_ok() {}
         }
-        for worker in self.workers.drain(..) {
-            let _ = worker.recv();
+        if let Some(workers) = self.workers.take() {
+            workers.wait();
         }
-        self.worker_started = false;
         self.result_curr = None;
         // Go `RegisterStats(e.ID(), e.stats)`.
         if let Some(stats) = self.shared.stats.as_ref() {
@@ -1785,5 +1803,94 @@ impl Executor for IndexLookUpExecutor {
 
     fn new_chunk(&self) -> Chunk {
         self.meta.new_chunk()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup_executor(row_count: usize) -> IndexLookUpExecutor {
+        fn lookup_plan(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
+            if matches!(plan, PhysicalPlan::IndexLookUpReader(_)) {
+                return Some(plan);
+            }
+            plan.children().iter().find_map(lookup_plan)
+        }
+        let mut catalog = tidb_infoschema_perfschema::mock_catalog();
+        crate::run_create_table_on(
+            "CREATE TABLE empty_lookup (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, KEY ia(a))",
+            &mut catalog,
+        )
+        .unwrap();
+        let ctx =
+            crate::StmtContext::for_query().with_txn_store(Box::new(crate::test_store::store()));
+        if row_count > 0 {
+            let values = (1..=row_count)
+                .map(|i| format!("({i},{i},{i})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            crate::run_insert_on(
+                &format!("INSERT INTO empty_lookup VALUES {values}"),
+                &mut catalog,
+                &ctx,
+            )
+            .unwrap();
+        }
+        let ctx = ctx.with_fresh_staged_writes();
+        let tidb_ast::Stmt::Query(query) =
+            tidb_parser::parse("SELECT b FROM empty_lookup FORCE INDEX (ia) WHERE a > 0").unwrap()
+        else {
+            panic!("expected a query");
+        };
+        let tidb_ast::QueryStmt::Select(select) = &*query else {
+            panic!("expected SELECT");
+        };
+        let physical =
+            crate::driver::planner_bridge::physical_select_plan(select, &catalog, "test", &ctx)
+                .unwrap();
+        let plan = lookup_plan(&physical).expect("forced non-covering index lookup");
+        let PhysicalPlan::IndexLookUpReader(reader) = plan else {
+            unreachable!()
+        };
+        let meta = ExecutorMeta::new(plan.schema().unwrap().clone(), plan.id().into(), 32, 1024);
+        IndexLookUpExecutor::build_no_range(meta, &ctx, &catalog, reader)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn empty_and_single_batch_index_lookups_need_only_the_index_worker() {
+        for count in [0, 1] {
+            let mut executor = lookup_executor(count);
+            executor.open().unwrap();
+            let mut chunk = executor.new_chunk();
+            executor.next(&mut chunk).unwrap();
+            assert_eq!(chunk.num_rows(), count);
+            let workers = executor.workers.as_ref().unwrap().starts();
+            executor.close().unwrap();
+            assert_eq!(workers, 1);
+        }
+    }
+
+    #[test]
+    fn a_single_lookup_worker_can_drain_more_table_tasks_than_the_result_channel_holds() {
+        let count = LOOKUP_TABLE_TASK_CHANNEL_SIZE + 4;
+        let mut executor = lookup_executor(count);
+        executor.index_lookup_size = 1;
+        executor.index_lookup_concurrency = 1;
+        executor.open().unwrap();
+        let mut chunk = executor.new_chunk();
+        let mut rows = 0;
+        loop {
+            executor.next(&mut chunk).unwrap();
+            if chunk.num_rows() == 0 {
+                break;
+            }
+            rows += chunk.num_rows();
+        }
+        assert_eq!(rows, count);
+        assert_eq!(executor.workers.as_ref().unwrap().starts(), 1);
+        executor.close().unwrap();
     }
 }
