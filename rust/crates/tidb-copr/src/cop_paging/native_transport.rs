@@ -454,8 +454,19 @@ pub struct NativeCopResponse<S: ?Sized> {
     build_task_elapsed: Duration,
 }
 
+/// State needed to apply one physical RPC's answer to its logical task.
+struct CopSendAttempt {
+    logical_task_id: u64,
+    attempt_id: u64,
+    context: tidb_proto::KvrpcContext,
+    region: (u64, u64, u64),
+    backoffer: CopBackoffer,
+    stats: Arc<tikv_client::RegionRequestRuntimeStats>,
+    started: std::time::Instant,
+}
+
 impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
-    fn fail(&mut self, message: String) -> Result<Option<QueryResultSubset>, QueryResponseError> {
+    fn fail<T>(&mut self, message: String) -> Result<T, QueryResponseError> {
         self.closed = true;
         Err(QueryResponseError::Source(message))
     }
@@ -519,16 +530,12 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
         }))
     }
 
-    /// Go `copIteratorWorker.handleTaskOnce` for the task's active attempt.
-    fn dispatch(&mut self, logical_task_id: u64, attempt_id: u64) -> Result<(), NativeCopError> {
-        // The worker runs the task with `distsql.Select`'s ctx, whichever
-        // thread it is on: the store calls below report their client spans
-        // under that span (or the backoffer's ctx) and bring back execution
-        // details.
-        let _ctx = self
-            .trace_parent
-            .clone()
-            .map(|span| tidb_tracing::with_thread_span(Some(span)));
+    /// Build the physical request for the active logical attempt.
+    fn prepare_send(
+        &mut self,
+        logical_task_id: u64,
+        attempt_id: u64,
+    ) -> Result<(CopSendAttempt, tidb_proto::CoprocessorRequest), NativeCopError> {
         self.check_active()?;
         let prepared = self.runtime.activate_attempt(attempt_id)?;
         let task = prepared.task();
@@ -563,15 +570,32 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
         // Go `handleTaskOnce`: `worker.kvclient.Stats` collects the task's
         // physical RPCs and `costTime` is the send's wall time.
         let req_stats = Arc::new(tikv_client::RegionRequestRuntimeStats::new());
-        let send_started = std::time::Instant::now();
-        let sent = self.store.send(
-            &backoffer,
-            wire,
+        let attempt = CopSendAttempt {
+            logical_task_id,
+            attempt_id,
+            context: request.context,
             region,
-            self.timeout.min(self.call.timeout()),
-            &self.kv_context,
-            Some(Arc::clone(&req_stats)),
-        );
+            backoffer,
+            stats: req_stats,
+            started: std::time::Instant::now(),
+        };
+        Ok((attempt, wire))
+    }
+
+    fn accept_send(
+        &mut self,
+        attempt: CopSendAttempt,
+        sent: Result<NativeCopSend, tikv_client::Error>,
+    ) -> Result<(), NativeCopError> {
+        let CopSendAttempt {
+            logical_task_id,
+            attempt_id,
+            context,
+            region,
+            backoffer,
+            stats: req_stats,
+            started,
+        } = attempt;
         // Go `err = worker.req.RunawayChecker.CheckThresholds(nil, 0, err)`.
         let sent = match (sent, &self.metadata.runaway_checker) {
             (Err(error), Some(checker)) => match checker.check_thresholds(None, 0, Some(&error.to_string())) {
@@ -580,7 +604,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             },
             (sent, _) => sent?,
         };
-        let cost_time = send_started.elapsed();
+        let cost_time = started.elapsed();
         let (response, address) = match sent {
             NativeCopSend::Response(response, address) => (response, address.unwrap_or_default()),
             NativeCopSend::RegionError(error) => {
@@ -595,7 +619,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
                 return self.schedule_batched_remains(
                     logical_task_id,
                     &backoffer,
-                    &request.context,
+                    &context,
                     remains,
                 );
             }
@@ -617,7 +641,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             logical_task_id,
             attempt_id,
             &backoffer,
-            &request.context,
+            &context,
             region,
             address,
             response,
@@ -632,7 +656,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
                 return Err(NativeCopError::Terror(runaway));
             }
         }
-        self.schedule_batched_remains(logical_task_id, &backoffer, &request.context, remains)
+        self.schedule_batched_remains(logical_task_id, &backoffer, &context, remains)
     }
 
     /// Go `handleCopResponse` for the task's own response.
@@ -963,33 +987,37 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
     }
 }
 
-impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
-    fn next(&mut self) -> Result<Option<QueryResultSubset>, QueryResponseError> {
+type NextCopStep = std::ops::ControlFlow<Option<QueryResultSubset>, (u64, u64)>;
+
+impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
+    /// Deliver a buffered result or identify the attempt that must run next.
+    fn next_step(&mut self) -> Result<NextCopStep, QueryResponseError> {
+        use std::ops::ControlFlow;
         loop {
             if self.closed {
-                return Ok(None);
+                return Ok(ControlFlow::Break(None));
             }
             let Some(&logical_task_id) = self.logical_order.get(self.logical_index) else {
                 self.closed = true;
-                return Ok(None);
+                return Ok(ControlFlow::Break(None));
             };
             match self.runtime.next_response(logical_task_id) {
                 Some(ResponseChannelEvent::Result(data)) => {
                     self.check_visibility()?;
-                    return Ok(Some(QueryResultSubset {
+                    return Ok(ControlFlow::Break(Some(QueryResultSubset {
                         data,
                         runtime: None,
-                    }));
+                    })));
                 }
                 Some(ResponseChannelEvent::ResultWithRuntime {
                     result,
                     runtime_stats,
                 }) => {
                     self.check_visibility()?;
-                    return Ok(Some(QueryResultSubset {
+                    return Ok(ControlFlow::Break(Some(QueryResultSubset {
                         data: result,
                         runtime: Some(runtime_stats),
-                    }));
+                    })));
                 }
                 Some(ResponseChannelEvent::Closed) => {
                     self.active_attempts.remove(&logical_task_id);
@@ -1006,12 +1034,75 @@ impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
             let Some(&attempt_id) = self.active_attempts.get(&logical_task_id) else {
                 return self.fail("open logical task has no active attempt".to_owned());
             };
-            if let Err(error) = self.dispatch(logical_task_id, attempt_id) {
-                self.closed = true;
-                if self.cancellation.is_cancelled() {
-                    return Err(QueryResponseError::Cancelled);
+            return Ok(ControlFlow::Continue((logical_task_id, attempt_id)));
+        }
+    }
+
+    fn send_error(&mut self, error: NativeCopError) -> QueryResponseError {
+        self.closed = true;
+        if self.cancellation.is_cancelled() {
+            QueryResponseError::Cancelled
+        } else {
+            error.into()
+        }
+    }
+
+    fn dispatch(&mut self, logical: u64, id: u64) -> Result<(), NativeCopError> {
+        let _ctx = self
+            .trace_parent
+            .clone()
+            .map(|span| tidb_tracing::with_thread_span(Some(span)));
+        let (attempt, wire) = self.prepare_send(logical, id)?;
+        let sent = self.store.send(
+            &attempt.backoffer,
+            wire,
+            attempt.region,
+            self.timeout.min(self.call.timeout()),
+            &self.kv_context,
+            Some(Arc::clone(&attempt.stats)),
+        );
+        self.accept_send(attempt, sent)
+    }
+
+    async fn dispatch_on_worker(&mut self, logical: u64, id: u64) -> Result<(), NativeCopError> {
+        use std::future::Future;
+        let span = self.trace_parent.clone();
+        let mut send = std::pin::pin!(async {
+            let (attempt, wire) = self.prepare_send(logical, id)?;
+            let sent = self
+                .store
+                .send_async(
+                    &attempt.backoffer,
+                    wire,
+                    attempt.region,
+                    self.timeout.min(self.call.timeout()),
+                    &self.kv_context,
+                    Some(Arc::clone(&attempt.stats)),
+                )
+                .await;
+            self.accept_send(attempt, sent)
+        });
+        // A worker can resume on another thread. Restore the calling
+        // thread's span on every return to the scheduler, including Pending.
+        std::future::poll_fn(|cx| {
+            let _ctx = span
+                .clone()
+                .map(|span| tidb_tracing::with_thread_span(Some(span)));
+            send.as_mut().poll(cx)
+        })
+        .await
+    }
+}
+
+impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
+    fn next(&mut self) -> Result<Option<QueryResultSubset>, QueryResponseError> {
+        loop {
+            match self.next_step()? {
+                std::ops::ControlFlow::Break(row) => return Ok(row),
+                std::ops::ControlFlow::Continue((logical, id)) => {
+                    self.dispatch(logical, id)
+                        .map_err(|error| self.send_error(error))?;
                 }
-                return Err(error.into());
             }
         }
     }
@@ -1103,6 +1194,19 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopTaskSource for NativeCo
 }
 
 impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopWorkerSource for NativeCopResponse<S> {
+    async fn next_on_worker(&mut self) -> Result<Option<QueryResultSubset>, QueryResponseError> {
+        loop {
+            match self.next_step()? {
+                std::ops::ControlFlow::Break(row) => return Ok(row),
+                std::ops::ControlFlow::Continue((logical, id)) => {
+                    self.dispatch_on_worker(logical, id)
+                        .await
+                        .map_err(|error| self.send_error(error))?;
+                }
+            }
+        }
+    }
+
     fn keep_order(&self) -> bool {
         self.metadata.keep_order
     }
