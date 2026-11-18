@@ -644,7 +644,7 @@ fn rebuild_table_scan(
             }
             scan.ranges = tidb_ranger::points::full_range();
         } else {
-            let result = tidb_ranger::detacher::detach_cond_and_build_range_for_index_in(
+            let result = tidb_ranger::detacher::rebuild_index_ranges(
                 &scan.access_condition,
                 &pk_cols,
                 &pk_cols_len,
@@ -658,8 +658,8 @@ fn rebuild_table_scan(
                 &scan.ranges,
                 &result.ranges,
                 scan.access_condition.len(),
-                result.access_conds.len(),
-                result.remained_conds.len(),
+                result.access_count,
+                result.remained_count,
                 false,
             ) {
                 return Err(PlanCacheRebuildError::UnsafeRange { plan_id });
@@ -732,7 +732,7 @@ fn rebuild_index_scan(
         ));
     }
     bind_conditions(&mut scan.access_condition, context)?;
-    let result = tidb_ranger::detacher::detach_cond_and_build_range_for_index_in(
+    let result = tidb_ranger::detacher::rebuild_index_ranges(
         &scan.access_condition,
         &scan.idx_cols,
         &scan.idx_col_lens,
@@ -746,8 +746,8 @@ fn rebuild_index_scan(
         &scan.ranges,
         &result.ranges,
         scan.access_condition.len(),
-        result.access_conds.len(),
-        result.remained_conds.len(),
+        result.access_count,
+        result.remained_count,
         false,
     ) {
         return Err(PlanCacheRebuildError::UnsafeRange {
@@ -811,7 +811,7 @@ fn rebuild_point_ranges(
                 // Go `buildRangesForPointGet` (`plan_cache_rebuild.go:263`):
                 // a point get carrying access conditions is one the optimizer
                 // built, and its ranges come from the detacher, nothing else.
-                let result = tidb_ranger::detacher::detach_cond_and_build_range_for_index_in(
+                let result = tidb_ranger::detacher::rebuild_index_ranges(
                     &rebuild.access_conditions,
                     &rebuild.common_handle_columns,
                     &rebuild.common_handle_lengths,
@@ -825,8 +825,8 @@ fn rebuild_point_ranges(
                     &original,
                     &result.ranges,
                     rebuild.access_conditions.len(),
-                    result.access_conds.len(),
-                    result.remained_conds.len(),
+                    result.access_count,
+                    result.remained_count,
                     false,
                 ) {
                     return Err(PlanCacheRebuildError::UnsafeRange { plan_id });
@@ -869,7 +869,7 @@ fn rebuild_point_ranges(
             bind_conditions(&mut rebuild.access_conditions, context)?;
             // Go `buildRangesForPointGet` (`plan_cache_rebuild.go:265`):
             // `DetachCondAndBuildRangeForIndex` on the access conditions.
-            let result = tidb_ranger::detacher::detach_cond_and_build_range_for_index_in(
+            let result = tidb_ranger::detacher::rebuild_index_ranges(
                 &rebuild.access_conditions,
                 &rebuild.index_columns,
                 &rebuild.index_column_lengths,
@@ -883,8 +883,8 @@ fn rebuild_point_ranges(
                 &original,
                 &result.ranges,
                 rebuild.access_conditions.len(),
-                result.access_conds.len(),
-                result.remained_conds.len(),
+                result.access_count,
+                result.remained_count,
                 false,
             ) {
                 return Err(PlanCacheRebuildError::UnsafeRange { plan_id });
