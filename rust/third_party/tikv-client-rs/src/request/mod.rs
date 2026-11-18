@@ -43,6 +43,7 @@ pub use self::shard::NextBatch;
 pub use self::shard::RangeRequest;
 pub use self::shard::RegionPinned;
 pub use self::shard::Shardable;
+pub use self::shard::SingleRegionTarget;
 use crate::backoff::Backoff;
 use crate::backoff::DEFAULT_REGION_BACKOFF;
 use crate::backoff::OPTIMISTIC_BACKOFF;

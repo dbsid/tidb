@@ -1302,6 +1302,79 @@ mod send_req_tests {
         (pd, sent)
     }
 
+    #[tokio::test]
+    async fn a_get_and_a_pinned_send_locate_their_region_without_building_shard_streams() {
+        use crate::backoff::DEFAULT_REGION_BACKOFF;
+        use crate::request::plan::SHARD_STREAMS;
+        use crate::request::PlanBuilder;
+
+        SHARD_STREAMS.with(|count| count.set(0));
+        let get_pd = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(|req| {
+            let get = req.downcast_ref::<kvrpcpb::GetRequest>().unwrap();
+            assert_eq!(get.key, vec![1]);
+            assert_eq!(get.context.as_ref().unwrap().region_id, 1);
+            Ok(Box::new(kvrpcpb::GetResponse::default()))
+        })));
+        let request = kvrpcpb::GetRequest {
+            key: vec![1],
+            ..Default::default()
+        };
+        let result = PlanBuilder::new(get_pd, Keyspace::Disable, request)
+            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .plan()
+            .execute_once()
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_ok());
+
+        let (pd, sent) = client(|_| coprocessor::Response::default());
+        let backoffer = Arc::new(tokio::sync::Mutex::new(crate::retry::RetryBackoffer::new(
+            crate::async_util::Cancellation::default(),
+            1_000,
+        )));
+        send_req(
+            pd,
+            Keyspace::Disable,
+            request_to_region1(0),
+            backoffer,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(SHARD_STREAMS.with(|count| count.get()), 0);
+    }
+
+    #[tokio::test]
+    async fn a_single_key_with_a_shard_decorator_sends_the_decorated_request() {
+        let pd = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(|req| {
+            let get = req.downcast_ref::<kvrpcpb::GetRequest>().unwrap();
+            assert_eq!(get.context.as_ref().unwrap().resource_group_tag, vec![17]);
+            Ok(Box::new(kvrpcpb::GetResponse::default()))
+        })));
+        let request = kvrpcpb::GetRequest {
+            key: vec![1],
+            ..Default::default()
+        };
+        let results = crate::request::PlanBuilder::new(pd, Keyspace::Disable, request)
+            .decorate_shard_request(
+                |req| vec![req.key.clone()],
+                |req| {
+                    req.context
+                        .get_or_insert_with(Default::default)
+                        .resource_group_tag = vec![17]
+                },
+            )
+            .retry_multi_region(crate::backoff::DEFAULT_REGION_BACKOFF)
+            .plan()
+            .execute_once()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+    }
+
     fn region_error(error: errorpb::Error) -> coprocessor::Response {
         coprocessor::Response {
             region_error: Some(Box::new(error)),

@@ -28,6 +28,10 @@ macro_rules! impl_inner_shardable {
     () => {
         type Shard = P::Shard;
 
+        fn single_region_target(&self) -> Option<SingleRegionTarget<'_>> {
+            self.inner.single_region_target()
+        }
+
         fn request_source(&self) -> &str {
             self.inner.request_source()
         }
@@ -195,8 +199,47 @@ macro_rules! impl_inner_shardable {
     };
 }
 
+/// Region selection for a request whose key or pinned epoch already describes
+/// its complete shard. client-go locates a Get key directly and sends a pinned
+/// request to the specified region.
+#[doc(hidden)]
+pub enum SingleRegionTarget<'a> {
+    Key(&'a crate::Key),
+    Pinned(u64, Option<&'a crate::proto::metapb::RegionEpoch>),
+}
+
+impl SingleRegionTarget<'_> {
+    /// Resolve this target and check a pinned epoch before sending.
+    #[doc(hidden)]
+    pub async fn locate(self, pd: &impl PdClient) -> Result<RegionWithLeader> {
+        match self {
+            Self::Key(key) => pd.region_for_key(key).await,
+            Self::Pinned(id, epoch) => {
+                let region = pd.region_for_id(id).await?;
+                if region.region.region_epoch.as_ref() != epoch {
+                    return Err(crate::Error::RegionError(Box::new(
+                        crate::proto::errorpb::Error {
+                            message: "region missing in cache".to_owned(),
+                            epoch_not_match: Some(crate::proto::errorpb::EpochNotMatch::default()),
+                            ..Default::default()
+                        },
+                    )));
+                }
+                Ok(region)
+            }
+        }
+    }
+}
+
 pub trait Shardable {
     type Shard: Debug + Clone + Send + Sync;
+
+    /// A complete one-region request whose shard needs no changes. Wrappers
+    /// that retain a shard or decorate it can keep the normal grouping path.
+    #[doc(hidden)]
+    fn single_region_target(&self) -> Option<SingleRegionTarget<'_>> {
+        None
+    }
 
     fn shards(
         &self,
@@ -468,6 +511,13 @@ pub trait NextBatch {
 
 impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
     type Shard = Req::Shard;
+
+    fn single_region_target(&self) -> Option<SingleRegionTarget<'_>> {
+        if self.request_shard_identity.is_some() || self.snapshot_replica_read_adjuster.is_some() {
+            return None;
+        }
+        self.request.single_region_target()
+    }
 
     fn client_span_context(&self) -> Option<crate::trace::ClientSpanContext> {
         self.client_span_context.clone()
@@ -1033,6 +1083,10 @@ macro_rules! shardable_key {
         impl Shardable for $type_ {
             type Shard = Vec<Vec<u8>>;
 
+            fn single_region_target(&self) -> Option<$crate::request::SingleRegionTarget<'_>> {
+                Some($crate::request::SingleRegionTarget::Key(self.key.as_ref()))
+            }
+
             fn shards(
                 &self,
                 pd_client: &std::sync::Arc<impl $crate::pd::PdClient>,
@@ -1196,26 +1250,27 @@ macro_rules! region_pinned {
         impl Shardable for $type_ {
             type Shard = ();
 
+            fn single_region_target(&self) -> Option<$crate::request::SingleRegionTarget<'_>> {
+                let context = self.context.as_ref();
+                Some($crate::request::SingleRegionTarget::Pinned(
+                    context.map_or(0, |ctx| ctx.region_id),
+                    context.and_then(|ctx| ctx.region_epoch.as_ref()),
+                ))
+            }
+
             fn shards(
                 &self,
                 pd_client: &Arc<impl $crate::pd::PdClient>,
             ) -> BoxStream<'static, $crate::Result<(Self::Shard, $crate::region::RegionWithLeader)>>
             {
-                let context = self.context.clone().unwrap_or_default();
+                let context = self.context.as_ref();
+                let id = context.map_or(0, |ctx| ctx.region_id);
+                let epoch = context.and_then(|ctx| ctx.region_epoch.clone());
                 let pd_client = pd_client.clone();
                 futures::stream::once(async move {
-                    let region = pd_client.region_for_id(context.region_id).await?;
-                    if region.region.region_epoch != context.region_epoch {
-                        return Err($crate::Error::RegionError(Box::new(
-                            $crate::proto::errorpb::Error {
-                                message: "region missing in cache".to_owned(),
-                                epoch_not_match: Some(
-                                    $crate::proto::errorpb::EpochNotMatch::default(),
-                                ),
-                                ..Default::default()
-                            },
-                        )));
-                    }
+                    let region = $crate::request::SingleRegionTarget::Pinned(id, epoch.as_ref())
+                        .locate(&*pd_client)
+                        .await?;
                     Ok(((), region))
                 })
                 .boxed()
