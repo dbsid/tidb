@@ -1176,8 +1176,6 @@ where
     Req: crate::request::KvRequest + crate::request::Shardable<Shard = ()>,
     Req::Response: crate::store::HasRegionError,
 {
-    use crate::request::Plan;
-
     #[cfg(any(test, feature = "failpoints"))]
     if let Some(injected) = failpoint_send_req_result(crate::store::Request::label(&request)) {
         return injected.map(|response| (response, None));
@@ -1195,23 +1193,8 @@ where
             u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         );
     }
-    let address = std::sync::Arc::new(Mutex::new(None::<String>));
-    // client-go runs the ctx's interceptors around every RPC the sender
-    // issues (`interceptor.GetRPCInterceptorFromCtx`).
-    let mut interceptors = caller_interceptor.unwrap_or_default();
-    let recorded = std::sync::Arc::clone(&address);
-    interceptors.link(crate::interceptor::new_rpc_interceptor(
-        "send-req-ctx-address",
-        move |target, _request, next| {
-            *recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(target.to_owned());
-            Box::pin(next())
-                as futures::future::BoxFuture<'_, crate::interceptor::RpcDispatchResult>
-        },
-    ));
-    let mut responses = crate::request::PlanBuilder::new(pd_client, keyspace, request)
-        .rpc_interceptor(interceptors)
+    crate::request::PlanBuilder::new(pd_client, keyspace, request)
+        .rpc_interceptor_option(caller_interceptor)
         .request_timeout(timeout)
         .region_request_runtime_stats(stats)
         .retry_region_request(crate::request::plan::SenderBackoffer::new(
@@ -1219,21 +1202,8 @@ where
             cancellation,
         ))
         .plan()
-        .execute()
-        .await?;
-    let response = match (responses.pop(), responses.is_empty()) {
-        (Some(response), true) => response?,
-        _ => {
-            return Err(Error::StringError(
-                "a region request answered other than once".to_owned(),
-            ))
-        }
-    };
-    let address = address
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    Ok((response, address))
+        .execute_with_store_address()
+        .await
 }
 
 /// client-go `failpointSendReqResult`, failpoint `tikvStoreSendReqResult`,
@@ -1399,6 +1369,48 @@ mod send_req_tests {
         assert_eq!(sent.load(AtomicOrdering::SeqCst), 2);
         // client-go passes `bo` by pointer: the sender's sleep is the caller's.
         assert!(backoffer.lock().await.total_sleep_ms() > 0);
+    }
+
+    /// Go records the selected RPC context before running user interceptors.
+    #[tokio::test]
+    async fn a_short_circuited_region_send_keeps_the_selected_address_and_caller_interceptor() {
+        let (pd, sent) = client(|_| coprocessor::Response::default());
+        let mut interceptors = crate::interceptor::RpcInterceptorChain::new();
+        interceptors.link(crate::interceptor::new_rpc_interceptor(
+            "send-req-ctx-address",
+            |target, _request, _next| {
+                // The mock store has an empty but present target.
+                assert!(target.is_empty());
+                Box::pin(async {
+                    Ok(Box::new(coprocessor::Response {
+                        data: vec![7, 11].into(),
+                        ..Default::default()
+                    }) as Box<dyn Any>)
+                })
+                    as futures::future::BoxFuture<'_, crate::interceptor::RpcDispatchResult>
+            },
+        ));
+        let backoffer = Arc::new(tokio::sync::Mutex::new(
+            crate::retry::RetryBackoffer::new(crate::async_util::Cancellation::default(), 1_000)
+                .with_rpc_interceptor(interceptors),
+        ));
+
+        let (response, address) = super::send_req_ctx(
+            pd,
+            Keyspace::Disable,
+            request_to_region1(0),
+            backoffer,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sent.load(AtomicOrdering::SeqCst),
+            0,
+            "the region sender replaced the caller interceptor"
+        );
+        assert_eq!(&response.data[..], &[7, 11]);
+        assert_eq!(address.as_deref(), Some(""));
     }
 
     /// client-go runs the ctx's interceptors (`WithRPCInterceptor` on

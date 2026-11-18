@@ -306,6 +306,17 @@ impl<Req: KvRequest> Dispatch<Req> {
 }
 
 impl<Req: KvRequest> Dispatch<Req> {
+    /// RPCContext.Addr is the logical store, including when a proxy carried the RPC.
+    fn into_store_address(self) -> Option<String> {
+        self.kv_client.is_some().then(|| {
+            if self.forwarded_host.is_empty() {
+                self.target
+            } else {
+                self.forwarded_host
+            }
+        })
+    }
+
     /// The transaction details client-go's per-batch handlers charge from
     /// one RPC. Kept out of `execute` so its temporaries do not enlarge every
     /// poll of the (deeply nested) dispatch future.
@@ -2763,37 +2774,63 @@ where
         // An `async move` block, not an `async fn`: the future keeps the
         // one `self` it captured and lends its plan and backoff below,
         // where an `async fn` would also hold a moved copy of its argument.
-        async move {
-            // The generic Rust plan caps multi-region concurrency. client-go's
-            // snapshot BatchGet sends every initial region batch concurrently;
-            // its optional worker pool applies only to callback retry work.
-            let concurrency = if self.snapshot_region_scope.is_some() {
-                Semaphore::MAX_PERMITS
-            } else {
-                self.concurrency.max(1)
-            };
-            let concurrency_permits = Arc::new(Semaphore::new(concurrency));
-            // Region location and every send below run with client-go's
-            // `bo.GetCtx()`.
-            let slot = Self::bo_span_slot(&self.backoff, &self.inner).await;
-            let result = crate::trace::with_bo_span_slot(
-                slot,
-                Self::single_plan_handler(
-                    self.pd_client.clone(),
-                    &mut self.inner,
-                    &mut self.backoff,
-                    &concurrency_permits,
-                    self.preserve_region_results,
-                    self.one_region,
-                    self.snapshot_region_scope,
-                    self.snapshot_async_batch_get,
-                    None,
-                ),
-            )
-            .await;
-            self.backoff.record_stats().await;
-            result
-        }
+        async move { self.execute_regions().await }
+    }
+
+    async fn execute_regions(&mut self) -> Result<Vec<Result<P::Result>>> {
+        // The generic Rust plan caps multi-region concurrency. client-go's
+        // snapshot BatchGet sends every initial region batch concurrently;
+        // its optional worker pool applies only to callback retry work.
+        let concurrency = if self.snapshot_region_scope.is_some() {
+            Semaphore::MAX_PERMITS
+        } else {
+            self.concurrency.max(1)
+        };
+        let concurrency_permits = Arc::new(Semaphore::new(concurrency));
+        // Region location and every send below run with client-go's
+        // `bo.GetCtx()`.
+        let slot = Self::bo_span_slot(&self.backoff, &self.inner).await;
+        let result = crate::trace::with_bo_span_slot(
+            slot,
+            Self::single_plan_handler(
+                self.pd_client.clone(),
+                &mut self.inner,
+                &mut self.backoff,
+                &concurrency_permits,
+                self.preserve_region_results,
+                self.one_region,
+                self.snapshot_region_scope,
+                self.snapshot_async_batch_get,
+                None,
+            ),
+        )
+        .await;
+        self.backoff.record_stats().await;
+        result
+    }
+}
+
+impl<Req, PdC> RetryableMultiRegion<Dispatch<Req>, PdC, SenderBackoffer>
+where
+    PdC: PdClient,
+    Req: KvRequest + Shardable<Shard = ()>,
+    Req::Response: HasRegionError,
+{
+    /// Sends a region-addressed request and returns the final route's logical
+    /// store address (client-go's `RegionRequestSender.GetStoreAddr`).
+    pub(crate) async fn execute_with_store_address(
+        mut self,
+    ) -> Result<(Req::Response, Option<String>)> {
+        let mut responses = self.execute_regions().await?;
+        let response = match (responses.pop(), responses.is_empty()) {
+            (Some(response), true) => response?,
+            _ => {
+                return Err(Error::StringError(
+                    "a region request answered other than once".to_owned(),
+                ))
+            }
+        };
+        Ok((response, self.inner.into_store_address()))
     }
 }
 
@@ -4285,6 +4322,26 @@ mod test {
             dispatches.load(Ordering::SeqCst),
             if cfg!(feature = "nextgen") { 6 } else { 5 }
         );
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_region_dispatch_reports_the_logical_store_address() {
+        for (forwarded, expected) in [("", "physical:20160"), ("leader:20160", "leader:20160")] {
+            let store =
+                RegionStore::new(MockPdClient::region1(), Arc::new(MockKvClient::default()))
+                    .with_target("physical:20160")
+                    .with_forwarded_host(forwarded);
+            let dispatch = PlanBuilder::new(
+                Arc::new(MockPdClient::default()),
+                Keyspace::Disable,
+                kvrpcpb::GetRequest::default(),
+            )
+            .single_region_with_store(store)
+            .await
+            .unwrap()
+            .plan();
+            assert_eq!(dispatch.into_store_address().as_deref(), Some(expected));
+        }
     }
 
     struct ResetTraceHandlers;
