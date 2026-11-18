@@ -125,19 +125,19 @@ impl<PdC: PdClient> KvSnapshot<PdC> {
     pub async fn get(&self, key: impl Into<Key>) -> Result<Option<Value>> {
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
         let internal = self.request_source.is_internal();
-        let point_get = self.point_get();
+        let point_get = self.point_get().run(key);
         let read = async move {
             let _timer = crate::stats::snapshot_command_timer("get", internal);
             // client-go `KVSnapshot.get` opens its span and discards the
             // derived ctx.
-            crate::trace::detached_client_span("tikvSnapshot.get", point_get.run(key)).await
+            crate::trace::detached_client_span("tikvSnapshot.get", point_get).await
         };
         match snapshot_read_trace_context_of(
             self.exec_details.as_ref(),
             self.caller_context.as_ref(),
             self.timestamp.version(),
         ) {
-            Some(statement) => crate::trace::with_trace_context(statement, Box::pin(read)).await,
+            Some(statement) => crate::trace::with_trace_context(statement, read).await,
             None => read.await,
         }
     }
@@ -350,6 +350,21 @@ mod tests {
     use crate::mock::{MockKvClient, MockPdClient};
     use crate::timestamp::TimestampExt;
     use crate::{CheckLevel, Transaction, TransactionOptions};
+
+    #[test]
+    fn tracing_a_point_get_moves_only_its_handle() {
+        let snapshot = KvSnapshot::new(
+            Timestamp::from_version(u64::MAX),
+            Arc::new(MockPdClient::default()),
+            Keyspace::Disable,
+            None,
+            ResolveLocksContext::default(),
+            None,
+            None,
+        );
+        let read = snapshot.point_get().run(vec![1].into());
+        assert_eq!(std::mem::size_of_val(&read), std::mem::size_of::<usize>());
+    }
 
     /// client-go's `KVTxn.Get` reads through its `KVSnapshot`: a snapshot
     /// read sends the request a transaction's read at the same version and
