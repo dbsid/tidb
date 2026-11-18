@@ -358,7 +358,7 @@ impl Shardable for kvrpcpb::BatchGetRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         self.set_busy_threshold_ms(store.busy_threshold_ms);
@@ -807,7 +807,7 @@ impl Shardable for kvrpcpb::PrewriteRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -925,7 +925,7 @@ impl Shardable for kvrpcpb::CommitRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -1021,7 +1021,7 @@ impl Shardable for kvrpcpb::BatchRollbackRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         self.set_busy_threshold_ms(store.busy_threshold_ms);
@@ -1117,7 +1117,7 @@ impl Shardable for kvrpcpb::PessimisticRollbackRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         self.set_busy_threshold_ms(store.busy_threshold_ms);
@@ -1265,7 +1265,7 @@ impl Shardable for kvrpcpb::PessimisticLockRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -1477,7 +1477,7 @@ impl Shardable for kvrpcpb::ScanLockRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -1554,7 +1554,7 @@ impl Shardable for kvrpcpb::TxnHeartBeatRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -1634,7 +1634,7 @@ impl Shardable for kvrpcpb::CheckTxnStatusRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -2220,7 +2220,7 @@ impl Shardable for kvrpcpb::FlushRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -2297,7 +2297,7 @@ impl Shardable for kvrpcpb::BufferBatchGetRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         self.set_busy_threshold_ms(store.busy_threshold_ms);

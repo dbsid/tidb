@@ -1207,7 +1207,7 @@ fn set_single_region_store<PdC: PdClient, R: KvRequest>(
     resource_control: Option<ResourceGroupControllerHandle>,
     ru_details: Option<Arc<crate::RuDetails>>,
 ) -> Result<PlanBuilder<PdC, Dispatch<R>, Targetted>> {
-    plan.request.set_leader(&store.request_region())?;
+    plan.request.set_region_from_store(&store)?;
     plan.request.set_replica_read(store.is_replica_read());
     plan.request.set_stale_read(store.stale_read);
     plan.request.set_busy_threshold_ms(store.busy_threshold_ms);

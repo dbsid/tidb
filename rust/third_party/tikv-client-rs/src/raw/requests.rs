@@ -210,7 +210,7 @@ impl Shardable for kvrpcpb::RawBatchGetRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -398,7 +398,7 @@ impl Shardable for kvrpcpb::RawBatchPutRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -499,7 +499,7 @@ impl Shardable for kvrpcpb::RawBatchDeleteRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -580,7 +580,7 @@ impl Shardable for kvrpcpb::RawChecksumRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -693,7 +693,7 @@ impl Shardable for kvrpcpb::RawBatchScanRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         Ok(())
@@ -885,7 +885,7 @@ impl Shardable for RawCoprocessorRequest {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
-        self.set_leader(&store.request_region())?;
+        self.set_region_from_store(store)?;
         self.set_replica_read(store.is_replica_read());
         self.set_stale_read(store.stale_read);
         self.inner.data = (self.data_builder)(

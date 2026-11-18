@@ -14,10 +14,11 @@ use tonic::IntoRequest;
 use crate::proto::coprocessor;
 use crate::proto::debugpb;
 use crate::proto::kvrpcpb;
+use crate::proto::metapb;
 use crate::proto::mpp;
 use crate::proto::tikvpb::{self, tikv_client::TikvClient};
 use crate::request::{set_context_keyspace_id, ApiV2Codec};
-use crate::store::RegionWithLeader;
+use crate::store::{RegionStore, RegionWithLeader};
 use crate::Error;
 use crate::Result;
 
@@ -316,6 +317,23 @@ impl BatchCoprocessorStreamRequest {
 #[allow(dead_code)]
 pub struct MppStreamRequest(pub mpp::EstablishMppConnectionRequest);
 
+/// client-go tikvrpc.SetContextNoAttach takes the region and selected peer
+/// separately. Only these fields belong in the outgoing request context.
+fn set_region_peer(
+    context: &mut Option<kvrpcpb::Context>,
+    region: &RegionWithLeader,
+    peer: Option<&metapb::Peer>,
+) -> Result<()> {
+    let context = context.get_or_insert_with(kvrpcpb::Context::default);
+    let peer = peer.ok_or_else(|| Error::LeaderNotFound {
+        region: region.ver_id(),
+    })?;
+    context.region_id = region.region.id;
+    context.region_epoch = region.region.region_epoch.clone();
+    context.peer = Some(peer.clone());
+    Ok(())
+}
+
 #[async_trait]
 pub trait Request: Any + Sync + Send + 'static {
     async fn dispatch(
@@ -327,6 +345,17 @@ pub trait Request: Any + Sync + Send + 'static {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()>;
+    /// Attach the selected region and logical peer to a physical request.
+    /// Requests with their own leader handling receive the same metadata as
+    /// through `RegionStore::request_region`.
+    fn set_region_from_store(&mut self, store: &RegionStore) -> Result<()> {
+        if store.target_peer == store.region_with_leader.leader {
+            self.set_leader(&store.region_with_leader)
+        } else {
+            self.set_leader(&store.request_region())
+        }
+    }
+
     fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion);
     /// Marks a resend of the same logical request. Context-bearing TiKV
     /// requests expose this as `Context.is_retry_request`; store-only
@@ -818,14 +847,15 @@ macro_rules! impl_request {
             }
 
             fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()> {
-                let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
-                let leader_peer = leader.leader.as_ref().ok_or(Error::LeaderNotFound {
-                    region: leader.ver_id(),
-                })?;
-                ctx.region_id = leader.region.id;
-                ctx.region_epoch = leader.region.region_epoch.clone();
-                ctx.peer = Some(leader_peer.clone());
-                Ok(())
+                set_region_peer(&mut self.context, leader, leader.leader.as_ref())
+            }
+
+            fn set_region_from_store(&mut self, store: &RegionStore) -> Result<()> {
+                set_region_peer(
+                    &mut self.context,
+                    &store.region_with_leader,
+                    store.target_peer.as_ref(),
+                )
             }
 
             fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
@@ -1443,14 +1473,15 @@ impl Request for coprocessor::Request {
     }
 
     fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()> {
-        let context = self.context.get_or_insert(kvrpcpb::Context::default());
-        let leader_peer = leader.leader.as_ref().ok_or(Error::LeaderNotFound {
-            region: leader.ver_id(),
-        })?;
-        context.region_id = leader.region.id;
-        context.region_epoch = leader.region.region_epoch.clone();
-        context.peer = Some(leader_peer.clone());
-        Ok(())
+        set_region_peer(&mut self.context, leader, leader.leader.as_ref())
+    }
+
+    fn set_region_from_store(&mut self, store: &RegionStore) -> Result<()> {
+        set_region_peer(
+            &mut self.context,
+            &store.region_with_leader,
+            store.target_peer.as_ref(),
+        )
     }
 
     fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
@@ -1616,6 +1647,10 @@ impl Request for CoprocessorStreamRequest {
 
     fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()> {
         self.request.set_leader(leader)
+    }
+
+    fn set_region_from_store(&mut self, store: &RegionStore) -> Result<()> {
+        self.request.set_region_from_store(store)
     }
 
     fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {

@@ -232,6 +232,8 @@ impl RegionStore {
     /// as its request-context leader. `Request::set_leader` historically uses
     /// this shape, so this preserves its API while permitting replica reads.
     pub fn request_region(&self) -> RegionWithLeader {
+        #[cfg(test)]
+        REQUEST_REGION_COPIES.with(|count| count.set(count.get() + 1));
         let mut region = self.region_with_leader.clone();
         region.leader = self.target_peer.clone();
         region
@@ -454,6 +456,11 @@ pub fn region_stream_for_ranges<PdC: PdClient>(
 }
 
 #[cfg(test)]
+thread_local! {
+    static REQUEST_REGION_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use std::any::Any;
 
@@ -469,6 +476,66 @@ mod tests {
         async fn dispatch(&self, _request: &dyn Request) -> Result<Box<dyn Any>> {
             Err(crate::Error::Unimplemented)
         }
+    }
+
+    #[test]
+    fn attaching_a_selected_peer_does_not_copy_the_region() {
+        use crate::request::Shardable;
+
+        let leader = metapb::Peer {
+            id: 1,
+            store_id: 11,
+            ..Default::default()
+        };
+        let follower = metapb::Peer {
+            id: 2,
+            store_id: 22,
+            ..Default::default()
+        };
+        let epoch = metapb::RegionEpoch {
+            conf_ver: 3,
+            version: 4,
+        };
+        let region = RegionWithLeader::new(
+            metapb::Region {
+                id: 17,
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+                region_epoch: Some(epoch.clone()),
+                peers: vec![leader.clone(), follower.clone()],
+                ..Default::default()
+            },
+            Some(leader.clone()),
+        );
+        let mut route = RegionStore::new(region, Arc::new(NoopClient));
+        let mut request = kvrpcpb::GetRequest::default();
+        REQUEST_REGION_COPIES.with(|count| count.set(0));
+        for peer in [&leader, &follower] {
+            route = route.with_target_peer(peer.clone());
+            request.apply_store(&route).unwrap();
+            let context = request.context.as_ref().unwrap();
+            assert_eq!(context.region_id, 17);
+            assert_eq!(context.region_epoch.as_ref(), Some(&epoch));
+            assert_eq!(context.peer.as_ref(), Some(peer));
+            assert_eq!(route.region_with_leader.leader.as_ref(), Some(&leader));
+        }
+        let mut cop = crate::proto::coprocessor::Request::default();
+        cop.context = Some(kvrpcpb::Context {
+            resolved_locks: vec![23],
+            ..Default::default()
+        });
+        cop.set_region_from_store(&route).unwrap();
+        let context = cop.context.unwrap();
+        assert_eq!(context.peer.as_ref(), Some(&follower));
+        assert_eq!(context.region_epoch.as_ref(), Some(&epoch));
+        assert_eq!(context.resolved_locks, vec![23]);
+
+        route.target_peer = None;
+        assert!(matches!(
+            request.apply_store(&route),
+            Err(crate::Error::LeaderNotFound { .. })
+        ));
+        assert_eq!(REQUEST_REGION_COPIES.with(|count| count.get()), 0);
     }
 
     #[test]

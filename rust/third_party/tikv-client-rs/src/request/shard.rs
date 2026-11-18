@@ -1052,7 +1052,7 @@ macro_rules! shardable_key {
             }
 
             fn apply_store(&mut self, store: &$crate::store::RegionStore) -> $crate::Result<()> {
-                self.set_leader(&store.request_region())?;
+                self.set_region_from_store(store)?;
                 self.set_replica_read(store.is_replica_read());
                 self.set_stale_read(store.stale_read);
                 self.set_busy_threshold_ms(store.busy_threshold_ms);
@@ -1086,7 +1086,7 @@ macro_rules! shardable_keys {
             }
 
             fn apply_store(&mut self, store: &$crate::store::RegionStore) -> $crate::Result<()> {
-                self.set_leader(&store.request_region())?;
+                self.set_region_from_store(store)?;
                 self.set_replica_read(store.is_replica_read());
                 self.set_stale_read(store.stale_read);
                 self.set_busy_threshold_ms(store.busy_threshold_ms);
@@ -1155,7 +1155,7 @@ macro_rules! shardable_range {
             }
 
             fn apply_store(&mut self, store: &$crate::store::RegionStore) -> $crate::Result<()> {
-                self.set_leader(&store.request_region())?;
+                self.set_region_from_store(store)?;
                 self.set_replica_read(store.is_replica_read());
                 self.set_stale_read(store.stale_read);
                 self.set_busy_threshold_ms(store.busy_threshold_ms);
@@ -1224,7 +1224,7 @@ macro_rules! region_pinned {
             fn apply_shard(&mut self, _shard: Self::Shard) {}
 
             fn apply_store(&mut self, store: &$crate::store::RegionStore) -> $crate::Result<()> {
-                self.set_leader(&store.request_region())?;
+                self.set_region_from_store(store)?;
                 self.set_replica_read(store.is_replica_read());
                 self.set_stale_read(store.stale_read);
                 self.set_busy_threshold_ms(store.busy_threshold_ms);
