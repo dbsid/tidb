@@ -893,6 +893,9 @@ impl Drop for BatchCommandSubmission {
 
 /// An owned batch candidate. A non-empty forwarding host must use a distinct
 /// gRPC stream, matching client-go's metadata-per-stream constraint.
+/// The channel, priority queue and selected group pass a pointer to this
+/// entry, like client-go's `*batchCommandsEntry`. Its inline protobuf
+/// request stays in place until the builder moves it into the wire batch.
 pub(crate) struct BatchCommandEntry {
     // The command is moved into the protobuf batch at selection time. The
     // selected entry remains in its group to carry cancellation and routing
@@ -934,7 +937,7 @@ impl BatchRequestCollector {
     /// `None` when the sender is closed before a head arrives.
     async fn collect(
         &mut self,
-        receiver: &mut mpsc::Receiver<BatchCommandEntry>,
+        receiver: &mut mpsc::Receiver<Box<BatchCommandEntry>>,
         builder: &mut BatchCommandsBuilder,
         max_batch_size: usize,
         batch_wait_size: usize,
@@ -951,7 +954,7 @@ impl BatchRequestCollector {
 
     fn accept_head(
         &mut self,
-        head: BatchCommandEntry,
+        head: Box<BatchCommandEntry>,
         builder: &mut BatchCommandsBuilder,
     ) -> Option<Duration> {
         self.last_head_received_at = Some(Instant::now());
@@ -965,7 +968,7 @@ impl BatchRequestCollector {
     }
 
     async fn collect_more(
-        receiver: &mut mpsc::Receiver<BatchCommandEntry>,
+        receiver: &mut mpsc::Receiver<Box<BatchCommandEntry>>,
         builder: &mut BatchCommandsBuilder,
         max_batch_size: usize,
         batch_wait_size: usize,
@@ -989,7 +992,7 @@ impl BatchRequestCollector {
 
     async fn collect_with_policy(
         &mut self,
-        receiver: &mut mpsc::Receiver<BatchCommandEntry>,
+        receiver: &mut mpsc::Receiver<Box<BatchCommandEntry>>,
         builder: &mut BatchCommandsBuilder,
         policy: &mut BatchCollectionPolicy,
         transport_layer_load: u64,
@@ -1004,11 +1007,11 @@ impl BatchRequestCollector {
 
     async fn collect_head_with_policy(
         &mut self,
-        receiver: &mut mpsc::Receiver<BatchCommandEntry>,
+        receiver: &mut mpsc::Receiver<Box<BatchCommandEntry>>,
         builder: &mut BatchCommandsBuilder,
         policy: &mut BatchCollectionPolicy,
         transport_layer_load: u64,
-        head: BatchCommandEntry,
+        head: Box<BatchCommandEntry>,
     ) {
         self.last_head_received_at = None;
         self.last_head_arrival_interval = None;
@@ -1035,7 +1038,7 @@ impl BatchRequestCollector {
     }
 
     fn drain_ready(
-        receiver: &mut mpsc::Receiver<BatchCommandEntry>,
+        receiver: &mut mpsc::Receiver<Box<BatchCommandEntry>>,
         builder: &mut BatchCommandsBuilder,
         max_batch_size: usize,
     ) {
@@ -1050,7 +1053,7 @@ impl BatchRequestCollector {
     }
 }
 
-impl PriorityItem for BatchCommandEntry {
+impl PriorityItem for Box<BatchCommandEntry> {
     fn priority(&self) -> u64 {
         self.priority
     }
@@ -1075,7 +1078,7 @@ impl BatchCommandEntry {
 pub(crate) struct BatchCommandGroup {
     pub(crate) forwarded_host: String,
     pub(crate) request: tikvpb::BatchCommandsRequest,
-    pub(crate) entries: Vec<BatchCommandEntry>,
+    pub(crate) entries: Vec<Box<BatchCommandEntry>>,
 }
 
 impl BatchCommandGroup {
@@ -1196,7 +1199,7 @@ impl BatchCommandGroup {
 /// `enqueue`/`flush` pair remains available for deterministic tests; normal
 /// scheduling should use this worker so collection owns timing.
 pub(crate) struct BatchCommandsWorker {
-    sender: mpsc::Sender<BatchCommandEntry>,
+    sender: mpsc::Sender<Box<BatchCommandEntry>>,
     task: JoinHandle<()>,
     dispatcher: Arc<BatchCommandsDispatcher>,
 }
@@ -2032,7 +2035,7 @@ impl BatchCommandsDispatcher {
     ) -> BatchCommandsWorker {
         let capacity =
             usize::try_from(config.max_batch_size).expect("enabled batch size fits usize");
-        let (sender, mut receiver) = mpsc::channel::<BatchCommandEntry>(capacity);
+        let (sender, mut receiver) = mpsc::channel::<Box<BatchCommandEntry>>(capacity);
         let config = config.clone();
         let transport_layer_load = self.transport_layer_load.clone();
         let dispatcher = self.clone();
@@ -2427,7 +2430,7 @@ impl BatchCommandsDispatcher {
 /// as a Go `batchCommandsBuilder` is retained by its batch connection.
 pub(crate) struct BatchCommandsBuilder {
     id_allocator: BatchRequestIdAllocator,
-    entries: PriorityQueue<BatchCommandEntry>,
+    entries: PriorityQueue<Box<BatchCommandEntry>>,
 }
 
 impl BatchCommandsBuilder {
@@ -2459,7 +2462,7 @@ impl BatchCommandsBuilder {
         request: BatchCommandRequest,
         priority: u64,
         forwarded_host: impl Into<String>,
-    ) -> (BatchCommandEntry, BatchCommandSubmission) {
+    ) -> (Box<BatchCommandEntry>, BatchCommandSubmission) {
         let stage_metrics = Arc::new(BatchRequestStageMetrics::new(request.store_id()));
         Self::entry_with_stage_metrics(request, priority, forwarded_host, stage_metrics)
     }
@@ -2471,14 +2474,14 @@ impl BatchCommandsBuilder {
         priority: u64,
         forwarded_host: impl Into<String>,
         stage_metrics: Arc<BatchRequestStageMetrics>,
-    ) -> (BatchCommandEntry, BatchCommandSubmission) {
+    ) -> (Box<BatchCommandEntry>, BatchCommandSubmission) {
         let cancellation = Arc::new(AtomicBool::new(false));
         let (response_sender, response) = oneshot::channel();
         let arrived_at = Instant::now();
         let mut telemetry = BatchRequestTelemetry::with_stage_metrics(stage_metrics, arrived_at);
         telemetry.client_spans = crate::trace::current_client_span_context();
         let telemetry = Arc::new(telemetry);
-        let entry = BatchCommandEntry {
+        let entry = Box::new(BatchCommandEntry {
             request: Some(request),
             priority,
             forwarded_host: forwarded_host.into(),
@@ -2486,7 +2489,7 @@ impl BatchCommandsBuilder {
             response_sender,
             arrived_at,
             telemetry: telemetry.clone(),
-        };
+        });
         let submission = BatchCommandSubmission {
             cancellation: BatchCommandCancellation(cancellation),
             response,
@@ -2824,7 +2827,7 @@ mod tests {
         })
     }
 
-    fn queued_entry(builder: &mut BatchCommandsBuilder, id: u64) -> BatchCommandEntry {
+    fn queued_entry(builder: &mut BatchCommandsBuilder, id: u64) -> Box<BatchCommandEntry> {
         let _submission = builder.push(empty(id), 0, "");
         builder
             .entries
@@ -2832,6 +2835,30 @@ mod tests {
             .into_iter()
             .next()
             .expect("one queued entry")
+    }
+
+    #[tokio::test]
+    async fn batch_send_queue_keeps_the_entry_in_place_until_selection() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (entry, _submission) = BatchCommandsBuilder::entry(empty(41), 1, "");
+        let original = std::ptr::addr_of!(entry.priority) as usize;
+        sender.send(entry).await.unwrap();
+
+        let mut builder = BatchCommandsBuilder::new();
+        BatchRequestCollector::new()
+            .collect(&mut receiver, &mut builder, 1, 1, None)
+            .await
+            .unwrap();
+        let (direct, forwarded) = builder.build_with_limit(1);
+        let group = direct.unwrap();
+        assert!(forwarded.is_empty());
+        assert_eq!(group.request.request_ids.len(), 1);
+        assert!(group.entries[0].request.is_none());
+        assert_eq!(
+            std::ptr::addr_of!(group.entries[0].priority) as usize,
+            original,
+            "moving the batch request through the queue relocated its entry",
+        );
     }
 
     #[tokio::test]
