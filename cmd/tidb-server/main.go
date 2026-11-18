@@ -311,6 +311,7 @@ func initFlagSet() *flag.FlagSet {
 	starterAdditionalParams = fset.String(nmStarterParams, "", "starter additional params in k=v,k=v format")
 
 	session.RegisterMockUpgradeFlag(fset)
+	registerEmbeddedTiKVFlags(fset)
 	// Ignore errors; CommandLine is set for ExitOnError.
 	// nolint:errcheck
 	fset.Parse(os.Args[1:])
@@ -535,6 +536,7 @@ func main() {
 	keyspaceName := keyspace.GetKeyspaceNameBySettings()
 	executor.Start()
 	resourcemanager.InstanceResourceManager.Start()
+	startEmbeddedTiKV()
 	storage, dom, externalWorkloadManager, err := createStoreDDLOwnerMgrAndDomain(keyspaceName)
 	terror.MustNil(err)
 	repository.SetupRepository(dom)
@@ -558,6 +560,7 @@ func main() {
 		svr.Close()
 		resourcemanager.InstanceResourceManager.Stop()
 		cleanup(svr, storage, dom)
+		stopEmbeddedTiKV()
 		cpuprofile.StopCPUProfiler()
 		executor.Stop()
 		exitCode = exitCodeForSignal(sig)
