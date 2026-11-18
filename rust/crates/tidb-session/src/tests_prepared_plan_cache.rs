@@ -98,6 +98,43 @@ fn unchanged_session_reuses_the_prepared_plan_cache_environment() {
 }
 
 #[test]
+fn a_point_cache_lookup_reuses_the_unbound_environment_and_separates_bound_plans() {
+    let mut session = Session::new();
+    session
+        .run("CREATE TABLE point_binding (id BIGINT PRIMARY KEY, v BIGINT)")
+        .unwrap();
+    let prepared = session
+        .prepare_ast("SELECT v FROM point_binding WHERE id = ?")
+        .unwrap();
+    let plan = prepared.point_get_plan().unwrap();
+    let base = session.prepared_plan_cache_environment().unwrap();
+    let binding =
+        "SELECT /*+ USE_INDEX(point_binding, PRIMARY) */ v FROM point_binding WHERE id = ?";
+    for sql in [None, Some("")] {
+        let effective = session
+            .shared_plan_cache_environment_for_binding(sql)
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&base, &effective));
+    }
+    for (sql, hit) in [
+        (None, false),
+        (Some(binding), false),
+        (Some(binding), true),
+        (Some(""), true),
+    ] {
+        let bound = session
+            .bind_cached_prepared_point_get_for_binding(&plan, &[Datum::Int(1)], sql)
+            .unwrap();
+        assert_eq!(bound.cache_hit(), hit);
+    }
+    session.run("SET time_zone = '+00:00'").unwrap();
+    assert!(!session
+        .bind_cached_prepared_point_get_for_binding(&plan, &[Datum::Int(1)], None)
+        .unwrap()
+        .cache_hit());
+}
+
+#[test]
 fn cached_dml_binding_refuses_a_pinned_historical_read() {
     let mut session = Session::new();
     session

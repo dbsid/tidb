@@ -69,7 +69,7 @@ impl Session {
             return;
         }
         self.configure_session_plan_cache();
-        let Some(environment) = self.prepared_plan_cache_environment_for_binding(None) else {
+        let Some(environment) = self.shared_plan_cache_environment_for_binding(None) else {
             return;
         };
         let Ok(catalog) = self.lock_catalog() else {

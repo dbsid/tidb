@@ -110,10 +110,15 @@ struct PreparedPointCacheKey {
 }
 
 impl PreparedPointCacheKey {
-    fn matches(&self, actual: &Self) -> bool {
-        self.schema_version == actual.schema_version
-            && self.environment == actual.environment
-            && prepared_parameter_types_compatible(&self.parameter_types, &actual.parameter_types)
+    fn matches(
+        &self,
+        schema_version: u64,
+        environment: &PreparedPlanCacheEnvironment,
+        parameter_types: &[PreparedParameterType],
+    ) -> bool {
+        self.schema_version == schema_version
+            && &self.environment == environment
+            && prepared_parameter_types_compatible(&self.parameter_types, parameter_types)
     }
 }
 
@@ -223,24 +228,29 @@ impl PreparedPointGetPlan {
         zone: &tidb_datatype::SessionTimeZone,
         environment: &PreparedPlanCacheEnvironment,
     ) -> Option<PreparedPointGetExecution> {
-        let key = PreparedPointCacheKey {
-            schema_version: self.schema_version,
-            environment: environment.clone(),
-            parameter_types: values.iter().map(PreparedParameterType::of).collect(),
+        let parameter_types: Vec<_> = values.iter().map(PreparedParameterType::of).collect();
+        let contains_key = |entries: &[PreparedPointCacheKey], types: &[PreparedParameterType]| {
+            entries
+                .iter()
+                .any(|entry| entry.matches(self.schema_version, environment, types))
         };
         let cache_hit = self
             .cached_keys
             .lock()
             .ok()
-            .is_some_and(|cached| cached.iter().any(|entry| entry.matches(&key)));
+            .is_some_and(|cached| contains_key(&cached, &parameter_types));
         let execution = |handle, range_values, residuals| {
             // Go inserts a generated plan before building or opening its
             // executor. A runtime error therefore does not erase the plan or
             // turn the next identical EXECUTE into another miss.
             if !cache_hit {
                 let mut cached = self.cached_keys.lock().ok()?;
-                if !cached.iter().any(|entry| entry.matches(&key)) {
-                    cached.push(key.clone());
+                if !contains_key(&cached, &parameter_types) {
+                    cached.push(PreparedPointCacheKey {
+                        schema_version: self.schema_version,
+                        environment: environment.clone(),
+                        parameter_types,
+                    });
                 }
             }
             Some(PreparedPointGetExecution {

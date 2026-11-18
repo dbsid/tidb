@@ -303,20 +303,35 @@ pub trait PreparedAstCompile: super::CompilerSession {
         environment
     }
 
+    /// Returns the session's cached environment when no SQL binding matched.
+    /// A nonempty binding has its own cache key (Go `newPlanCacheKeyWithMatchedBinding`).
+    fn shared_plan_cache_environment_for_binding(
+        &self,
+        binding_sql: Option<&str>,
+    ) -> Option<Arc<crate::PreparedPlanCacheEnvironment>> {
+        let environment = self.prepared_plan_cache_environment()?;
+        let Some(sql) = binding_sql.filter(|sql| !sql.is_empty()) else {
+            return Some(environment);
+        };
+        let skip_stats = self
+            .session_vars()
+            .get_system(tidb_vardef::tidb_vars::TIDB_PLAN_CACHE_SKIP_STATS_ON_BINDING)
+            .as_deref()
+            != Ok("OFF");
+        Some(Arc::new(
+            environment
+                .as_ref()
+                .clone()
+                .with_binding_sql(Some(sql), skip_stats),
+        ))
+    }
+
     fn prepared_plan_cache_environment_for_binding(
         &self,
         binding_sql: Option<&str>,
     ) -> Option<crate::PreparedPlanCacheEnvironment> {
-        let environment = self.prepared_plan_cache_environment()?;
-        Some(
-            environment.as_ref().clone().with_binding_sql(
-                binding_sql,
-                self.session_vars()
-                    .get_system(tidb_vardef::tidb_vars::TIDB_PLAN_CACHE_SKIP_STATS_ON_BINDING)
-                    .as_deref()
-                    != Ok("OFF"),
-            ),
-        )
+        self.shared_plan_cache_environment_for_binding(binding_sql)
+            .map(Arc::unwrap_or_clone)
     }
 
     /// Go `GeneratePlanCacheStmtWithAST`'s refusal note for a protocol-level
@@ -534,7 +549,7 @@ pub trait PreparedAstCompile: super::CompilerSession {
         if !self.can_reuse_prepared_point_get(plan) {
             return None;
         }
-        let environment = self.prepared_plan_cache_environment_for_binding(binding_sql)?;
+        let environment = self.shared_plan_cache_environment_for_binding(binding_sql)?;
         plan.bind_with_environment(values, &self.session_time_zone(), &environment)
     }
 
@@ -569,8 +584,7 @@ pub trait PreparedAstCompile: super::CompilerSession {
         {
             return Ok(None);
         }
-        let Some(environment) = self.prepared_plan_cache_environment_for_binding(binding_sql)
-        else {
+        let Some(environment) = self.shared_plan_cache_environment_for_binding(binding_sql) else {
             return Ok(None);
         };
         self.configure_session_plan_cache();
@@ -670,8 +684,7 @@ pub trait PreparedAstCompile: super::CompilerSession {
         {
             return Ok(None);
         }
-        let Some(environment) = self.prepared_plan_cache_environment_for_binding(binding_sql)
-        else {
+        let Some(environment) = self.shared_plan_cache_environment_for_binding(binding_sql) else {
             return Ok(None);
         };
         self.configure_session_plan_cache();

@@ -1100,8 +1100,7 @@ pub trait NonPreparedPlanCacheCompile: super::CompilerSession {
         if !self.non_prepared_plan_cache_allowed(effective_statement) {
             return Ok(None);
         }
-        let Some(environment) = self.prepared_plan_cache_environment_for_binding(binding_sql)
-        else {
+        let Some(environment) = self.shared_plan_cache_environment_for_binding(binding_sql) else {
             return Ok(None);
         };
         let lookup_start = std::time::Instant::now();
@@ -1224,8 +1223,7 @@ pub trait NonPreparedPlanCacheCompile: super::CompilerSession {
             return Ok(None);
         }
         let lookup_start = std::time::Instant::now();
-        let Some(environment) = self.prepared_plan_cache_environment_for_binding(binding_sql)
-        else {
+        let Some(environment) = self.shared_plan_cache_environment_for_binding(binding_sql) else {
             return Ok(None);
         };
         let (plan, requests) = match self.non_prepared_plan_cache_mut().get(&parameterized.key) {
