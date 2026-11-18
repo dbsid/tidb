@@ -273,11 +273,11 @@ fn shared_context_preserves_resource_control_penalty() {
         context: Some(kvrpcpb::Context {
             resource_control_context: Some(kvrpcpb::ResourceControlContext {
                 resource_group_name: "foreground".into(),
-                penalty: Some(resource_manager::Consumption {
+                penalty: Some(Box::new(resource_manager::Consumption {
                     r_r_u: 3.5,
                     w_r_u: 7.0,
                     ..Default::default()
-                }),
+                })),
                 override_priority: 17,
             }),
             ..Default::default()

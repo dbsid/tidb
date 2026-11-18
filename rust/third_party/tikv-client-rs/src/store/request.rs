@@ -944,7 +944,7 @@ macro_rules! impl_request {
                     .get_or_insert_with(kvrpcpb::Context::default)
                     .resource_control_context
                     .get_or_insert_with(kvrpcpb::ResourceControlContext::default)
-                    .penalty = penalty;
+                    .penalty = penalty.map(Box::new);
             }
 
             fn set_resource_control_priority_if_unset(&mut self, priority: u64) {
@@ -1533,7 +1533,7 @@ impl Request for coprocessor::Request {
         &mut self,
         penalty: Option<crate::proto::resource_manager::Consumption>,
     ) {
-        context_resource_control(&mut self.context).penalty = penalty;
+        context_resource_control(&mut self.context).penalty = penalty.map(Box::new);
     }
 
     fn set_resource_control_priority_if_unset(&mut self, priority: u64) {
@@ -1675,7 +1675,7 @@ impl Request for CoprocessorStreamRequest {
         &mut self,
         penalty: Option<crate::proto::resource_manager::Consumption>,
     ) {
-        context_resource_control(&mut self.request.context).penalty = penalty;
+        context_resource_control(&mut self.request.context).penalty = penalty.map(Box::new);
     }
 
     fn set_resource_control_priority_if_unset(&mut self, priority: u64) {
@@ -1831,7 +1831,7 @@ impl Request for BatchCoprocessorStreamRequest {
         &mut self,
         penalty: Option<crate::proto::resource_manager::Consumption>,
     ) {
-        context_resource_control(&mut self.request.context).penalty = penalty;
+        context_resource_control(&mut self.request.context).penalty = penalty.map(Box::new);
     }
 
     fn set_resource_control_priority_if_unset(&mut self, priority: u64) {

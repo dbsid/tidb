@@ -2216,8 +2216,10 @@ pub struct ResourceControlContext {
     pub resource_group_name: ::prost::alloc::string::String,
     /// The resource consumption of the resource group that have completed at all TiKVs between the previous request to this TiKV and current request.
     /// It's used as penalty to make the local resource scheduling on one TiKV takes the gloabl resource consumption into consideration.
-    #[prost(message, optional, tag = "2")]
-    pub penalty: ::core::option::Option<super::resource_manager::Consumption>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub penalty: ::core::option::Option<
+        ::prost::alloc::boxed::Box<super::resource_manager::Consumption>,
+    >,
     /// This priority would override the original priority of the resource group for the request.
     /// Used to deprioritize the runaway queries.
     #[prost(uint64, tag = "3")]

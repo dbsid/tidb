@@ -52,6 +52,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kv_request_context_keeps_the_optional_resource_penalty_behind_a_pointer() {
+        use std::mem::{size_of, size_of_val};
+
+        let absent = super::kvrpcpb::ResourceControlContext::default();
+        assert_eq!(
+            size_of_val(&absent.penalty),
+            size_of::<usize>(),
+            "every request context reserved space for an absent consumption report",
+        );
+        assert!(absent.encode_to_vec().is_empty());
+
+        // resource_control_context.penalty with one read request unit.
+        let wire = [0x12, 9, 0x09, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f];
+        let present = super::kvrpcpb::ResourceControlContext::decode(wire.as_slice()).unwrap();
+        assert_eq!(present.penalty.as_ref().unwrap().r_r_u, 1.0);
+        assert_eq!(present.encode_to_vec(), wire);
+    }
+
     fn identity() -> apipb::KeyspaceIdentity {
         apipb::KeyspaceIdentity {
             namespace_id: 1,

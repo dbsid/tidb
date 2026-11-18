@@ -31,6 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".kvrpcpb.TiFlashSystemTableResponse.data",
     ]);
 
+    // client-go attaches a *Consumption only after resource-control
+    // admission. Most request contexts have no penalty report.
+    prost.boxed(".kvrpcpb.ResourceControlContext.penalty");
+
     // Go's generated messages hold these optional sub-messages as pointers.
     // Inline, a region error (576 bytes), a key error (824) and the execution
     // details (680) made every response that carries them over 2 KB -- a
