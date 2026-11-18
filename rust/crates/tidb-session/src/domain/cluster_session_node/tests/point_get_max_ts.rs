@@ -265,6 +265,11 @@ fn a_prepared_point_get_takes_no_timestamp_either() {
         let outcome = session
             .node_conn().execute_general(&statement, &[PreparedValue::SignedLongLong(2)])
             .expect("execute");
+        // decideTxnMode reads the definition retained by binary PREPARE.
+        assert!(crate::txn::TXN_MODE_STATEMENT.with(|seen| {
+            std::ptr::eq(seen.get(), statement.template().expect("retained statement"))
+        }));
+
         let GeneralExecuteOutcome::Rows(mut result) = outcome else {
             panic!("a query must answer with rows");
         };

@@ -285,6 +285,12 @@ pub(crate) fn server_status_2_str(in_trans: bool, autocommit: bool) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TXN_MODE_STATEMENT: std::cell::Cell<*const Stmt> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
 impl Session {
     /// Go `SessionVars.IsAutocommit()`: whether each statement stands on its
     /// own, or joins a transaction the session keeps open for it.
@@ -417,6 +423,8 @@ impl Session {
     /// (`isDMLStatement`). The answer stands until the next statement, as
     /// Go's `TxnCtx` does.
     pub(crate) fn decide_autocommit_statement_txn_mode(&mut self, stmt: &Stmt) {
+        #[cfg(test)]
+        TXN_MODE_STATEMENT.with(|seen| seen.set(std::ptr::from_ref(stmt)));
         let pessimistic = !self.in_transaction()
             && self.is_autocommit()
             && !self.vars.restricted_sql

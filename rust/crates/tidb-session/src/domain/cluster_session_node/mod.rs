@@ -2035,11 +2035,8 @@ impl<'s> ClusterServerSession<'s> {
         self.session.restore_statement_variables();
         self.session.reset_plan_cache_tracker();
         // Go `PrepareTxnCtx`'s `decideTxnMode`, before the statement plans.
-        match statement.prepared_ast() {
-            Some(prepared) => {
-                let stmt = prepared.statement().clone();
-                self.session.decide_autocommit_statement_txn_mode(&stmt);
-            }
+        match statement.template() {
+            Some(stmt) => self.session.decide_autocommit_statement_txn_mode(stmt),
             None => self.session.set_autocommit_pessimistic_statement(false),
         }
         // Go `ExecutePreparedStmt` runs `ExecuteStmt`: `Compile`'s fresh
