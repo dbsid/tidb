@@ -323,7 +323,7 @@ impl<S: NativeCopStore + ?Sized> QueryTransport for NativeCopTransport<S> {
                 .map_err(|error| error.to_string())?,
         };
         let runtime = CopReadTaskRuntime::prepare_for_transport(
-            &coordinator_metadata,
+            coordinator_metadata,
             &topology,
             cache,
             self.config.read_engine_generation,
@@ -333,8 +333,7 @@ impl<S: NativeCopStore + ?Sized> QueryTransport for NativeCopTransport<S> {
         build_cop_tasks.end();
         let build_task_elapsed = build_started.elapsed();
         let keep_order = metadata.keep_order;
-        let mut metadata = runtime.request_metadata().clone();
-        metadata.keep_order = keep_order;
+        let metadata = runtime.request_metadata();
         let mut logical_order = Vec::new();
         let mut active_attempts = BTreeMap::new();
         for (attempt_id, task) in runtime.initial_tasks() {
@@ -370,7 +369,7 @@ impl<S: NativeCopStore + ?Sized> QueryTransport for NativeCopTransport<S> {
             kv_context,
             variables: request.variables(),
             timeout,
-            metadata: Arc::new(metadata),
+            keep_order,
             runtime,
             logical_order,
             active_attempts,
@@ -435,7 +434,9 @@ pub struct NativeCopResponse<S: ?Sized> {
     kv_context: tidb_txnkv::StatementKvContext,
     variables: Option<Arc<tikv_client::Variables>>,
     timeout: Duration,
-    metadata: Arc<tidb_txnkv::KvRequestMetadata>,
+    /// The caller's ordering across tasks. The coordinator always delivers
+    /// each individual task's responses in order.
+    keep_order: bool,
     runtime: CopReadTaskRuntime,
     logical_order: Vec<u64>,
     active_attempts: BTreeMap<u64, u64>,
@@ -464,7 +465,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
     /// `it.store.CheckVisibility(it.req.StartTs)` proves GC has not passed the
     /// read's timestamp; checking after the read is what makes it sound.
     fn check_visibility(&mut self) -> Result<(), QueryResponseError> {
-        match self.store.check_visibility(self.metadata.start_ts) {
+        match self.store.check_visibility(self.runtime.request_metadata().start_ts) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.closed = true;
@@ -542,14 +543,14 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             .ok_or_else(|| "active task has no read-byte prediction".to_owned())?;
         let mut request = build_tikv_unary_request(
             &prepared,
-            &self.metadata,
+            self.runtime.request_metadata(),
             predicted_read_bytes,
             self.trace.as_ref(),
             self.cluster_id,
         )
         .map_err(|error| error.to_string())?;
         // Go `handleTaskOnce`: `RunawayChecker.BeforeCopRequest(req)`.
-        if let Some(checker) = &self.metadata.runaway_checker {
+        if let Some(checker) = &self.runtime.request_metadata().runaway_checker {
             checker.before_cop_request(&mut request.context).map_err(NativeCopError::Terror)?;
         }
         // Go `ClientHelper.SendReqCtx` stamps both lock sets on every send.
@@ -573,7 +574,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             Some(Arc::clone(&req_stats)),
         );
         // Go `err = worker.req.RunawayChecker.CheckThresholds(nil, 0, err)`.
-        let sent = match (sent, &self.metadata.runaway_checker) {
+        let sent = match (sent, &self.runtime.request_metadata().runaway_checker) {
             (Err(error), Some(checker)) => match checker.check_thresholds(None, 0, Some(&error.to_string())) {
                 Some(runaway) => return Err(NativeCopError::Terror(runaway)),
                 None => return Err(error.into()),
@@ -625,7 +626,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
         )?;
         // Go `handleCopResponse`'s last step: the statement's RU details and
         // this response's processed keys against the thresholds.
-        if let Some(checker) = &self.metadata.runaway_checker {
+        if let Some(checker) = &self.runtime.request_metadata().runaway_checker {
             if let Some(runaway) =
                 checker.check_thresholds(self.kv_context.ru_details.as_deref(), processed_keys, None)
             {
@@ -884,7 +885,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             backoffer,
             context,
             lock,
-            self.metadata.start_ts,
+            self.runtime.request_metadata().start_ts,
             &self.kv_context,
         )?;
         self.snapshot_locks
@@ -1020,7 +1021,7 @@ impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
         self.closed = true;
         // Go: the runaway checker counts every task's processed keys of one
         // read; the next read starts from zero.
-        if let Some(checker) = &self.metadata.runaway_checker {
+        if let Some(checker) = &self.runtime.request_metadata().runaway_checker {
             checker.reset_total_processed_keys();
         }
         Ok(())
@@ -1031,7 +1032,7 @@ impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
     /// small tasks get (`smallTaskConcurrency`).
     fn cop_info(&self) -> Option<tidb_txnkv::CopInfo> {
         let tasks = self.logical_order.len();
-        let use_row_hints = !self.metadata.request_source.internal;
+        let use_row_hints = !self.runtime.request_metadata().request_source.internal;
         let small = if use_row_hints {
             self.runtime.small_task_count()
         } else {
@@ -1041,7 +1042,7 @@ impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
             small,
             tidb_txnkv::rpc::go_max_procs(),
         );
-        let mut concurrency = usize::try_from(self.metadata.concurrency)
+        let mut concurrency = usize::try_from(self.runtime.request_metadata().concurrency)
             .unwrap_or(1)
             .min(tasks);
         if tasks - small.min(tasks) < concurrency {
@@ -1053,7 +1054,7 @@ impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
             concurrency = 1;
             extra = 0;
         }
-        if self.metadata.keep_order {
+        if self.keep_order {
             extra = extra.min(20);
         }
         Some(tidb_txnkv::CopInfo {
@@ -1073,7 +1074,7 @@ impl<S: NativeCopStore + ?Sized> tidb_txnkv::Response for NativeCopResponse<S> {
 impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
     /// Go `copIterator`'s `RunawayChecker.CheckAction() == CoolDown`.
     fn cooled_down(&self) -> bool {
-        self.metadata
+        self.runtime.request_metadata()
             .runaway_checker
             .as_ref()
             .is_some_and(|checker| checker.check_action() == tidb_proto::resource_manager::RunawayAction::CoolDown)
@@ -1104,14 +1105,14 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopTaskSource for NativeCo
 
 impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopWorkerSource for NativeCopResponse<S> {
     fn keep_order(&self) -> bool {
-        self.metadata.keep_order
+        self.keep_order
     }
 
     fn concurrency(&self) -> usize {
         if self.cooled_down() {
             return 1;
         }
-        usize::try_from(self.metadata.concurrency)
+        usize::try_from(self.runtime.request_metadata().concurrency)
             .unwrap_or(1)
             .max(1)
     }
@@ -1121,7 +1122,7 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopWorkerSource for Native
     }
 
     fn use_row_hints(&self) -> bool {
-        !self.metadata.request_source.internal
+        !self.runtime.request_metadata().request_source.internal
     }
 
     fn start_worker(&mut self) {}
@@ -1133,8 +1134,9 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopWorkerSource for Native
         if self.logical_order.is_empty() {
             return Vec::new();
         }
-        if self.metadata.concurrency <= 1
-            && (self.metadata.request_source.internal || !self.runtime.has_small_tasks())
+        if self.runtime.request_metadata().concurrency <= 1
+            && (self.runtime.request_metadata().request_source.internal
+                || !self.runtime.has_small_tasks())
         {
             return vec![self];
         }
@@ -1153,7 +1155,7 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopWorkerSource for Native
                 kv_context: self.kv_context.clone(),
                 variables: self.variables.clone(),
                 timeout: self.timeout,
-                metadata: Arc::clone(&self.metadata),
+                keep_order: self.keep_order,
                 runtime,
                 logical_order: vec![logical_task_id],
                 active_attempts: self

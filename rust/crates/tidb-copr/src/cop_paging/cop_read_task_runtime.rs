@@ -508,7 +508,7 @@ impl CopReadTaskRuntime {
     }
 
     pub(super) fn prepare_for_transport(
-        metadata: &KvRequestMetadata,
+        metadata: KvRequestMetadata,
         topology: &[RegionTaskTopology],
         cache: Option<CoprCache>,
         generation: ReadEngineGeneration,
@@ -531,7 +531,7 @@ impl CopReadTaskRuntime {
             metadata.store_batch_size = 0;
         }
         Self::prepare_inner(
-            &metadata,
+            metadata,
             topology,
             cache,
             generation,
@@ -541,16 +541,15 @@ impl CopReadTaskRuntime {
     }
 
     fn prepare_inner(
-        metadata: &KvRequestMetadata,
+        mut metadata: KvRequestMetadata,
         topology: &[RegionTaskTopology],
         cache: Option<CoprCache>,
         generation: ReadEngineGeneration,
         seed_read_bytes: u64,
         deferred: bool,
     ) -> Result<Self, CopReadTaskError> {
-        validate_request(metadata)?;
+        validate_request(&metadata)?;
         validate_topology(topology)?;
-        let mut metadata = metadata.clone();
         let envelopes =
             build_region_tasks(&metadata, topology).ok_or(CopReadTaskError::InvalidTopology)?;
 
@@ -1553,14 +1552,20 @@ mod tests {
             }])
             .into(),
         );
+        let payload = metadata.data.as_ref().unwrap().as_ptr();
         let mut runtime = CopReadTaskRuntime::prepare_for_transport(
-            &metadata,
+            metadata,
             &topology,
             None,
             ReadEngineGeneration::Classic,
             0,
         )
         .unwrap();
+        assert_eq!(
+            runtime.request_metadata().data.as_ref().unwrap().as_ptr(),
+            payload,
+            "transport copied the coordinator's owned DAG payload",
+        );
         assert_eq!(runtime.tasks.len(), 64);
         assert!(
             runtime.prepared.is_empty(),
@@ -1571,7 +1576,7 @@ mod tests {
         assert_eq!(first.logical_task_id(), 1);
         assert_eq!(
             first.request().data.as_ref(),
-            metadata.data.as_ref().unwrap()
+            runtime.request_metadata().data.as_ref().unwrap()
         );
         assert_eq!(first.request().ranges, first.task().ranges);
         assert!(Arc::ptr_eq(&first, &runtime.activate_attempt(1).unwrap()));
