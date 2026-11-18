@@ -23,6 +23,7 @@
 
 use crate::CollationCollator;
 use std::cmp::Ordering;
+use std::sync::LazyLock;
 
 use super::{decimal_from_bytes, Datum, DatumValueError};
 use crate::{
@@ -30,6 +31,9 @@ use crate::{
     Collation, ConversionContext, CoreTime, Decimal, MySqlDuration, SessionTimeZone, Time,
     TimeType, VectorFloat32,
 };
+
+// Go's default type context shares time.UTC across comparisons.
+static DEFAULT_COMPARISON_ZONE: LazyLock<SessionTimeZone> = LazyLock::new(SessionTimeZone::utc);
 
 impl Datum {
     /// Compares the source-defined NULL/range-sentinel part of `Datum.Compare`.
@@ -56,7 +60,7 @@ impl Datum {
     /// mixed numeric, string, temporal, enum/set, binary-literal, and JSON
     /// comparisons because the right operand selects the conversion domain.
     pub fn compare(&self, other: &Self, comparer: Collation) -> Result<Ordering, DatumValueError> {
-        self.compare_in(other, comparer, true, false, &SessionTimeZone::utc())
+        self.compare_in(other, comparer, true, false, &DEFAULT_COMPARISON_ZONE)
     }
 
     /// Source `Datum.Compare` with statement conversion flags and location.
@@ -170,8 +174,7 @@ impl Datum {
         other: &Self,
         comparer: Collation,
     ) -> (Ordering, Option<DatumValueError>) {
-        let timezone = SessionTimeZone::utc();
-        match self.compare_in(other, comparer, true, false, &timezone) {
+        match self.compare_in(other, comparer, true, false, &DEFAULT_COMPARISON_ZONE) {
             Ok(ordering) => (
                 ordering,
                 string_comparison_event(self, other).map(DatumValueError::Comparison),
@@ -800,6 +803,16 @@ mod tests {
         );
         let right = Datum::new_string_datum("2020-01-01 00:00:00+01:00");
         let context = ConversionContext::strict();
+
+        // Both context-free forms use UTC when parsing an explicit offset.
+        assert_eq!(
+            left.compare(&right, Collation::Binary).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            left.compare_with_error(&right, Collation::Binary),
+            (std::cmp::Ordering::Greater, None)
+        );
 
         let (ordering, error) =
             left.compare_with_context(&right, Collation::Binary, &context, &utc);
