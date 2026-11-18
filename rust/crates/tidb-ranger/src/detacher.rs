@@ -1592,13 +1592,13 @@ impl RangeDetacher<'_> {
     }
 
     /// Go `detachDNFCondAndBuildRangeForIndex` (`detacher.go:849`).
-    fn detach_dnf(
+    fn detach_dnf<'e>(
         &mut self,
-        condition: &tidb_expr::scalar_function::ScalarFunction,
+        condition: &'e tidb_expr::scalar_function::ScalarFunction,
     ) -> Result<
         (
             super::types::Ranges,
-            Vec<Expression>,
+            Vec<DnfAccessArm<'e>>,
             Vec<Option<ValueInfo>>,
             bool,
             i64,
@@ -1634,7 +1634,7 @@ impl RangeDetacher<'_> {
                     unreachable!("matched above");
                 };
                 let cnf_items = flatten_cnf_conditions_ref(sf);
-                let mut res = self.detach_cnf(&cnf_items, true)?;
+                let res = self.detach_cnf(&cnf_items, true)?;
                 // An always-false DNF item is skipped.
                 if res.ranges.is_empty() {
                     continue;
@@ -1664,13 +1664,7 @@ impl RangeDetacher<'_> {
                     ));
                 }
                 let access_len = res.access_conds.len() as i64;
-                // Move the arm's access conds into the compose: the clone this
-                // replaces ran once per DNF arm per EXECUTE on the rebuild path.
-                if let Some(composed) = tidb_expr::simple_expr::compose_cnf_condition(
-                    std::mem::take(&mut res.access_conds),
-                ) {
-                    new_access_items.push(composed);
-                }
+                new_access_items.push(DnfAccessArm::Conjunction(res.access_conds));
                 if i == 0 {
                     column_values = res.column_values;
                 } else {
@@ -1736,7 +1730,7 @@ impl RangeDetacher<'_> {
                         -1,
                     ));
                 }
-                new_access_items.push((*item).clone());
+                new_access_items.push(DnfAccessArm::Single(item));
                 if i == 0 {
                     column_values[0] = extract_value_info(item);
                 } else if column_values[0].is_some() {
@@ -1751,11 +1745,9 @@ impl RangeDetacher<'_> {
             }
         }
         let total_ranges = super::ranger::union_ranges(total_ranges, self.merge_consecutive)?;
-        let access = tidb_expr::simple_expr::compose_dnf_condition(new_access_items)
-            .map_or_else(Vec::new, |composed| vec![composed]);
         Ok((
             total_ranges,
-            access,
+            new_access_items,
             column_values,
             has_residual,
             min_access_conds,
@@ -1768,26 +1760,22 @@ impl RangeDetacher<'_> {
         all_conds: &[Expression],
     ) -> Result<DetachRangeResult, super::points::PointBuilderError> {
         let mut res = DetachRangeResult::default();
-        if all_conds.len() == 1 {
-            if let Expression::ScalarFunction(sf) = &all_conds[0] {
-                if sf.func_name.lowercase() == "or" {
-                    let (ranges, accesses, column_values, has_residual, min_access_conds) =
-                        self.detach_dnf(sf)?;
-                    res.ranges = ranges;
-                    res.access_conds = accesses;
-                    res.column_values = column_values;
-                    res.is_dnf_cond = true;
-                    if min_access_conds != -1 {
-                        res.min_access_conds_for_dnf_cond = min_access_conds;
-                    }
-                    // A DNF with an uncomputable part pushes WHOLE as
-                    // filter.
-                    if has_residual {
-                        res.remained_conds = all_conds.to_vec();
-                    }
-                    return Ok(res);
-                }
+        if let Some(sf) = single_dnf_condition(all_conds) {
+            let (ranges, accesses, column_values, has_residual, min_access_conds) =
+                self.detach_dnf(sf)?;
+            res.ranges = ranges;
+            res.access_conds = compose_dnf_access(accesses);
+            res.column_values = column_values;
+            res.is_dnf_cond = true;
+            if min_access_conds != -1 {
+                res.min_access_conds_for_dnf_cond = min_access_conds;
             }
+            // A DNF with an uncomputable part pushes WHOLE as
+            // filter.
+            if has_residual {
+                res.remained_conds = all_conds.to_vec();
+            }
+            return Ok(res);
         }
         self.detach_cnf(all_conds, true)
     }
@@ -1832,6 +1820,117 @@ pub fn detach_cond_and_build_range_for_index_in(
         None,
         options,
     )
+}
+
+fn single_dnf_condition(
+    conditions: &[Expression],
+) -> Option<&tidb_expr::scalar_function::ScalarFunction> {
+    match conditions {
+        [Expression::ScalarFunction(sf)] if sf.func_name.lowercase() == "or" => Some(sf),
+        _ => None,
+    }
+}
+
+// Keep the exact access terms until the detacher knows every arm was usable.
+// Ordinary planning needs the expression. A cache rebuild only checks its count.
+enum DnfAccessArm<'a> {
+    Single(&'a Expression),
+    Conjunction(Vec<Expression>),
+}
+
+fn compose_dnf_access(arms: Vec<DnfAccessArm<'_>>) -> Vec<Expression> {
+    #[cfg(test)]
+    DNF_ACCESS_TREES.with(|count| count.set(count.get() + 1));
+    let mut terms = Vec::with_capacity(arms.len());
+    terms.extend(arms.into_iter().filter_map(|arm| match arm {
+        DnfAccessArm::Single(predicate) => Some(predicate.clone()),
+        DnfAccessArm::Conjunction(predicates) => compose_cnf_condition(predicates),
+    }));
+    compose_dnf_condition(terms).into_iter().collect()
+}
+
+fn dnf_access_count(arms: Vec<DnfAccessArm<'_>>) -> usize {
+    // For integer-returning predicates, both wrapWithIsTrue and WrapWithCastAsInt
+    // pass their operand through. AND/OR accept each pair without a conversion,
+    // so a nonempty tree contributes exactly one access condition. For other
+    // types use the ordinary constructor, including its possible None result.
+    let is_integer_predicate = |expr: &Expression| {
+        matches!(expr, Expression::ScalarFunction(_))
+            && expr
+                .static_type()
+                .is_some_and(|tp| tp.eval_type() == tidb_datatype::EvalType::Int)
+    };
+    if arms.iter().all(|arm| match arm {
+        DnfAccessArm::Single(predicate) => is_integer_predicate(predicate),
+        DnfAccessArm::Conjunction(predicates) => {
+            !predicates.is_empty() && predicates.iter().all(is_integer_predicate)
+        }
+    }) {
+        usize::from(!arms.is_empty())
+    } else {
+        compose_dnf_access(arms).len()
+    }
+}
+
+/// Range data consumed by Go `isSafeRange` when rebuilding a cached index plan.
+pub struct RebuiltIndexRanges {
+    /// Key ranges for this execution.
+    pub ranges: super::types::Ranges,
+    /// Number of detached access conditions.
+    pub access_count: usize,
+    /// Number of residual predicates that still need evaluation.
+    pub remained_count: usize,
+    /// Reason produced by detachment for skipping this plan-cache entry.
+    pub skip_plan_cache_reason: Option<String>,
+}
+
+impl From<DetachRangeResult> for RebuiltIndexRanges {
+    fn from(result: DetachRangeResult) -> Self {
+        Self {
+            ranges: result.ranges,
+            access_count: result.access_conds.len(),
+            remained_count: result.remained_conds.len(),
+            skip_plan_cache_reason: result.skip_plan_cache_reason,
+        }
+    }
+}
+
+/// Rebuilds the ranges and condition counts checked by a cached index plan.
+pub fn rebuild_index_ranges(
+    conditions: &[Expression],
+    cols: &[tidb_expr::column::Column],
+    lengths: &[i64],
+    range_max_size: i64,
+    eval_expression: &ExpressionEvaluator<'_>,
+    options: RangerOptions,
+) -> Result<RebuiltIndexRanges, super::points::PointBuilderError> {
+    let mut detacher = range_detacher(
+        cols,
+        lengths,
+        range_max_size,
+        true,
+        true,
+        eval_expression,
+        None,
+        options,
+    );
+    if let Some(condition) = single_dnf_condition(conditions) {
+        let (ranges, arms, _, has_residual, _) = detacher.detach_dnf(condition)?;
+        return Ok(RebuiltIndexRanges {
+            ranges,
+            access_count: dnf_access_count(arms),
+            remained_count: usize::from(has_residual),
+            skip_plan_cache_reason: detacher.skip_plan_cache_reason,
+        });
+    }
+    let mut result = RebuiltIndexRanges::from(detacher.detach_cnf(conditions, true)?);
+    result.skip_plan_cache_reason = detacher.skip_plan_cache_reason;
+    Ok(result)
+}
+
+#[cfg(test)]
+thread_local! {
+    static DNF_ACCESS_TREES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Builds index ranges with the statement's shared quota-fallback handler.
@@ -1950,6 +2049,31 @@ fn detach_cond_and_build_range(
     range_fallback_handler: Option<&tidb_context::RangeFallbackHandler>,
     options: RangerOptions,
 ) -> Result<DetachRangeResult, super::points::PointBuilderError> {
+    let mut detacher = range_detacher(
+        cols,
+        lengths,
+        range_max_size,
+        convert_to_sort_key,
+        merge_consecutive,
+        eval_expression,
+        range_fallback_handler,
+        options,
+    );
+    let mut res = detacher.detach_cond_and_build_range_for_cols(conditions)?;
+    res.skip_plan_cache_reason = detacher.skip_plan_cache_reason;
+    Ok(res)
+}
+
+fn range_detacher<'a>(
+    cols: &'a [tidb_expr::column::Column],
+    lengths: &'a [i64],
+    range_max_size: i64,
+    convert_to_sort_key: bool,
+    merge_consecutive: bool,
+    eval_expression: &'a ExpressionEvaluator<'a>,
+    range_fallback_handler: Option<&'a tidb_context::RangeFallbackHandler>,
+    options: RangerOptions,
+) -> RangeDetacher<'a> {
     let new_tp_slice: Vec<tidb_datatype::FieldType> = cols
         .iter()
         .map(|col| {
@@ -1958,7 +2082,7 @@ fn detach_cond_and_build_range(
             }))
         })
         .collect();
-    let mut detacher = RangeDetacher {
+    RangeDetacher {
         eval_expression,
         cols,
         lengths,
@@ -1972,10 +2096,7 @@ fn detach_cond_and_build_range(
         skip_plan_cache_reason: None,
         fix_44389: options.fix_44389,
         fix_54337: options.fix_54337,
-    };
-    let mut res = detacher.detach_cond_and_build_range_for_cols(conditions)?;
-    res.skip_plan_cache_reason = detacher.skip_plan_cache_reason;
-    Ok(res)
+    }
 }
 
 /// Go `MergeDNFItems4Col` (`detacher.go:1191`): group single-column DNF
@@ -2401,6 +2522,106 @@ mod tests {
         assert_eq!(res.remained_conds.len(), 1);
         assert_eq!(res.ranges.len(), 1);
         assert_eq!(res.ranges[0].to_display_string(), "[NULL,+inf]");
+    }
+
+    #[test]
+    fn cached_dnf_rebuild_counts_access_without_composing_an_unused_tree() {
+        let column = int_column(1);
+        let arm = |low, high| {
+            func(
+                "and",
+                vec![
+                    func(
+                        "ge",
+                        vec![Expression::Column(column.clone()), int_const(low)],
+                    ),
+                    func(
+                        "le",
+                        vec![Expression::Column(column.clone()), int_const(high)],
+                    ),
+                ],
+            )
+        };
+        let inputs = [func("or", vec![arm(10, 15), arm(20, 25)])];
+        let cols = [column];
+        let full = detach_cond_and_build_range_for_index(&inputs, &cols, &[-1], 0).unwrap();
+        assert_eq!(full.access_conds.len(), 1);
+        DNF_ACCESS_TREES.with(|count| count.set(0));
+        let rebuilt = rebuild_index_ranges(
+            &inputs,
+            &cols,
+            &[-1],
+            0,
+            &crate::points::evaluate_static,
+            RangerOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.ranges, full.ranges);
+        assert_eq!(rebuilt.access_count, full.access_conds.len());
+        assert_eq!(rebuilt.remained_count, full.remained_conds.len());
+        assert_eq!(rebuilt.skip_plan_cache_reason, full.skip_plan_cache_reason);
+        assert_eq!(
+            DNF_ACCESS_TREES.with(std::cell::Cell::get),
+            0,
+            "cached range rebuild composed an unused access tree"
+        );
+    }
+
+    #[test]
+    fn cached_index_ranges_preserve_fallbacks_and_residuals() {
+        let indexed = int_column(1);
+        let other = int_column(2);
+        let compare = |name: &str, col: &Column, value: i64| {
+            func(
+                name,
+                vec![Expression::Column(col.clone()), int_const(value)],
+            )
+        };
+        let a = compare("ge", &indexed, 12);
+        let b = compare("lt", &indexed, 15);
+        let c = compare("eq", &other, 42);
+        let impossible = func("and", vec![a.clone(), compare("le", &indexed, 5)]);
+        let partial = func("and", vec![b.clone(), c.clone()]);
+        let null = func(
+            "eq",
+            vec![
+                Expression::Column(indexed.clone()),
+                Expression::Constant(tidb_expr::constant::Constant::new_null()),
+            ],
+        );
+        let cases = [
+            vec![],
+            vec![a.clone(), c.clone()],
+            vec![func("or", vec![a.clone(), b.clone()])],
+            vec![func("or", vec![a.clone(), c])],
+            vec![func("or", vec![partial, impossible.clone()])],
+            vec![func("or", vec![impossible.clone(), impossible])],
+            vec![func("or", vec![null, b])],
+            vec![func("or", vec![Expression::Column(indexed.clone()), a])],
+        ];
+        for conditions in cases {
+            for quota in [0, 1] {
+                let cols = std::slice::from_ref(&indexed);
+                let reference =
+                    detach_cond_and_build_range_for_index(&conditions, cols, &[-1], quota).unwrap();
+                let actual = rebuild_index_ranges(
+                    &conditions,
+                    cols,
+                    &[-1],
+                    quota,
+                    &crate::points::evaluate_static,
+                    RangerOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(actual.ranges, reference.ranges);
+                assert_eq!(actual.access_count, reference.access_conds.len());
+                assert_eq!(actual.remained_count, reference.remained_conds.len());
+                assert_eq!(
+                    actual.skip_plan_cache_reason,
+                    reference.skip_plan_cache_reason
+                );
+            }
+        }
     }
 
     /// The considerDNF branch's best-CNF-item pick: a first-column DNF
