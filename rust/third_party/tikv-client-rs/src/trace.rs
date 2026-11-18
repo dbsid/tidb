@@ -4,7 +4,6 @@
 
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::ops::{BitOr, BitOrAssign};
@@ -1051,10 +1050,29 @@ impl std::fmt::Debug for TraceField {
     }
 }
 
+/// Go's valueCtx. The erased value lives in the node's allocation, and each
+/// derived context keeps its parent's values alive.
+struct ContextValue<V: ?Sized = dyn Any + Send + Sync> {
+    key: TypeId,
+    parent: Option<Arc<ContextValue>>,
+    value: V,
+}
+
+impl<V: ?Sized> Drop for ContextValue<V> {
+    fn drop(&mut self) {
+        // Release a long, uniquely owned chain without recursing through
+        // Arc::drop. A shared parent still belongs to another context.
+        let mut parent = self.parent.take();
+        while let Some(mut node) = parent {
+            parent = Arc::get_mut(&mut node).and_then(|node| node.parent.take());
+        }
+    }
+}
+
 /// Immutable context supporting type-keyed values and trace-ID propagation.
 #[derive(Clone, Default)]
 pub struct TraceContext {
-    values: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    values: Option<Arc<ContextValue>>,
     trace_id: Option<Arc<[u8]>>,
 }
 
@@ -1069,9 +1087,14 @@ impl TraceContext {
         K: 'static,
         V: Any + Send + Sync,
     {
-        let mut derived = self.clone();
-        derived.values.insert(TypeId::of::<K>(), Arc::new(value));
-        derived
+        Self {
+            values: Some(Arc::new(ContextValue {
+                key: TypeId::of::<K>(),
+                parent: self.values.clone(),
+                value,
+            })),
+            trace_id: self.trace_id.clone(),
+        }
     }
 
     pub fn value<K, V>(&self) -> Option<&V>
@@ -1079,9 +1102,15 @@ impl TraceContext {
         K: 'static,
         V: Any + Send + Sync,
     {
-        self.values
-            .get(&TypeId::of::<K>())
-            .and_then(|value| value.downcast_ref())
+        let key = TypeId::of::<K>();
+        let mut node = self.values.as_deref();
+        while let Some(current) = node {
+            if current.key == key {
+                return current.value.downcast_ref();
+            }
+            node = current.parent.as_deref();
+        }
+        None
     }
 
     pub fn with_trace_id(&self, trace_id: impl Into<Vec<u8>>) -> Self {
@@ -1535,6 +1564,45 @@ mod tests {
         let second = first.with_trace_id(vec![6, 7, 8, 9, 10]);
         assert_eq!(second.trace_id(), Some(&[6, 7, 8, 9, 10][..]));
         assert_eq!(first.trace_id(), Some(&[1, 2, 3, 4, 5][..]));
+    }
+
+    #[test]
+    fn capturing_a_trace_context_shares_its_value_storage() {
+        struct Statement;
+        struct Request;
+        let caller = TraceContext::new()
+            .with_value::<Statement, _>(17_u64)
+            .with_trace_id(vec![1, 2]);
+        with_trace_context_sync(caller.clone(), || {
+            let captured = current_trace_context();
+            assert!(Arc::ptr_eq(
+                caller.values.as_ref().unwrap(),
+                captured.values.as_ref().unwrap(),
+            ));
+            let child = captured.with_value::<Request, _>(true);
+            let shadow = child
+                .with_value::<Statement, _>("new")
+                .with_trace_id(vec![3]);
+            assert_eq!(shadow.value::<Statement, u64>(), None);
+            assert_eq!(shadow.value::<Statement, &str>(), Some(&"new"));
+            assert_eq!(shadow.value::<Request, bool>(), Some(&true));
+            assert_eq!(child.value::<Statement, u64>(), Some(&17));
+            assert_eq!(caller.value::<Request, bool>(), None);
+            assert_eq!(current_trace_context().trace_id(), Some(&[1, 2][..]));
+        });
+    }
+
+    #[test]
+    fn dropping_deeply_derived_contexts_leaves_the_shared_parent_readable() {
+        struct Key;
+        let parent = TraceContext::new().with_value::<Key, _>(0);
+        let mut child = parent.clone();
+        for value in 1..100_000 {
+            child = child.with_value::<Key, _>(value);
+        }
+        assert_eq!(child.value::<Key, i32>(), Some(&99_999));
+        drop(child);
+        assert_eq!(parent.value::<Key, i32>(), Some(&0));
     }
 
     #[tokio::test]
