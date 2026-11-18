@@ -845,11 +845,62 @@ impl SessionTableLocks {
     }
 }
 
+/// Go keeps these flags and counters on the statement context. All configured
+/// views of one statement observe the same updates.
+#[derive(Default)]
+struct StatementCounters {
+    /// How many coprocessor-equivalent evaluations are open on this thread.
+    /// An atomic so parallel agg workers sharing the context stay `Sync`.
+    cop_eval_depth: AtomicU32,
+    /// Go `StatementContext.indexForce` (`stmtctx.go:1010`): a USE/FORCE
+    /// INDEX hint matched a path somewhere in the statement, so
+    /// `getTableScanPenalty` surcharges EVERY risky full table scan, hinted
+    /// or not. An atomic because parallel stats/agg workers share the ctx.
+    index_force: AtomicBool,
+    /// Go `StmtCtx.InsertID`: the explicit value a row gave the
+    /// `AUTO_INCREMENT` column, which the OK packet falls back to.
+    given_insert_id: AtomicU64,
+    /// Go `StmtCtx.ForeignKeyTriggerCtx.HasFKCascades`: the statement's root
+    /// executor cascades foreign keys.
+    fk_cascades: AtomicBool,
+    /// Go `StmtCtx.InHandleForeignKeyTrigger`: a foreign-key cascade
+    /// statement is running.
+    in_handle_foreign_key_trigger: AtomicBool,
+    /// Go `StmtCtx.UpdatedRows`: the rows the statement's updates changed,
+    /// the foreign-key cascade statements it ran included.
+    updated_rows: AtomicU64,
+    /// Go `StmtCtx.AddAffectedRows` for a write whose statement answers rows
+    /// (`EXPLAIN ANALYZE` of an INSERT/UPDATE/DELETE), which the result
+    /// set's terminal OK packet reports.
+    affected_rows: AtomicU64,
+    /// Go `StmtCtx.IsTiFlash` as `buildDataSource` sets it: MPP is allowed
+    /// and a table the statement reads has an available TiFlash replica.
+    is_tiflash: AtomicBool,
+    /// Go `StmtCtx.FTSFunctionIsUsed`: `FTS_MATCH_WORD()` appears in the
+    /// statement, set where the function is built.
+    fts_function_is_used: AtomicBool,
+    /// Go `StmtCtx.UseDynamicPruneMode = false`, set while building a data
+    /// source when a partitioned table has no global statistics: the rest of
+    /// this statement prunes statically.
+    dynamic_prune_disabled: AtomicBool,
+    /// Go `StmtCtx.IsSyncStatsFailed`.
+    sync_stats_failed: AtomicBool,
+    /// Go `StmtCtx.OperatorNum`, populated by
+    /// `CollectPredicateColumnsPoint` before later optimizer phases.
+    operator_num: AtomicU64,
+    /// Whether executor construction installed a physical table reader for
+    /// this statement. Go records the corresponding table IDs while building
+    /// those readers; `SLEEP` needs only the empty/non-empty distinction when
+    /// deciding whether a handled kill may reset the statement killer.
+    has_physical_table_reader: AtomicBool,
+}
+
 /// Private configuration payload exposed only as the context's dereference
 /// target. Access and mutation remain on [`StmtContext`].
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct StmtContextData {
+    counters: Arc<StatementCounters>,
     /// Go `sessionexpr`'s `OptionalEvalPropProviders`: what builtins that
     /// need session state read through `expropt`'s readers.
     optional_props: tidb_expropt::OptionalEvalPropProviders,
@@ -905,9 +956,6 @@ pub struct StmtContextData {
     /// warnings accumulate deduplicated in this buffer instead of the row
     /// buffer, and [`StmtContext::take_warnings`] appends them once.
     cop_batch_warnings: Arc<Mutex<Vec<SqlWarn>>>,
-    /// How many coprocessor-equivalent evaluations are open on this thread.
-    /// An atomic so parallel agg workers sharing the context stay `Sync`.
-    cop_eval_depth: Arc<AtomicU32>,
     /// Go `StatementContext.UsedStatsInfo`, keyed by physical table ID.
     used_stats_info: Arc<Mutex<BTreeMap<i64, tidb_stmtctx::used_stats::SharedUsedStatsInfo>>>,
     /// Shared by every rebuilt executor of one statement attempt. Go emits
@@ -917,11 +965,6 @@ pub struct StmtContextData {
     /// Go `StmtCtx.RunawayChecker` and the group its `BeforeExecutor`
     /// switched the statement to.
     runaway: Arc<StatementRunaway>,
-    /// Go `StatementContext.indexForce` (`stmtctx.go:1010`): a USE/FORCE
-    /// INDEX hint matched a path somewhere in the statement, so
-    /// `getTableScanPenalty` surcharges EVERY risky full table scan, hinted
-    /// or not. An atomic because parallel stats/agg workers share the ctx.
-    index_force: Arc<AtomicBool>,
     /// Go `StmtCtx.ReadFromTableCache`: a read of this statement was served
     /// by a cached table's in-memory copy.
     read_from_table_cache: Arc<AtomicBool>,
@@ -1152,9 +1195,6 @@ pub struct StmtContextData {
     temporary_table_data: Option<tidb_variable::temporary_table_data::SessionData>,
     /// Go `sctx.Txn()`, see [`StmtContextSessionState::txn_store`].
     txn_store: Option<Box<dyn tidb_kv::storage::TableStorage>>,
-    /// Go `StmtCtx.InsertID`: the explicit value a row gave the
-    /// `AUTO_INCREMENT` column, which the OK packet falls back to.
-    given_insert_id: Arc<AtomicU64>,
     /// The ids a previous attempt at this same statement already assigned; see
     /// [`RetryAutoIds`]. It is a session-lived handle rather than statement
     /// state because the retry loop that rewinds it sits ABOVE the statement:
@@ -1260,22 +1300,9 @@ pub struct StmtContextData {
     txn_is_explicit: bool,
     /// Go `SessionVars.EnableRedactLog`.
     enable_redact_log: String,
-    /// Go `StmtCtx.ForeignKeyTriggerCtx.HasFKCascades`: the statement's root
-    /// executor cascades foreign keys.
-    fk_cascades: Arc<std::sync::atomic::AtomicBool>,
-    /// Go `StmtCtx.InHandleForeignKeyTrigger`: a foreign-key cascade
-    /// statement is running.
-    in_handle_foreign_key_trigger: Arc<std::sync::atomic::AtomicBool>,
-    /// Go `StmtCtx.UpdatedRows`: the rows the statement's updates changed,
-    /// the foreign-key cascade statements it ran included.
-    updated_rows: Arc<std::sync::atomic::AtomicU64>,
     /// Whether a foreign-key cascade statement is being planned, after the
     /// statement's own writes (see [`Self::plans_fk_cascade`]).
     plans_fk_cascade: Arc<std::sync::atomic::AtomicBool>,
-    /// Go `StmtCtx.AddAffectedRows` for a write whose statement answers rows
-    /// (`EXPLAIN ANALYZE` of an INSERT/UPDATE/DELETE), which the result
-    /// set's terminal OK packet reports.
-    affected_rows: Arc<std::sync::atomic::AtomicU64>,
     /// The statement continues (or lazily opens) an optimistic transaction,
     /// whose membuffer outlives it: the in-process store keeps its staged
     /// keys in [`Self::staged_writes`] (see
@@ -1451,12 +1478,6 @@ pub struct StmtContextData {
     /// statement: registers its SQL and plan with Top SQL once, when Top
     /// profiling is on as an executor runs.
     top_profiling_registration: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Go `StmtCtx.IsTiFlash` as `buildDataSource` sets it: MPP is allowed
-    /// and a table the statement reads has an available TiFlash replica.
-    is_tiflash: Arc<AtomicBool>,
-    /// Go `StmtCtx.FTSFunctionIsUsed`: `FTS_MATCH_WORD()` appears in the
-    /// statement, set where the function is built.
-    fts_function_is_used: Arc<AtomicBool>,
     kv_exec_counter: tidb_topsql_stmtstats::KvExecCounterHandle,
     /// Go `KvExecCounter.RPCInterceptor()`, built once per statement so every
     /// request the statement configures runs the same interceptor.
@@ -1488,10 +1509,6 @@ pub struct StmtContextData {
     /// Go `SessionVars.PartitionPruneMode == Static`: see
     /// [`StmtContext::static_partition_prune`].
     static_partition_prune: bool,
-    /// Go `StmtCtx.UseDynamicPruneMode = false`, set while building a data
-    /// source when a partitioned table has no global statistics: the rest of
-    /// this statement prunes statically.
-    dynamic_prune_disabled: Arc<AtomicBool>,
     /// Go `SessionVars.SkipMissingPartitionStats`
     /// (`tidb_skip_missing_partition_stats`).
     skip_missing_partition_stats: bool,
@@ -1619,11 +1636,6 @@ pub struct StmtContextData {
     enable_skew_distinct_agg: bool,
     /// Go `SessionVars.GetMaxExecutionTime()`, in milliseconds.
     max_execution_time_ms: u64,
-    /// Go `StmtCtx.IsSyncStatsFailed`.
-    sync_stats_failed: Arc<AtomicBool>,
-    /// Go `StmtCtx.OperatorNum`, populated by
-    /// `CollectPredicateColumnsPoint` before later optimizer phases.
-    operator_num: Arc<AtomicU64>,
     /// Go `sessionctx.Context.UpdateColStatsUsage` over the session's
     /// `SessionStatsItem`, shared by every statement context built for this
     /// session.
@@ -1700,11 +1712,6 @@ pub struct StmtContextData {
     /// their IN lists in the normalized plan text (Go
     /// `vardef.IgnoreInlistPlanDigest`).
     ignore_inlist_plan_digest: bool,
-    /// Whether executor construction installed a physical table reader for
-    /// this statement. Go records the corresponding table IDs while building
-    /// those readers; `SLEEP` needs only the empty/non-empty distinction when
-    /// deciding whether a handled kill may reset the statement killer.
-    has_physical_table_reader: Arc<AtomicBool>,
     /// Go `SessionVars.IsAllocValid()` for this statement: the session
     /// installed its reusable chunk allocator (`SetAlloc`, under
     /// `tidb_enable_reuse_chunk`) and the planner has not cleared it
@@ -3241,6 +3248,7 @@ impl StmtContext {
         session: StmtContextSessionState,
     ) -> Self {
         Self::from_data(Arc::new(StmtContextData {
+            counters: Arc::default(),
             optional_props: optional_eval_props(&session.regions, &session.session_privilege, &session.dynamic_privilege),
             mpp_query_info: session.mpp_query_info,
             mpp_server_id: session.mpp_server_id,
@@ -3260,11 +3268,9 @@ impl StmtContext {
             mem_table_retrieval: Arc::default(),
             show_retrieval: Arc::default(),
             cop_batch_warnings: Arc::default(),
-            cop_eval_depth: Arc::new(AtomicU32::new(0)),
             used_stats_info: Arc::default(),
             before_executor_first_run: session.before_executor_first_run,
             runaway: session.runaway,
-            index_force: Arc::default(),
             read_from_table_cache: Arc::clone(&session.read_from_table_cache),
             telemetry_info: Arc::clone(&session.telemetry_info),
             breakpoint_notify_func: session.breakpoint_notify_func,
@@ -3348,7 +3354,6 @@ impl StmtContext {
             txn_cached_tables: session.txn_cached_tables,
             temporary_table_data: session.temporary_table_data,
             txn_store: session.txn_store,
-            given_insert_id: Arc::default(),
             retry_auto_ids: session.retry_auto_ids,
             row_id_shards: session.row_id_shards,
             auto_increment_step: (1, 1),
@@ -3383,11 +3388,7 @@ impl StmtContext {
             in_transaction: false,
             txn_is_explicit: false,
             enable_redact_log: String::new(),
-            fk_cascades: Arc::default(),
-            in_handle_foreign_key_trigger: Arc::default(),
-            updated_rows: Arc::default(),
             plans_fk_cascade: Arc::default(),
-            affected_rows: Arc::default(),
             optimistic_transaction: false,
             pessimistic_check_in_prewrite: false,
             enable_mutation_checker: false,
@@ -3453,8 +3454,6 @@ impl StmtContext {
             sql_cpu_usages: None,
             plan_cache_unqualified: None,
             top_profiling_registration: None,
-            is_tiflash: Arc::default(),
-            fts_function_is_used: Arc::default(),
             kv_exec_counter: Default::default(),
             rpc_interceptor: Default::default(),
             statement_kv_context: None,
@@ -3466,7 +3465,6 @@ impl StmtContext {
             disabled_logical_rules: std::sync::Arc::default(),
             // Go's shipped `tidb_partition_prune_mode` is `dynamic`.
             static_partition_prune: false,
-            dynamic_prune_disabled: Arc::new(AtomicBool::new(false)),
             skip_missing_partition_stats:
                 tidb_vardef::defaults::DEF_TIDB_SKIP_MISSING_PARTITION_STATS,
             sequences: session.sequences,
@@ -3516,8 +3514,6 @@ impl StmtContext {
                 tidb_vardef::defaults::DEF_OPT_ENABLE_NO_DECORRELATE_IN_SELECT,
             enable_skew_distinct_agg: tidb_vardef::defaults::DEF_TIDB_SKEW_DISTINCT_AGG,
             max_execution_time_ms: 0,
-            sync_stats_failed: Arc::default(),
-            operator_num: Arc::default(),
             column_stats_usage: None,
             index_usage_collector: None,
             executor_runtime_stats_source: None,
@@ -3545,7 +3541,6 @@ impl StmtContext {
             statement_class: StatementClass::Other,
             enable_stable_result_mode: false,
             ignore_inlist_plan_digest: tidb_vardef::defaults::DEF_TIDB_IGNORE_INLIST_PLAN_DIGEST,
-            has_physical_table_reader: Arc::default(),
             chunk_alloc_valid: Arc::default(),
             chunk_allocator: None,
             result_write_chunk: None,
@@ -3798,7 +3793,7 @@ impl StmtContext {
     /// Records the same physical-reader fact Go records by appending to
     /// `StmtCtx.TableIDs` in `executorBuilder`.
     pub fn mark_physical_table_reader(&self) {
-        self.has_physical_table_reader
+        self.counters.has_physical_table_reader
             .store(true, Ordering::Relaxed);
     }
 
@@ -4336,7 +4331,7 @@ impl StmtContext {
 
     /// Records Go `StmtCtx.IsSyncStatsFailed`.
     pub fn report_sync_stats_failed(&self) {
-        self.sync_stats_failed
+        self.counters.sync_stats_failed
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -4355,25 +4350,25 @@ impl StmtContext {
 
     /// Go `buildDataSource`: `StmtCtx.IsTiFlash.Store(true)`.
     pub fn mark_is_tiflash(&self) {
-        self.is_tiflash.store(true, Ordering::Relaxed);
+        self.counters.is_tiflash.store(true, Ordering::Relaxed);
     }
 
     /// Go `StmtCtx.IsSyncStatsFailed`.
     #[must_use]
     pub fn sync_stats_failed(&self) -> bool {
-        self.sync_stats_failed
+        self.counters.sync_stats_failed
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Records Go `StmtCtx.OperatorNum`.
     pub fn set_operator_num(&self, count: u64) {
-        self.operator_num.store(count, Ordering::Relaxed);
+        self.counters.operator_num.store(count, Ordering::Relaxed);
     }
 
     /// Go `StmtCtx.OperatorNum`.
     #[must_use]
     pub fn operator_num(&self) -> u64 {
-        self.operator_num.load(Ordering::Relaxed)
+        self.counters.operator_num.load(Ordering::Relaxed)
     }
 
     /// Returns the statement-local index-usage collector, when enabled.
@@ -5268,7 +5263,7 @@ impl StmtContext {
     /// Go `StatementContext.SetIndexForce` (`stmtctx.go:1034`): the statement
     /// carries a hint-forced access path somewhere.
     pub fn set_index_force(&self) {
-        self.data.index_force.store(true, Ordering::Release);
+        self.data.counters.index_force.store(true, Ordering::Release);
     }
 
     /// Go `StmtCtx.ReadFromTableCache = true`.
@@ -5296,7 +5291,7 @@ impl StmtContext {
     /// Go `StatementContext.GetIndexForce` (`stmtctx.go:1011`).
     #[must_use]
     pub fn get_index_force(&self) -> bool {
-        self.data.index_force.load(Ordering::Acquire)
+        self.data.counters.index_force.load(Ordering::Acquire)
     }
 
     /// The statement side of Go `ExecStmt.Exec` between `buildExecutor` and
@@ -5469,7 +5464,7 @@ impl StmtContext {
             .map(|(id, entry)| (*id, entry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()))
             .collect();
         plan.is_sync_stats_failed = self.sync_stats_failed();
-        plan.is_tiflash = self.is_tiflash.load(Ordering::Relaxed);
+        plan.is_tiflash = self.counters.is_tiflash.load(Ordering::Relaxed);
         plan.runaway_rule_kill_action = self.runaway_rule_kill_action();
         self.publish_process_plan_info(plan);
     }
@@ -5525,7 +5520,7 @@ impl StmtContext {
     /// table has no global statistics ([`Self::disable_dynamic_prune`]).
     #[must_use]
     pub fn static_partition_prune(&self) -> bool {
-        self.static_partition_prune || self.dynamic_prune_disabled.load(Ordering::Acquire)
+        self.static_partition_prune || self.counters.dynamic_prune_disabled.load(Ordering::Acquire)
     }
     /// Go `SessionVars.SkipMissingPartitionStats`.
     #[must_use]
@@ -5536,7 +5531,7 @@ impl StmtContext {
     /// Go `StmtCtx.UseDynamicPruneMode = false`: the statement falls back to
     /// static pruning (a partitioned table without global statistics).
     pub fn disable_dynamic_prune(&self) {
-        self.dynamic_prune_disabled.store(true, Ordering::Release);
+        self.counters.dynamic_prune_disabled.store(true, Ordering::Release);
     }
 
     /// Go `SessionVars.SelectLimit`; `u64::MAX` means no session-level cap.
@@ -5699,14 +5694,14 @@ impl StmtContext {
     /// Records that the statement cascades foreign keys (Go
     /// `ForeignKeyTriggerCtx.HasFKCascades`).
     pub fn mark_fk_cascades(&self) {
-        self.fk_cascades
+        self.counters.fk_cascades
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Go `StmtCtx.InHandleForeignKeyTrigger`, set while
     /// `handleForeignKeyCascade` runs the cascade statements.
     pub fn set_in_handle_foreign_key_trigger(&self, handling: bool) {
-        self.in_handle_foreign_key_trigger
+        self.counters.in_handle_foreign_key_trigger
             .store(handling, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -5718,9 +5713,9 @@ impl StmtContext {
     pub fn writes_untouched_indices(&self) -> bool {
         self.in_transaction
             || self
-                .in_handle_foreign_key_trigger
+                .counters.in_handle_foreign_key_trigger
                 .load(std::sync::atomic::Ordering::Relaxed)
-            || self.fk_cascades.load(std::sync::atomic::Ordering::Relaxed)
+            || self.counters.fk_cascades.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether this statement is part of an optimistic transaction.
@@ -6674,7 +6669,7 @@ impl StmtContext {
     /// `AUTO_INCREMENT` column. Go overwrites it per row, so the LAST such
     /// value of the statement is the one that survives.
     pub fn record_given_insert_id(&self, id: u64) {
-        self.given_insert_id.store(id, Ordering::Relaxed);
+        self.counters.given_insert_id.store(id, Ordering::Relaxed);
     }
 
     /// The explicit auto-increment value this statement last saw, or 0.
@@ -6687,7 +6682,7 @@ impl StmtContext {
     /// move (captured).
     #[must_use]
     pub fn given_insert_id(&self) -> u64 {
-        self.given_insert_id.load(Ordering::Relaxed)
+        self.counters.given_insert_id.load(Ordering::Relaxed)
     }
 
     /// Whether an explicit `0` written to an AUTO_INCREMENT column must be
@@ -6786,26 +6781,26 @@ impl StmtContext {
 
     /// Go `StmtCtx.AddUpdatedRows`.
     pub fn add_updated_rows(&self, rows: u64) {
-        self.updated_rows
+        self.counters.updated_rows
             .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Go `StmtCtx.UpdatedRows`.
     #[must_use]
     pub fn updated_rows(&self) -> u64 {
-        self.updated_rows.load(std::sync::atomic::Ordering::Relaxed)
+        self.counters.updated_rows.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Go `StmtCtx.AddAffectedRows`: the rows a foreign-key trigger writes
     /// (`InHandleForeignKeyTrigger`) do not count, for MySQL compatibility.
     pub fn add_affected_rows(&self, rows: u64) {
         if self
-            .in_handle_foreign_key_trigger
+            .counters.in_handle_foreign_key_trigger
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return;
         }
-        self.affected_rows
+        self.counters.affected_rows
             .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -6813,7 +6808,7 @@ impl StmtContext {
     /// recorded.
     #[must_use]
     pub fn affected_rows(&self) -> u64 {
-        self.affected_rows
+        self.counters.affected_rows
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -6892,7 +6887,7 @@ impl StmtContext {
     /// in one statement -- each distinct message still appears once.
     #[must_use]
     pub fn enter_cop_eval(&self) -> CopEvalGuard<'_> {
-        self.cop_eval_depth.fetch_add(1, Ordering::Relaxed);
+        self.counters.cop_eval_depth.fetch_add(1, Ordering::Relaxed);
         CopEvalGuard { context: self }
     }
 
@@ -6932,7 +6927,7 @@ impl StmtContext {
     /// The one push onto the buffer, so its retention limit lives in one
     /// place regardless of which level came through.
     fn push_warning(&self, warning: SqlWarn) {
-        if self.cop_eval_depth.load(Ordering::Relaxed) > 0 {
+        if self.counters.cop_eval_depth.load(Ordering::Relaxed) > 0 {
             let mut batch = self
                 .cop_batch_warnings
                 .lock()
@@ -7002,7 +6997,7 @@ pub struct CopEvalGuard<'a> {
 
 impl Drop for CopEvalGuard<'_> {
     fn drop(&mut self) {
-        self.context.cop_eval_depth.fetch_sub(1, Ordering::Relaxed);
+        self.context.counters.cop_eval_depth.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -7267,11 +7262,11 @@ impl Columns for StmtContext {
     }
 
     fn fts_function_is_used(&self) -> bool {
-        self.fts_function_is_used.load(Ordering::Relaxed)
+        self.counters.fts_function_is_used.load(Ordering::Relaxed)
     }
 
     fn set_fts_function_is_used(&self) {
-        self.fts_function_is_used.store(true, Ordering::Relaxed);
+        self.counters.fts_function_is_used.store(true, Ordering::Relaxed);
     }
 
     fn alternative_logical_plan_signals(
@@ -7603,7 +7598,7 @@ impl Columns for StmtContext {
         let killed = self.memory.sleep_for(duration);
         if killed
             && self.statement_class == StatementClass::Select
-            && !self.has_physical_table_reader.load(Ordering::Relaxed)
+            && !self.counters.has_physical_table_reader.load(Ordering::Relaxed)
         {
             self.memory.reset_kill_signal();
         }
@@ -7918,6 +7913,42 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn statement_counters_share_storage_and_follow_the_statement_across_configurations() {
+        let ctx = StmtContext::for_query();
+        let addresses = [
+            ctx.counters.cop_eval_depth.as_ptr().addr(),
+            ctx.counters.index_force.as_ptr().addr(),
+            ctx.counters.given_insert_id.as_ptr().addr(),
+            ctx.counters.fk_cascades.as_ptr().addr(),
+            ctx.counters.in_handle_foreign_key_trigger.as_ptr().addr(),
+            ctx.counters.updated_rows.as_ptr().addr(),
+            ctx.counters.affected_rows.as_ptr().addr(),
+            ctx.counters.is_tiflash.as_ptr().addr(),
+            ctx.counters.fts_function_is_used.as_ptr().addr(),
+            ctx.counters.dynamic_prune_disabled.as_ptr().addr(),
+            ctx.counters.sync_stats_failed.as_ptr().addr(),
+            ctx.counters.operator_num.as_ptr().addr(),
+            ctx.counters.has_physical_table_reader.as_ptr().addr(),
+        ];
+        // Each counter fits in one u64. Separate reference-counted
+        // allocations cannot occupy the footprint of these counters alone.
+        let span = addresses.iter().max().unwrap() - addresses.iter().min().unwrap();
+        assert!(
+            span < addresses.len() * size_of::<u64>(),
+            "statement counter span: {span}"
+        );
+
+        let copy = ctx.clone().configure(|_| {});
+        copy.add_affected_rows(3);
+        copy.record_given_insert_id(42);
+        assert_eq!(ctx.affected_rows(), 3);
+        assert_eq!(ctx.given_insert_id(), 42);
+        let next = StmtContext::for_query();
+        assert_eq!(next.affected_rows(), 0);
+        assert_eq!(next.given_insert_id(), 0);
+    }
 
     #[test]
     fn stats_load_wait_is_capped_and_failure_state_is_shared_by_clones() {
