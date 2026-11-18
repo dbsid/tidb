@@ -68,6 +68,20 @@ pub trait NativeCopStore: Send + Sync + 'static {
         stats: Option<Arc<tikv_client::RegionRequestRuntimeStats>>,
     ) -> Result<NativeCopSend, tikv_client::Error>;
 
+    /// Sends a concurrent worker's request, allowing it to yield while TiKV
+    /// answers. Synchronous store implementations use their existing sender.
+    fn send_async<'a>(
+        &'a self,
+        backoffer: &'a CopBackoffer,
+        request: tidb_proto::CoprocessorRequest,
+        region: (u64, u64, u64),
+        timeout: Duration,
+        kv_context: &'a tidb_txnkv::StatementKvContext,
+        stats: Option<Arc<tikv_client::RegionRequestRuntimeStats>>,
+    ) -> futures::future::BoxFuture<'a, Result<NativeCopSend, tikv_client::Error>> {
+        Box::pin(async move { self.send(backoffer, request, region, timeout, kv_context, stats) })
+    }
+
     /// Go `ResolveLocksWithOpts` for a read, from `handleLockErr`, under the
     /// same `bo` ctx as [`Self::send`].
     fn resolve_lock(
@@ -151,6 +165,46 @@ where
     }
 }
 
+async fn send_tikv<PdC: tikv_client::PdClient>(
+    store: &TikvStore<PdC>,
+    backoffer: &CopBackoffer,
+    request: tidb_proto::CoprocessorRequest,
+    region: (u64, u64, u64),
+    timeout: Duration,
+    kv_context: &tidb_txnkv::StatementKvContext,
+    stats: Option<Arc<tikv_client::RegionRequestRuntimeStats>>,
+) -> Result<NativeCopSend, tikv_client::Error> {
+    // Go `codecV2.EncodeRequest(CmdCop)`: prefix every unary/batched
+    // range before dispatch. The native plan decodes response key fields.
+    let request = match store.store().keyspace() {
+        tikv_client::request::Keyspace::Enable { keyspace_id } => {
+            tikv_client::request::ApiV2Codec::new(tikv_client::request::KeyMode::Txn, keyspace_id)?
+                .encode_coprocessor_request(&request)
+        }
+        _ => request,
+    };
+    let region = tikv_client::RegionVerId {
+        id: region.0,
+        conf_ver: region.1,
+        ver: region.2,
+    };
+    let send = store.store().send_req_ctx_with_stats(
+        Arc::clone(backoffer),
+        request,
+        &region,
+        timeout,
+        stats,
+    );
+    let sent = with_statement_kv_context(kv_context, send).await;
+    match sent {
+        Ok((response, address)) => Ok(NativeCopSend::Response(Box::new(response), address)),
+        Err(tikv_client::Error::RegionError(error)) => {
+            Ok(NativeCopSend::RegionError(format!("{error:?}")))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
     fn cluster_id(&self) -> u64 {
         self.block_on(self.store().pd_client().cluster_id())
@@ -204,28 +258,28 @@ impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
         kv_context: &tidb_txnkv::StatementKvContext,
         stats: Option<Arc<tikv_client::RegionRequestRuntimeStats>>,
     ) -> Result<NativeCopSend, tikv_client::Error> {
-        // Go `codecV2.EncodeRequest(CmdCop)`: prefix every unary/batched
-        // range before dispatch. The native plan decodes response key fields.
-        let request=match self.store().keyspace() {
-            tikv_client::request::Keyspace::Enable {keyspace_id}=>tikv_client::request::ApiV2Codec::new(tikv_client::request::KeyMode::Txn,keyspace_id)?.encode_coprocessor_request(&request),
-            _=>request,
-        };
-        let region = tikv_client::RegionVerId {
-            id: region.0,
-            conf_ver: region.1,
-            ver: region.2,
-        };
-        let send = self
-            .store()
-            .send_req_ctx_with_stats(Arc::clone(backoffer), request, &region, timeout, stats);
-        let sent = self.block_on(with_statement_kv_context(kv_context, send));
-        match sent {
-            Ok((response, address)) => Ok(NativeCopSend::Response(Box::new(response), address)),
-            Err(tikv_client::Error::RegionError(error)) => {
-                Ok(NativeCopSend::RegionError(format!("{error:?}")))
-            }
-            Err(error) => Err(error),
-        }
+        self.block_on(send_tikv(
+            self, backoffer, request, region, timeout, kv_context, stats,
+        ))
+    }
+
+    fn send_async<'a>(
+        &'a self,
+        backoffer: &'a CopBackoffer,
+        request: tidb_proto::CoprocessorRequest,
+        region: (u64, u64, u64),
+        timeout: Duration,
+        kv_context: &'a tidb_txnkv::StatementKvContext,
+        stats: Option<Arc<tikv_client::RegionRequestRuntimeStats>>,
+    ) -> futures::future::BoxFuture<'a, Result<NativeCopSend, tikv_client::Error>> {
+        let send = send_tikv(self, backoffer, request, region, timeout, kv_context, stats);
+        let traced = tidb_txnkv::rpc::trace::with_span_ctx(tidb_tracing::current_span(), send);
+        // Poll on the query worker. Spawned connections and timers belong
+        // to the store, as they do on the synchronous sender.
+        Box::pin(tokio_util::context::TokioContext::new(
+            traced,
+            self.runtime().handle().clone(),
+        ))
     }
 
     fn resolve_lock(

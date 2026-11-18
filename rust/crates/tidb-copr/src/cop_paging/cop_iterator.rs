@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Wake, Waker};
 
+use futures::FutureExt;
 use tidb_txnkv::rpc::{
     go_max_procs, query_worker_runtime, wait_with_call, CompletionError, UnaryCallContext,
 };
@@ -44,6 +45,13 @@ pub(crate) trait CopWorkerSource: CopTaskSource + Sized {
     fn task(&self) -> &crate::region_task::RegionTaskEnvelope;
     fn use_row_hints(&self) -> bool;
     fn start_worker(&mut self);
+
+    /// Polls the next task result on a concurrent coprocessor worker.
+    fn next_on_worker(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<QueryResultSubset>, QueryResponseError>> + Send
+    where
+        Self: Send;
 }
 
 pub(crate) type ConcurrentStart<R> =
@@ -659,7 +667,11 @@ async fn run_worker<R: CopWorkerSource + Send + 'static>(
             if group.closed.load(Ordering::Acquire) {
                 break;
             }
-            match recover(|| source.try_next()) {
+            let result = std::panic::AssertUnwindSafe(async { source.next_on_worker().await })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(worker_panic);
+            match result {
                 Err(QueryResponseError::Pending) => match spin_pending(&mut source) {
                     Err(QueryResponseError::Pending) => completed.await,
                     Ok(Some(row)) => {
@@ -858,16 +870,20 @@ pub(super) fn completion_error(error: CompletionError) -> QueryResponseError {
 fn recover(
     next: impl FnOnce() -> Result<Option<QueryResultSubset>, QueryResponseError>,
 ) -> Result<Option<QueryResultSubset>, QueryResponseError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(next)).unwrap_or_else(|panic| {
-        let message = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or("non-string panic payload");
-        Err(QueryResponseError::Source(format!(
-            "coprocessor worker panicked: {message}"
-        )))
-    })
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(next)).unwrap_or_else(worker_panic)
+}
+
+fn worker_panic(
+    panic: Box<dyn std::any::Any + Send>,
+) -> Result<Option<QueryResultSubset>, QueryResponseError> {
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    Err(QueryResponseError::Source(format!(
+        "coprocessor worker panicked: {message}"
+    )))
 }
 
 #[cfg(test)]
@@ -950,6 +966,80 @@ mod tests {
             }
             assert!(it.next().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn concurrent_native_reads_poll_on_the_worker_with_the_store_runtime() {
+        use tidb_txnkv::{
+            CancelHandle, KeyRange, KvRequestMetadata, PartitionedKeyRanges, RequestType,
+            TransportBinding, TransportRequest,
+        };
+        use tikv_client::mock::{MockKvClient, MockPdClient};
+
+        use crate::{
+            cop_paging::{CopRuntimeConfig, NativeCopTransport},
+            query_transport::{QueryOperation, QueryTransport},
+        };
+
+        let worker_thread = std::thread::current().id();
+        let dispatched = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&dispatched);
+        let pd = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_| {
+                *observed.lock().unwrap() = Some((
+                    std::thread::current().id(),
+                    tokio::runtime::Handle::current().id(),
+                ));
+                Ok(Box::new(tidb_proto::CoprocessorResponse {
+                    data: prost::bytes::Bytes::from_static(b"row"),
+                    ..Default::default()
+                }))
+            },
+        )));
+        let runtime = tidb_txnkv::driver::tikv_store::store_runtime().unwrap();
+        let store_runtime_id = runtime.handle().id();
+        let store = runtime
+            .block_on(tikv_client::tikv::KvStore::new_with_pd_client(
+                pd,
+                Arc::new(tikv_client::tikv::MockSafePointKv::new()),
+                tikv_client::Config::default(),
+            ))
+            .unwrap();
+        let store = tidb_txnkv::driver::tikv_store::TikvStore::new(runtime, store);
+        let mut transport = NativeCopTransport::new(Arc::new(store), CopRuntimeConfig::default());
+        let mut metadata = KvRequestMetadata::default();
+        metadata.request_type = RequestType::Dag;
+        metadata.start_ts = 100;
+        metadata.keep_order = true;
+        metadata.key_ranges = Some(Arc::new(PartitionedKeyRanges::new_non_partitioned(vec![
+            KeyRange::new(vec![1].into(), vec![3].into()),
+        ])));
+        let token = Arc::new(AtomicBool::new(false));
+        let request = TransportRequest::new(metadata, Arc::new(CancelHandle::default()))
+            .with_cop_lite_worker(Arc::clone(&token))
+            .bind(TransportBinding::new())
+            .unwrap();
+        let mut it = transport
+            .send(&request, QueryOperation::Select)
+            .unwrap()
+            .unwrap();
+        // Borrow the prepared source to exercise its worker path on a
+        // single executor thread, where a nested synchronous store wait
+        // would have to hand the physical RPC to another thread.
+        let Driver::Inline(source) = &mut it.driver else {
+            panic!("expected a lite source");
+        };
+        let worker = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let row = worker.block_on(source.next_on_worker()).unwrap().unwrap();
+        assert_eq!(row.data.as_ref(), b"row");
+        assert_eq!(
+            *dispatched.lock().unwrap(),
+            Some((worker_thread, store_runtime_id))
+        );
+        assert!(worker.block_on(source.next_on_worker()).unwrap().is_none());
     }
 
     struct PendingSource {
