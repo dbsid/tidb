@@ -28,7 +28,9 @@ use tidb_driver_error::ExecError;
 use tidb_executor_internal_exec::{Executor, ExecutorMeta};
 use tidb_expr::column::Column;
 use tidb_expr::schema::Schema;
-use tidb_planner_core_operator_physicalop::{PhysicalIndexLookUpReader, PhysicalPlan, PushedDownLimit};
+use tidb_planner_core_operator_physicalop::{
+    flatten_list_push_down_plan, PhysicalIndexLookUpReader, PhysicalPlan, PushedDownLimit,
+};
 use tidb_txnkv::Handle;
 
 /// Go `size.SizeOfInterface` (a `kv.Handle`), `unsafe.Sizeof(chunk.Row{})`
@@ -65,8 +67,8 @@ enum GetHandleType {
 struct Shared {
     ctx: crate::StmtContext,
     client: Arc<dyn tidb_txnkv::Client>,
-    /// Go `tblPlans`.
-    table_plans: Vec<PhysicalPlan>,
+    /// Root of Go `tblPlans`, shared by all table tasks.
+    table_plan: Arc<PhysicalPlan>,
     /// Go `getPhysicalPlanIDs(e.tblPlans)`.
     table_plan_ids: Vec<isize>,
     /// Go `e.table`'s metadata.
@@ -261,10 +263,14 @@ impl IndexLookUpExecutor {
         let internal = |message: &'static str| ExecError::Internal(message.into());
         // Go `v.IndexPlans`, `v.IndexPlansUnNatureOrders` and `v.TablePlans`.
         let (index_plans, index_plans_un_nature_orders) = v.index_plans();
-        let table_plans = v.table_plans();
         let Some(PhysicalPlan::IndexScan(scan)) = index_plans.first() else {
             return Err(internal("the lookup's index plans start with no index scan"));
         };
+        let table_plan = v
+            .table_plan
+            .as_deref()
+            .ok_or_else(|| internal("the lookup's table plans start with no table scan"))?;
+        let table_plans = flatten_list_push_down_plan(table_plan);
         let Some(PhysicalPlan::TableScan(ts)) = table_plans.first().copied() else {
             return Err(internal("the lookup's table plans start with no table scan"));
         };
@@ -391,7 +397,7 @@ impl IndexLookUpExecutor {
         let shared = Shared {
             ctx: ctx.clone(),
             client,
-            table_plans: table_plans.iter().copied().cloned().collect(),
+            table_plan: Arc::new(table_plan.clone()),
             table_plan_ids,
             index_name: index.name.original().to_owned(),
             index: index.clone(),
@@ -415,7 +421,7 @@ impl IndexLookUpExecutor {
             // Go `BuildNewBaseExecutorV2(..., e.Schema(), e.getTableRootPlanID())`.
             table_reader_meta: ExecutorMeta::new(
                 meta.schema().clone(),
-                table_plans.last().map_or(meta.id(), |plan| i64::from(plan.id())),
+                i64::from(table_plan.id()),
                 meta.init_cap(),
                 meta.max_chunk_size(),
             )
@@ -436,7 +442,7 @@ impl IndexLookUpExecutor {
                         .then(|| source.basic_runtime_stats(index_root))
                         .flatten(),
                     source: Arc::clone(source),
-                    table_root_plan_id: table_plans.last().map_or(meta.id() as i64, |plan| i64::from(plan.id())),
+                    table_root_plan_id: i64::from(table_plan.id()),
                     plan_id: meta.id() as i64,
                     index_end_recorded: false,
                 }
@@ -753,7 +759,7 @@ impl IndexLookUpExecutor {
         let work_rx = Arc::new(Mutex::new(work_rx));
         // Go `tableRequest` (`buildTableReq`), rebuilt on `open` for
         // `corColInTblSide`.
-        let table_plans: Vec<&PhysicalPlan> = self.shared.table_plans.iter().collect();
+        let table_plans = flatten_list_push_down_plan(&self.shared.table_plan);
         let mut table_request = crate::builder_utils::construct_dag_req(
             &self.shared.ctx,
             &statement,
@@ -1404,7 +1410,7 @@ fn execute_table_task(
             meta: shared.table_reader_meta.clone(),
             ctx: &shared.ctx,
             client: Arc::clone(&shared.client),
-            table_plan: shared.table_plans.last().ok_or_else(|| ExecError::Internal("the lookup has no table plans".into()))?,
+            table_plan: &shared.table_plan,
             plan_ids: shared.table_plan_ids.clone(),
             dag: table_request.clone(),
             physical_table_id,
@@ -1473,7 +1479,7 @@ fn execute_table_task(
     // Go `executeTask`: a handle the table did not answer is a lookup
     // inconsistency (`consistency.Reporter.ReportLookupInconsistent`).
     let handle_cnt = handles.len();
-    if handle_cnt != order.len() && !shared.ctx.weak_consistency() && shared.table_plans.len() == 1 {
+    if handle_cnt != order.len() && !shared.ctx.weak_consistency() && shared.table_plan_ids.len() == 1 {
         return Err(ExecError::from(crate::consistency_errors::ERR_LOOKUP_INCONSISTENT.gen_with_stack_by_args(&[
             shared.table_info.name.original().into(),
             shared.index_name.as_str().into(),

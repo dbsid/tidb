@@ -5166,7 +5166,11 @@ fn build_index_merge_reader(
             ),
             ctx: ctx.clone(),
             client,
-            table_plans: tidb_planner_core_operator_physicalop::flatten_list_push_down_plan(table_plan).into_iter().cloned().collect(),
+            table_plan: Arc::new(table_plan.clone()),
+            table_plan_ids: tidb_planner_core_operator_physicalop::flatten_list_push_down_plan(table_plan)
+                .into_iter()
+                .map(|plan| plan.id() as isize)
+                .collect(),
             columns: ts.columns.clone(),
             start_ts: crate::statement_store(ctx).start_ts(),
             avg_row_size: table_plan.cop_avg_row_size(

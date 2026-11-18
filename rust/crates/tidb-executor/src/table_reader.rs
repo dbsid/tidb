@@ -284,8 +284,8 @@ pub struct TableReaderExecutor {
     net_data_size: f64,
     /// Go `dctx.Client`.
     client: Arc<dyn tidb_txnkv::Client>,
-    /// Go `tablePlan`.
-    table_plan: PhysicalPlan,
+    /// Go `tablePlan`. Readers for handle batches share their parent's plan.
+    table_plan: Arc<PhysicalPlan>,
     /// Go `getPhysicalPlanIDs(e.plans)`.
     plan_ids: Vec<isize>,
     /// Go `table.GetPhysicalID()`.
@@ -347,7 +347,7 @@ pub(crate) struct TableReaderForHandles<'a> {
     pub ctx: &'a crate::StmtContext,
     pub client: Arc<dyn tidb_txnkv::Client>,
     /// Go `tblPlans`' root.
-    pub table_plan: &'a PhysicalPlan,
+    pub table_plan: &'a Arc<PhysicalPlan>,
     /// Go `getPhysicalPlanIDs(e.tblPlans)`.
     pub plan_ids: Vec<isize>,
     /// Go `tableRequest`.
@@ -382,7 +382,7 @@ impl TableReaderExecutor {
             store_type: tidb_kv::store_type::StoreType::TiKv,
             net_data_size: e.net_data_size,
             client: e.client,
-            table_plan: e.table_plan.clone(),
+            table_plan: Arc::clone(e.table_plan),
             plan_ids: e.plan_ids,
             physical_table_id: e.physical_table_id,
             is_common_handle: e.is_common_handle,
@@ -583,7 +583,7 @@ impl TableReaderExecutor {
                 tidb_config::tikvcfg::get_global_config().tikv_client.enable_chunk_rpc,
             ),
             client,
-            table_plan: table_plan.clone(),
+            table_plan: Arc::new(table_plan.clone()),
             plan_ids,
             physical_table_id: ts.physical_table_id,
             is_common_handle: table.is_common_handle,
@@ -940,7 +940,7 @@ impl Executor for TableReaderExecutor {
         // (the table plan itself for `kv.TiFlash`), rebuilt here, so a
         // correlated filter reads the outer row as `corColInFilter` does.
         let plans = if self.store_type == tidb_kv::store_type::StoreType::TiFlash {
-            vec![&self.table_plan]
+            vec![self.table_plan.as_ref()]
         } else {
             tidb_planner_core_operator_physicalop::flatten_list_push_down_plan(&self.table_plan)
         };
@@ -1083,5 +1083,50 @@ impl Executor for TableReaderExecutor {
 
     fn new_chunk(&self) -> Chunk {
         self.meta.new_chunk()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tidb_kv::storage::TableStorage;
+
+    #[test]
+    fn table_readers_for_handle_batches_share_the_lookup_plan() {
+        let plan = Arc::new(PhysicalPlan::TableScan(Default::default()));
+        let ctx = crate::StmtContext::for_query();
+        let client = crate::test_store::store().client().unwrap();
+        for handle in [3, 7] {
+            let mut reader = TableReaderExecutor::build_table_reader_from_handles(
+                TableReaderForHandles {
+                    meta: ExecutorMeta::new(Schema::default(), 1, 32, 32),
+                    ctx: &ctx,
+                    client: Arc::clone(&client),
+                    table_plan: &plan,
+                    plan_ids: vec![1],
+                    dag: tipb::DagRequest {
+                        executors: vec![tipb::Executor {
+                            tp: Some(tipb::ExecType::TypeTableScan as i32),
+                            tbl_scan: Some(tipb::TableScan {
+                                table_id: Some(42),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    physical_table_id: 42,
+                    is_common_handle: false,
+                    columns: Vec::new(),
+                    start_ts: 10,
+                    net_data_size: 0.0,
+                },
+                &mut [tidb_txnkv::Handle::Int(tidb_txnkv::IntHandle::new(handle))],
+            )
+            .unwrap();
+            let reader_plan: &PhysicalPlan = &reader.table_plan;
+            assert!(std::ptr::eq(reader_plan, plan.as_ref()));
+            reader.close().unwrap();
+        }
     }
 }

@@ -870,8 +870,10 @@ pub(crate) struct FinalTableReader {
     pub meta: ExecutorMeta,
     pub ctx: crate::StmtContext,
     pub client: std::sync::Arc<dyn tidb_txnkv::Client>,
-    /// Go `tblPlans`, the table scan first.
-    pub table_plans: Vec<tidb_planner_core_operator_physicalop::PhysicalPlan>,
+    /// Root of Go `tblPlans`, shared by all table tasks.
+    pub table_plan: std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>,
+    /// Go `getPhysicalPlanIDs(e.tblPlans)`, the table scan first.
+    pub table_plan_ids: Vec<isize>,
     pub columns: Vec<tidb_model::GoShared<tidb_model::ColumnInfo>>,
     pub start_ts: u64,
     /// Go `dataAvgRowSize`.
@@ -927,7 +929,7 @@ impl IndexMergeReaderExecutor {
     /// says no table-side operator can remove rows.
     #[must_use]
     pub(crate) fn with_final_table_reader(mut self, final_table_reader: FinalTableReader) -> Self {
-        self.table_plan_is_scan = final_table_reader.table_plans.len() == 1;
+        self.table_plan_is_scan = final_table_reader.table_plan_ids.len() == 1;
         self.final_table_reader = Some(final_table_reader);
         self
     }
@@ -2322,7 +2324,7 @@ impl FinalTableReader {
     /// `Open` (`isCorColInTableFilter`).
     fn build_table_request(&mut self, output_len: usize) -> Result<(), ExecError> {
         let statement = crate::remote_scan::pushdown_statement_context(&self.ctx);
-        let plans: Vec<&tidb_planner_core_operator_physicalop::PhysicalPlan> = self.table_plans.iter().collect();
+        let plans = tidb_planner_core_operator_physicalop::flatten_list_push_down_plan(&self.table_plan);
         let mut table_request = crate::builder_utils::construct_dag_req(
             &self.ctx,
             &statement,
@@ -2368,11 +2370,8 @@ impl FinalTableReader {
                 meta: self.meta.clone(),
                 ctx: &self.ctx,
                 client: std::sync::Arc::clone(&self.client),
-                table_plan: self
-                    .table_plans
-                    .last()
-                    .ok_or_else(|| ExecError::internal("the index merge reader has no table plans"))?,
-                plan_ids: self.table_plans.iter().map(|plan| plan.id() as isize).collect(),
+                table_plan: &self.table_plan,
+                plan_ids: self.table_plan_ids.clone(),
                 dag: table_request,
                 physical_table_id: self.physical_table_id,
                 is_common_handle: self.is_common_handle,
