@@ -1146,9 +1146,10 @@ pub(crate) struct PointGet<PdC: PdClient> {
 impl<PdC: PdClient> PointGet<PdC> {
     /// Sends the Get for the physical `key` and returns its value. The
     /// block reads `self`'s fields in place: moving them into locals would
-    /// keep a second copy of them in the future.
+    /// keep a second copy of them in the future. Pin the read once so each
+    /// tracing scope and the buffer's miss handler move only its handle.
     pub(crate) fn run(self, key: Key) -> impl Future<Output = Result<Option<Value>>> + Send {
-        async move {
+        Box::pin(async move {
             let snapshot_version = self.timestamp.version();
             let mut request = new_get_request(key, self.timestamp.clone());
             let resource_group_tag = apply_snapshot_resource_group_tag(
@@ -1211,7 +1212,7 @@ impl<PdC: PdClient> PointGet<PdC> {
                 validator.check_visibility(snapshot_version).await?;
             }
             Ok(value)
-        }
+        })
     }
 }
 
