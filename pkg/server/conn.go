@@ -1694,6 +1694,7 @@ func (cc *clientConn) writeOK(ctx context.Context) error {
 }
 
 func (cc *clientConn) writeOkWith(ctx context.Context, header byte, flush bool, status uint16) error {
+	status = cc.tidbOneStatus(status) // tidb-one: session tracking for the locality router
 	msg := cc.ctx.LastMessage()
 	affectedRows := cc.ctx.AffectedRows()
 	lastInsertID := cc.ctx.LastInsertID()
@@ -1776,6 +1777,7 @@ func (cc *clientConn) writeError(ctx context.Context, e error) error {
 // serverStatus, a flag bit represents server information in the packet.
 // Note: it is callers' responsibility to ensure correctness of serverStatus.
 func (cc *clientConn) writeEOF(ctx context.Context, serverStatus uint16) error {
+	serverStatus = cc.tidbOneStatus(serverStatus) // tidb-one: session tracking for the locality router
 	if cc.capability&mysql.ClientDeprecateEOF > 0 {
 		return cc.writeOkWith(ctx, mysql.EOFHeader, false, serverStatus)
 	}
@@ -2256,6 +2258,7 @@ func (cc *clientConn) handleStmt(
 		clearConnectionAlive = cc.setSQLKillerConnectionAlive()
 		defer clearConnectionAlive()
 	}
+	cc.tidbOneBeginStmt(stmt) // tidb-one: session tracking for the locality router
 	rs, err := cc.ctx.ExecuteStmt(ctx, stmt)
 	if rs == nil || err != nil {
 		clearConnectionAlive()

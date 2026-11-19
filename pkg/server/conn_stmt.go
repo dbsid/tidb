@@ -280,6 +280,7 @@ func (cc *clientConn) executePreparedStmtAndWriteResult(ctx context.Context, stm
 		clearConnectionAlive = cc.setSQLKillerConnectionAlive()
 		defer clearConnectionAlive()
 	}
+	cc.tidbOneBeginExecute(prepStmt, execStmt) // tidb-one: session tracking for the locality router
 	rs, err := (&cc.ctx).ExecuteStmt(ctx, execStmt)
 	if rs == nil || err != nil {
 		clearConnectionAlive()
