@@ -19,10 +19,16 @@
 // TiKV is linked as a static library (tikv/cmd/tikv-embed) through cgo. After
 // Start, requests whose target is the local store are handed to TiKV in
 // process: client-go encodes the request once as a protobuf
-// BatchCommandsRequest.Request, TiKV executes it on its own thread pools, and
-// the protobuf response is decoded directly from TiKV's buffer. gRPC, HTTP/2
+// BatchCommandsRequest.Request, TiKV executes it on its own thread pools and
+// passes the protobuf response to a completion callback. gRPC, HTTP/2
 // framing, the batch-commands stream envelope and the loopback socket are not
 // involved. Requests for other stores keep using gRPC.
+//
+// A local call does not hold an OS thread while TiKV works: the caller
+// submits the request and waits on a channel, so cancellation (KILL), the
+// request timeout and the context deadline end the wait as they do for gRPC.
+// In-flight local calls are capped (SetMaxInFlight); above the cap requests
+// use gRPC.
 package embedded
 
 /*
@@ -34,9 +40,15 @@ package embedded
 int32_t tikv_embed_start(const char *const *argv, int32_t argc);
 int32_t tikv_embed_wait_ready(uint64_t timeout_ms);
 uint64_t tikv_embed_store_id(void);
-int32_t tikv_embed_call(const uint8_t *req, size_t req_len, uint8_t **resp, size_t *resp_len);
+typedef void (*tikv_embed_done_fn)(uint64_t token, int32_t code, uint8_t *resp, size_t resp_len);
+void tikv_embed_set_done(tikv_embed_done_fn done);
+int32_t tikv_embed_submit(const uint8_t *req, size_t req_len, uint64_t token);
+int32_t tikv_embed_health_feedback(uint8_t **out, size_t *out_len, uint64_t *interval_ms);
 void tikv_embed_free(uint8_t *ptr, size_t len);
 int32_t tikv_embed_stop(bool graceful, uint64_t timeout_ms);
+
+// Implemented in Go (callback.go).
+void tidbOneEmbedDone(uint64_t token, int32_t code, uint8_t *resp, size_t resp_len);
 */
 import "C"
 
@@ -49,7 +61,9 @@ import (
 	"unsafe"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
+	"github.com/pingcap/tidb/pkg/store/embedded/calls"
 	"github.com/tikv/client-go/v2/tikv"
 )
 
@@ -99,11 +113,16 @@ func (cfg *Config) Args() []string {
 	return args
 }
 
+// DefaultMaxInFlight is the default cap on in-flight local calls.
+const DefaultMaxInFlight = 8192
+
 // Store is the in-process TiKV. It implements tikv.LocalStore.
 type Store struct {
-	addr    string
-	storeID uint64
-	stopped atomic.Bool
+	addr     string
+	storeID  uint64
+	stopped  atomic.Bool
+	calls    *calls.Pending
+	maxCalls atomic.Int64
 }
 
 var _ tikv.LocalStore = (*Store)(nil)
@@ -141,8 +160,19 @@ func Start(cfg *Config, readyTimeout time.Duration) (*Store, error) {
 	if addr == "" {
 		addr = cfg.Addr
 	}
-	return &Store{addr: addr, storeID: uint64(C.tikv_embed_store_id())}, nil
+	C.tikv_embed_set_done(C.tikv_embed_done_fn(C.tidbOneEmbedDone))
+	s := &Store{addr: addr, storeID: uint64(C.tikv_embed_store_id()), calls: pending}
+	s.maxCalls.Store(DefaultMaxInFlight)
+	return s, nil
 }
+
+// SetMaxInFlight caps in-flight local calls; requests above the cap use
+// gRPC. n <= 0 removes the cap.
+func (s *Store) SetMaxInFlight(n int64) { s.maxCalls.Store(n) }
+
+// InFlight returns the number of local calls TiKV has not answered yet,
+// including calls whose caller stopped waiting.
+func (s *Store) InFlight() int64 { return s.calls.InFlight() }
 
 // StoreID returns the ID of the local store.
 func (s *Store) StoreID() uint64 { return s.storeID }
@@ -158,44 +188,81 @@ func (s *Store) IsLocal(addr string, storeID uint64) bool {
 	return addr == s.addr
 }
 
-// Call implements tikv.LocalStore. It blocks the calling goroutine's thread
-// until TiKV answers; the work itself runs on TiKV's thread pools.
-func (s *Store) Call(_ context.Context, req []byte, resp *tikvpb.BatchCommandsResponse_Response, _ time.Duration) error {
+// Call implements tikv.LocalStore. It submits req to TiKV and waits for the
+// response, ctx or timeout (0: no timeout), whichever comes first. A call
+// given up on keeps running in TiKV until it finishes, as a gRPC request
+// does; its response is dropped.
+func (s *Store) Call(ctx context.Context, req []byte, resp *tikvpb.BatchCommandsResponse_Response, timeout time.Duration) error {
 	if s.stopped.Load() {
 		return tikv.ErrLocalStoreUnavailable
 	}
-	var (
-		reqPtr *C.uint8_t
-		out    *C.uint8_t
-		outLen C.size_t
-	)
+	if max := s.maxCalls.Load(); max > 0 && s.calls.InFlight() >= max {
+		return tikv.ErrLocalStoreUnavailable
+	}
+	token, ch := s.calls.Add()
+	var reqPtr *C.uint8_t
 	if len(req) > 0 {
 		reqPtr = (*C.uint8_t)(unsafe.Pointer(&req[0]))
 	}
-	rc := C.tikv_embed_call(reqPtr, C.size_t(len(req)), &out, &outLen)
+	switch rc := C.tikv_embed_submit(reqPtr, C.size_t(len(req)), C.uint64_t(token)); rc {
+	case codeOK:
+	case codeUnavailable:
+		s.calls.Unsubmitted(token)
+		return tikv.ErrLocalStoreUnavailable
+	default:
+		s.calls.Unsubmitted(token)
+		return errors.Errorf("embedded TiKV rejected the request (code %d)", int(rc))
+	}
+	var timer <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		timer = t.C
+	}
+	select {
+	case r := <-ch:
+		if r.Code != codeOK {
+			return errors.Errorf("embedded TiKV call failed (code %d): %s", int(r.Code), r.Data)
+		}
+		// r.Data is Go memory: kvproto decodes some byte fields
+		// (sharedbytes.SharedBytes, e.g. coprocessor data) without copying.
+		return resp.Unmarshal(r.Data)
+	case <-ctx.Done():
+		s.calls.Abandon(token)
+		return errors.WithStack(ctx.Err())
+	case <-timer:
+		s.calls.Abandon(token)
+		return errors.WithMessage(context.DeadlineExceeded, "wait embedded TiKV")
+	}
+}
+
+// HealthFeedback returns the local store's health feedback and how long to
+// wait before asking again. It implements the optional health feedback
+// interface of tikv.LocalStore; the gRPC batch-commands stream delivers the
+// same feedback for remote stores.
+func (s *Store) HealthFeedback() (*kvrpcpb.HealthFeedback, time.Duration, error) {
+	if s.stopped.Load() {
+		return nil, 0, tikv.ErrLocalStoreUnavailable
+	}
+	var (
+		out      *C.uint8_t
+		outLen   C.size_t
+		interval C.uint64_t
+	)
+	rc := C.tikv_embed_health_feedback(&out, &outLen, &interval)
 	if out != nil {
 		defer C.tikv_embed_free(out, outLen)
 	}
-	switch rc {
-	case codeOK:
-		// Copy into Go memory before decoding: kvproto decodes some byte
-		// fields (sharedbytes.SharedBytes, e.g. coprocessor data) without
-		// copying, so the decoded response may alias the buffer, and TiKV's
-		// buffer is freed when Call returns.
-		var buf []byte
-		if out != nil && outLen > 0 {
-			buf = C.GoBytes(unsafe.Pointer(out), C.int(outLen))
-		}
-		return resp.Unmarshal(buf)
-	case codeUnavailable:
-		return tikv.ErrLocalStoreUnavailable
-	default:
-		var msg string
-		if out != nil && outLen > 0 {
-			msg = C.GoStringN((*C.char)(unsafe.Pointer(out)), C.int(outLen))
-		}
-		return errors.Errorf("embedded TiKV call failed (code %d): %s", int(rc), msg)
+	if rc != codeOK {
+		return nil, 0, tikv.ErrLocalStoreUnavailable
 	}
+	fb := &kvrpcpb.HealthFeedback{}
+	if out != nil && outLen > 0 {
+		if err := fb.Unmarshal(C.GoBytes(unsafe.Pointer(out), C.int(outLen))); err != nil {
+			return nil, 0, err
+		}
+	}
+	return fb, time.Duration(interval) * time.Millisecond, nil
 }
 
 // Stop shuts TiKV down. Requests sent afterwards fall back to gRPC.
