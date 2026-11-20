@@ -63,7 +63,7 @@ func (b *builtinConnectionIDSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk,
 	if data == nil {
 		return errors.Errorf("Missing session variable in `builtinConnectionIDSig.vecEvalInt`")
 	}
-	connectionID := int64(data.ConnectionID)
+	connectionID := int64(tidbOneConnectionID(data)) // tidb-one: session groups for the locality router
 	result.ResizeInt64(n, false)
 	i64s := result.Int64s()
 	for i := range n {

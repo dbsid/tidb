@@ -17,6 +17,9 @@
 package server
 
 import (
+	"math"
+	"strconv"
+
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
@@ -55,6 +58,30 @@ func init() {
 		Value: vardef.Off,
 		Type:  vardef.TypeBool,
 	})
+	// The router sets the session group on each backend connection of a
+	// client session; see sessiontrack.SessionGroupVar.
+	variable.RegisterSysVar(&variable.SysVar{
+		Scope:    vardef.ScopeSession,
+		Name:     sessiontrack.SessionGroupVar,
+		Value:    "0",
+		Type:     vardef.TypeUnsigned,
+		MinValue: 0,
+		MaxValue: math.MaxUint64,
+		SetSession: func(s *variable.SessionVars, val string) error {
+			g, err := strconv.ParseUint(val, 10, 64)
+			if err != nil {
+				return err
+			}
+			sessiontrack.SetConnGroup(s.ConnectionID, g)
+			return nil
+		},
+	})
+	sessiontrack.EnableGroups()
+}
+
+// tidbOneForgetConn drops a closed connection from its session group.
+func (cc *clientConn) tidbOneForgetConn() {
+	sessiontrack.ForgetConn(cc.connectionID)
 }
 
 func tidbOneTracking(vars *variable.SessionVars) bool {

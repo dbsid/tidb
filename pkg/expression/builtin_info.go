@@ -430,7 +430,7 @@ func (b *builtinConnectionIDSig) evalInt(ctx EvalContext, row chunk.Row) (int64,
 	if data == nil {
 		return 0, true, errors.Errorf("Missing session variable `builtinConnectionIDSig.evalInt`")
 	}
-	return int64(data.ConnectionID), false, nil
+	return int64(tidbOneConnectionID(data)), false, nil // tidb-one: session groups for the locality router
 }
 
 type lastInsertIDFunctionClass struct {

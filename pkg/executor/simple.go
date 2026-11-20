@@ -3079,6 +3079,7 @@ func (e *SimpleExec) executeKillStmt(ctx context.Context, s *ast.KillStmt) error
 		logutil.BgLogger().Info("Killing connection in current instance redirected from remote TiDB", zap.Uint64("conn", s.ConnectionID), zap.Bool("query", s.Query),
 			zap.String("sourceAddr", e.Ctx().GetSessionVars().SourceAddr.IP.String()))
 		killBySQLStmt(sm, s.ConnectionID, s.Query, true)
+		tidbOneKillGroupLocal(sm, s.ConnectionID, s.Query, true) // tidb-one: session groups for the locality router
 		return nil
 	}
 
@@ -3106,6 +3107,7 @@ func (e *SimpleExec) executeKillStmt(ctx context.Context, s *ast.KillStmt) error
 	} else {
 		killBySQLStmt(sm, s.ConnectionID, s.Query, false)
 	}
+	e.tidbOneKillGroup(ctx, sm, s.ConnectionID, gcid.ServerID, s.Query) // tidb-one: session groups for the locality router
 
 	return nil
 }
