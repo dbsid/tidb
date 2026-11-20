@@ -43,6 +43,8 @@ var (
 	embeddedTiKVReadyWait   *time.Duration
 	embeddedTiKVStopTimeout *time.Duration
 	embeddedTiKVLocalCall   *bool
+	embeddedTiKVMaxInFlight *int64
+	embeddedTiKVSyncWait    *time.Duration
 	embeddedTiKVStore       *embedded.Store
 )
 
@@ -61,6 +63,10 @@ func registerEmbeddedTiKVFlags(fset *flag.FlagSet) {
 	embeddedTiKVStopTimeout = fset.Duration("tikv.stop-timeout", time.Minute, "embedded TiKV: shutdown timeout")
 	embeddedTiKVLocalCall = fset.Bool("tikv.local-call", true,
 		"embedded TiKV: serve requests for the local store in process; false sends them over loopback gRPC (for comparison)")
+	embeddedTiKVMaxInFlight = fset.Int64("tikv.local-max-inflight", embedded.DefaultMaxInFlight,
+		"embedded TiKV: cap on in-flight local requests; requests above it use gRPC (0: no cap)")
+	embeddedTiKVSyncWait = fset.Duration("tikv.local-sync-wait", embedded.DefaultSyncWait,
+		"embedded TiKV: how long a local request holds its thread before it is answered through a callback")
 }
 
 // startEmbeddedTiKV starts the embedded TiKV and routes local requests to it.
@@ -82,6 +88,8 @@ func startEmbeddedTiKV() {
 		os.Exit(exitCodeErr)
 	}
 	embeddedTiKVStore = s
+	s.SetMaxInFlight(*embeddedTiKVMaxInFlight)
+	s.SetSyncWait(*embeddedTiKVSyncWait)
 	if *embeddedTiKVLocalCall {
 		tikv.SetDefaultLocalStore(s)
 	} else {
