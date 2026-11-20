@@ -415,6 +415,7 @@ func closeConn(cc *clientConn) error {
 	var err error
 	cc.closeOnce.Do(func() {
 		if cc.connectionID > 0 {
+			cc.tidbOneForgetConn() // tidb-one: session groups for the locality router
 			cc.server.dom.ReleaseConnID(cc.connectionID)
 			cc.connectionID = 0
 		}

@@ -25,3 +25,5 @@ func (*clientConn) tidbOneBeginStmt(ast.StmtNode) {}
 func (*clientConn) tidbOneBeginExecute(any, *ast.ExecuteStmt) {}
 
 func (*clientConn) tidbOneStatus(status uint16) uint16 { return status }
+
+func (*clientConn) tidbOneForgetConn() {}
