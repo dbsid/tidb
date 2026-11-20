@@ -71,8 +71,9 @@ func (p *Pending) remove(token uint64) chan Result {
 	return ch
 }
 
-// Unsubmitted removes a call TiKV did not accept; no callback will come.
-func (p *Pending) Unsubmitted(token uint64) {
+// NoCallback removes a call for which no callback will come: TiKV did not
+// accept it, or answered it synchronously.
+func (p *Pending) NoCallback(token uint64) {
 	if p.remove(token) != nil {
 		p.inFlight.Add(-1)
 	}
@@ -93,6 +94,6 @@ func (p *Pending) Take(token uint64) chan<- Result {
 	return nil
 }
 
-// InFlight returns the number of submitted calls without a callback yet, and
-// of registered calls not submitted yet.
+// InFlight returns the number of registered calls that have not been answered
+// (synchronously or by the callback), including abandoned ones.
 func (p *Pending) InFlight() int64 { return p.inFlight.Load() }

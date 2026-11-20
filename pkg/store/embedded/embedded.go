@@ -24,11 +24,13 @@
 // framing, the batch-commands stream envelope and the loopback socket are not
 // involved. Requests for other stores keep using gRPC.
 //
-// A local call does not hold an OS thread while TiKV works: the caller
-// submits the request and waits on a channel, so cancellation (KILL), the
-// request timeout and the context deadline end the wait as they do for gRPC.
-// In-flight local calls are capped (SetMaxInFlight); above the cap requests
-// use gRPC.
+// A local call holds its OS thread for at most a short synchronous wait
+// (SetSyncWait): most requests finish within it and cost one thread wake-up.
+// A longer request (lock wait, large scan) is answered through a completion
+// callback while the caller waits on a channel, so cancellation (KILL), the
+// request timeout and the context deadline end the wait as they do for gRPC,
+// and long requests do not pin threads. In-flight local calls are capped
+// (SetMaxInFlight); above the cap requests use gRPC.
 package embedded
 
 /*
@@ -42,7 +44,7 @@ int32_t tikv_embed_wait_ready(uint64_t timeout_ms);
 uint64_t tikv_embed_store_id(void);
 typedef void (*tikv_embed_done_fn)(uint64_t token, int32_t code, uint8_t *resp, size_t resp_len);
 void tikv_embed_set_done(tikv_embed_done_fn done);
-int32_t tikv_embed_submit(const uint8_t *req, size_t req_len, uint64_t token);
+int32_t tikv_embed_submit(const uint8_t *req, size_t req_len, uint64_t token, uint64_t wait_us, uint8_t **resp, size_t *resp_len);
 int32_t tikv_embed_health_feedback(uint8_t **out, size_t *out_len, uint64_t *interval_ms);
 void tikv_embed_free(uint8_t *ptr, size_t len);
 int32_t tikv_embed_stop(bool graceful, uint64_t timeout_ms);
@@ -76,6 +78,7 @@ const (
 	codeTimeout        = 4
 	codeExited         = 5
 	codeAlreadyStarted = 6
+	codePending        = 7
 )
 
 // Config describes the embedded TiKV. Fields map to tikv-server flags.
@@ -113,8 +116,14 @@ func (cfg *Config) Args() []string {
 	return args
 }
 
-// DefaultMaxInFlight is the default cap on in-flight local calls.
+// DefaultMaxInFlight is the default cap on in-flight local calls. Each call
+// can hold an OS thread for up to the synchronous wait, so the cap also keeps
+// the thread count below Go's limit of 10,000.
 const DefaultMaxInFlight = 8192
+
+// DefaultSyncWait is how long a local call waits synchronously before it
+// continues through the completion callback.
+const DefaultSyncWait = time.Millisecond
 
 // Store is the in-process TiKV. It implements tikv.LocalStore.
 type Store struct {
@@ -123,6 +132,7 @@ type Store struct {
 	stopped  atomic.Bool
 	calls    *calls.Pending
 	maxCalls atomic.Int64
+	syncWait atomic.Int64 // microseconds
 }
 
 var _ tikv.LocalStore = (*Store)(nil)
@@ -163,8 +173,13 @@ func Start(cfg *Config, readyTimeout time.Duration) (*Store, error) {
 	C.tikv_embed_set_done(C.tikv_embed_done_fn(C.tidbOneEmbedDone))
 	s := &Store{addr: addr, storeID: uint64(C.tikv_embed_store_id()), calls: pending}
 	s.maxCalls.Store(DefaultMaxInFlight)
+	s.SetSyncWait(DefaultSyncWait)
 	return s, nil
 }
+
+// SetSyncWait sets how long a local call holds its thread waiting for TiKV
+// before it continues through the completion callback.
+func (s *Store) SetSyncWait(d time.Duration) { s.syncWait.Store(d.Microseconds()) }
 
 // SetMaxInFlight caps in-flight local calls; requests above the cap use
 // gRPC. n <= 0 removes the cap.
@@ -189,9 +204,9 @@ func (s *Store) IsLocal(addr string, storeID uint64) bool {
 }
 
 // Call implements tikv.LocalStore. It submits req to TiKV and waits for the
-// response, ctx or timeout (0: no timeout), whichever comes first. A call
-// given up on keeps running in TiKV until it finishes, as a gRPC request
-// does; its response is dropped.
+// response, ctx or timeout (0: no timeout), whichever comes first; the first
+// SetSyncWait of the wait is synchronous. A call given up on keeps running in
+// TiKV until it finishes, as a gRPC request does; its response is dropped.
 func (s *Store) Call(ctx context.Context, req []byte, resp *tikvpb.BatchCommandsResponse_Response, timeout time.Duration) error {
 	if s.stopped.Load() {
 		return tikv.ErrLocalStoreUnavailable
@@ -204,13 +219,32 @@ func (s *Store) Call(ctx context.Context, req []byte, resp *tikvpb.BatchCommands
 	if len(req) > 0 {
 		reqPtr = (*C.uint8_t)(unsafe.Pointer(&req[0]))
 	}
-	switch rc := C.tikv_embed_submit(reqPtr, C.size_t(len(req)), C.uint64_t(token)); rc {
-	case codeOK:
+	var (
+		out    *C.uint8_t
+		outLen C.size_t
+	)
+	rc := C.tikv_embed_submit(reqPtr, C.size_t(len(req)), C.uint64_t(token), C.uint64_t(s.syncWait.Load()), &out, &outLen)
+	switch rc {
+	case codePending:
+	case codeOK, codeError:
+		// Answered within the synchronous wait; no callback follows.
+		s.calls.NoCallback(token)
+		var data []byte
+		if out != nil {
+			// Copy into Go memory: kvproto decodes some byte fields
+			// (sharedbytes.SharedBytes) without copying.
+			data = C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+			C.tikv_embed_free(out, outLen)
+		}
+		if rc != codeOK {
+			return errors.Errorf("embedded TiKV call failed (code %d): %s", int(rc), data)
+		}
+		return resp.Unmarshal(data)
 	case codeUnavailable:
-		s.calls.Unsubmitted(token)
+		s.calls.NoCallback(token)
 		return tikv.ErrLocalStoreUnavailable
 	default:
-		s.calls.Unsubmitted(token)
+		s.calls.NoCallback(token)
 		return errors.Errorf("embedded TiKV rejected the request (code %d)", int(rc))
 	}
 	var timer <-chan time.Time

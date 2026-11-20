@@ -35,7 +35,7 @@ func TestPending(t *testing.T) {
 
 	// Not accepted by TiKV: no callback follows.
 	tok, _ = p.Add()
-	p.Unsubmitted(tok)
+	p.NoCallback(tok)
 	require.EqualValues(t, 0, p.InFlight())
 
 	// Abandoned (cancelled, timed out): in flight until the callback.
