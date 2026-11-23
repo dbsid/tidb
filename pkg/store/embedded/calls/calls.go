@@ -88,10 +88,7 @@ func (p *Pending) Abandon(token uint64) { p.remove(token) }
 // up; the callback then skips copying the response.
 func (p *Pending) Take(token uint64) chan<- Result {
 	p.inFlight.Add(-1)
-	if ch := p.remove(token); ch != nil {
-		return ch
-	}
-	return nil
+	return p.remove(token)
 }
 
 // InFlight returns the number of registered calls that have not been answered

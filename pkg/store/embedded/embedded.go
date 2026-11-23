@@ -24,13 +24,15 @@
 // framing, the batch-commands stream envelope and the loopback socket are not
 // involved. Requests for other stores keep using gRPC.
 //
-// A local call holds its OS thread for at most a short synchronous wait
-// (SetSyncWait): most requests finish within it and cost one thread wake-up.
-// A longer request (lock wait, large scan) is answered through a completion
-// callback while the caller waits on a channel, so cancellation (KILL), the
-// request timeout and the context deadline end the wait as they do for gRPC,
-// and long requests do not pin threads. In-flight local calls are capped
-// (SetMaxInFlight); above the cap requests use gRPC.
+// By default a local call does not wait for TiKV: tikv_embed_submit starts
+// the request on TiKV's pools and returns, the caller waits on a channel, and
+// the TiKV thread that finishes the request answers it through a completion
+// callback. Cancellation (KILL), the request timeout and the context deadline
+// end the wait as they do for gRPC, and no OS thread is held while TiKV
+// works. SetSyncWait makes a call first hold its thread for a short
+// synchronous wait; a request that finishes within it is answered without
+// the callback. In-flight local calls are capped (SetMaxInFlight); above the
+// cap requests use gRPC.
 package embedded
 
 /*
@@ -116,14 +118,21 @@ func (cfg *Config) Args() []string {
 	return args
 }
 
-// DefaultMaxInFlight is the default cap on in-flight local calls. Each call
-// can hold an OS thread for up to the synchronous wait, so the cap also keeps
-// the thread count below Go's limit of 10,000.
+// DefaultMaxInFlight is the default cap on in-flight local calls: it bounds
+// the requests one process has started in TiKV and not yet seen answered.
+// With a synchronous wait (SetSyncWait) each call can also hold an OS thread
+// for up to that wait, and the cap then keeps the thread count below Go's
+// limit of 10,000.
 const DefaultMaxInFlight = 8192
 
-// DefaultSyncWait is how long a local call waits synchronously before it
-// continues through the completion callback.
-const DefaultSyncWait = time.Millisecond
+// DefaultSyncWait is how long a local call holds its thread waiting for TiKV
+// before it continues through the completion callback. It is 0. With a wait,
+// a request that finishes within it (nearly every point read) is a blocking
+// cgo call: the OS thread sleeps until the TiKV thread wakes it, and the
+// goroutine's P stays in the syscall state meanwhile. Without one the call
+// returns at once, the goroutine parks in the Go scheduler and its thread runs
+// other goroutines; sysbench point_select is about 5% faster.
+const DefaultSyncWait time.Duration = 0
 
 // Store is the in-process TiKV. It implements tikv.LocalStore.
 type Store struct {
@@ -178,7 +187,7 @@ func Start(cfg *Config, readyTimeout time.Duration) (*Store, error) {
 }
 
 // SetSyncWait sets how long a local call holds its thread waiting for TiKV
-// before it continues through the completion callback.
+// before it continues through the completion callback (0: it does not wait).
 func (s *Store) SetSyncWait(d time.Duration) { s.syncWait.Store(d.Microseconds()) }
 
 // SetMaxInFlight caps in-flight local calls; requests above the cap use
@@ -249,8 +258,8 @@ func (s *Store) Call(ctx context.Context, req []byte, resp *tikvpb.BatchCommands
 	}
 	var timer <-chan time.Time
 	if timeout > 0 {
-		t := time.NewTimer(timeout)
-		defer t.Stop()
+		t := calls.GetTimer(timeout)
+		defer calls.PutTimer(t)
 		timer = t.C
 	}
 	select {
