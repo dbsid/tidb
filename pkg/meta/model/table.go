@@ -224,6 +224,10 @@ type TableInfo struct {
 	// If it is nil, it means no affinity
 	Affinity *TableAffinityInfo `json:"affinity,omitempty"`
 
+	// PartitionGroup references the partition group that allocates the
+	// physical IDs of this table's partitions. Nil means not a member.
+	PartitionGroup *PartitionGroupRefInfo `json:"partition_group,omitempty"`
+
 	// TableSplitPolicy stores region split policy.
 	TableSplitPolicy *RegionSplitPolicy `json:"table_split_policy,omitempty"`
 
@@ -316,6 +320,9 @@ func (t *TableInfo) Clone() *TableInfo {
 
 	if t.Affinity != nil {
 		nt.Affinity = t.Affinity.Clone()
+	}
+	if t.PartitionGroup != nil {
+		nt.PartitionGroup = t.PartitionGroup.Clone()
 	}
 	nt.StorageClassTransitions = slices.Clone(t.StorageClassTransitions)
 	if t.MaterializedViewBase != nil {

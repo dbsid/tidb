@@ -66,6 +66,8 @@ const (
 	CreateMaskingPolicyCommand = "CREATE MASKING POLICY"
 	// CreateResourceGroupCommand represents CREATE RESOURCE GROUP statement
 	CreateResourceGroupCommand = "CREATE RESOURCE GROUP"
+	// CreatePartitionGroupCommand represents CREATE PARTITION GROUP statement
+	CreatePartitionGroupCommand = "CREATE PARTITION GROUP"
 	// CreateSequenceCommand represents CREATE SEQUENCE statement
 	CreateSequenceCommand = "CREATE SEQUENCE"
 	// CreateTableCommand represents CREATE TABLE statement
@@ -94,6 +96,8 @@ const (
 	DropPlacementPolicyCommand = "DROP PLACEMENT POLICY"
 	// DropResourceGroupCommand represents DROP RESOURCE GROUP statement
 	DropResourceGroupCommand = "DROP RESOURCE GROUP"
+	// DropPartitionGroupCommand represents DROP PARTITION GROUP statement
+	DropPartitionGroupCommand = "DROP PARTITION GROUP"
 	// DropSequenceCommand represents DROP SEQUENCE statement
 	DropSequenceCommand = "DROP SEQUENCE"
 	// DropTableCommand represents DROP TABLE statement
@@ -292,6 +296,10 @@ const (
 	ShowAffinityCommand = "SHOW AFFINITY"
 	// ShowStorageClassTransitionsCommand represents SHOW STORAGE_CLASS TRANSITIONS statement.
 	ShowStorageClassTransitionsCommand = "SHOW STORAGE_CLASS TRANSITIONS"
+	// ShowPartitionGroupsCommand represents SHOW PARTITION GROUPS statement.
+	ShowPartitionGroupsCommand = "SHOW PARTITION GROUPS"
+	// ShowPartitionGroupStatusCommand represents SHOW PARTITION GROUP STATUS statement.
+	ShowPartitionGroupStatusCommand = "SHOW PARTITION GROUP STATUS"
 )
 
 // Admin Commands
@@ -639,6 +647,16 @@ func (n *DropResourceGroupStmt) SEMCommand() string {
 }
 
 // SEMCommand returns the command string for the statement.
+func (n *CreatePartitionGroupStmt) SEMCommand() string {
+	return CreatePartitionGroupCommand
+}
+
+// SEMCommand returns the command string for the statement.
+func (n *DropPartitionGroupStmt) SEMCommand() string {
+	return DropPartitionGroupCommand
+}
+
+// SEMCommand returns the command string for the statement.
 func (n *DropSequenceStmt) SEMCommand() string {
 	return DropSequenceCommand
 }
@@ -948,6 +966,10 @@ func (n *ShowStmt) SEMCommand() string {
 		return ShowAffinityCommand
 	case ShowStorageClassTransitions:
 		return ShowStorageClassTransitionsCommand
+	case ShowPartitionGroups:
+		return ShowPartitionGroupsCommand
+	case ShowPartitionGroupStatus:
+		return ShowPartitionGroupStatusCommand
 	default:
 		return UnknownCommand
 	}
