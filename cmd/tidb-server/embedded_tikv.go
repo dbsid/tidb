@@ -66,7 +66,7 @@ func registerEmbeddedTiKVFlags(fset *flag.FlagSet) {
 	embeddedTiKVMaxInFlight = fset.Int64("tikv.local-max-inflight", embedded.DefaultMaxInFlight,
 		"embedded TiKV: cap on in-flight local requests; requests above it use gRPC (0: no cap)")
 	embeddedTiKVSyncWait = fset.Duration("tikv.local-sync-wait", embedded.DefaultSyncWait,
-		"embedded TiKV: how long a local request holds its thread before it is answered through a callback")
+		"embedded TiKV: how long a local request holds its thread waiting for TiKV before it is answered through a callback (0: no wait)")
 }
 
 // startEmbeddedTiKV starts the embedded TiKV and routes local requests to it.
