@@ -166,6 +166,7 @@ mod region_request;
 mod resource_control;
 mod stats;
 mod store;
+pub use store::connection_thread;
 mod timestamp;
 pub mod util;
 

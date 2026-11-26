@@ -24,6 +24,8 @@ use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::SecurityManager;
 use crate::{Error, Result};
 
+pub mod connection_thread;
+
 const READ_TIMEOUT_SHORT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
@@ -176,6 +178,52 @@ pub struct TikvConnect {
 }
 
 impl TikvConnect {
+    async fn connect_channels(&self, address: &str) -> Result<KvRpcClient> {
+        let mut clients = Vec::with_capacity(self.grpc_connection_count);
+        let mut debug_clients = Vec::with_capacity(self.grpc_connection_count);
+        let mut channels = Vec::with_capacity(self.grpc_connection_count);
+        for _ in 0..self.grpc_connection_count {
+            let (client, debug_client, channel) = self
+                .security_mgr
+                .connect_with_http2_settings_and_timeout(
+                    address,
+                    self.grpc_keepalive_time,
+                    self.grpc_keepalive_timeout,
+                    self.grpc_initial_stream_window_size,
+                    self.grpc_initial_connection_window_size,
+                    Some(self.dial_timeout),
+                    |channel| {
+                        let debug_client = DebugClient::new(channel.clone())
+                            .max_decoding_message_size(self.grpc_max_decoding_message_size)
+                            .accept_compressed(CompressionEncoding::Gzip);
+                        let debug_client = if self.send_gzip_requests {
+                            debug_client.send_compressed(CompressionEncoding::Gzip)
+                        } else {
+                            debug_client
+                        };
+                        let client = TikvClient::new(channel.clone())
+                            .max_decoding_message_size(self.grpc_max_decoding_message_size)
+                            .accept_compressed(CompressionEncoding::Gzip);
+                        let client = if self.send_gzip_requests {
+                            client.send_compressed(CompressionEncoding::Gzip)
+                        } else {
+                            client
+                        };
+                        (client, debug_client, channel)
+                    },
+                )
+                .await?;
+            clients.push(client);
+            debug_clients.push(debug_client);
+            channels.push(channel);
+        }
+        Ok(
+            KvRpcClient::new_with_debug_clients(clients, debug_clients, self.timeout)
+                .with_channels(channels)
+                .with_open_tracing(self.open_tracing_enable),
+        )
+    }
+
     /// client-go `NewRPCClient` with the options `config` carries: timeouts,
     /// message size, compression, keepalive, window sizes, connection count,
     /// batching and tracing.
@@ -287,51 +335,12 @@ impl KvConnect for TikvConnect {
         address: &str,
         store_type: super::EndpointType,
     ) -> Result<KvRpcClient> {
-        let mut clients = Vec::with_capacity(self.grpc_connection_count);
-        let mut debug_clients = Vec::with_capacity(self.grpc_connection_count);
-        let mut channels = Vec::with_capacity(self.grpc_connection_count);
-        for _ in 0..self.grpc_connection_count {
-            let (client, debug_client, channel) = self
-                .security_mgr
-                .connect_with_http2_settings_and_timeout(
-                    address,
-                    self.grpc_keepalive_time,
-                    self.grpc_keepalive_timeout,
-                    self.grpc_initial_stream_window_size,
-                    self.grpc_initial_connection_window_size,
-                    Some(self.dial_timeout),
-                    |channel| {
-                        let debug_client = DebugClient::new(channel.clone())
-                            .max_decoding_message_size(self.grpc_max_decoding_message_size)
-                            .accept_compressed(CompressionEncoding::Gzip);
-                        let debug_client = if self.send_gzip_requests {
-                            debug_client.send_compressed(CompressionEncoding::Gzip)
-                        } else {
-                            debug_client
-                        };
-                        let client = TikvClient::new(channel.clone())
-                            .max_decoding_message_size(self.grpc_max_decoding_message_size)
-                            .accept_compressed(CompressionEncoding::Gzip);
-                        let client = if self.send_gzip_requests {
-                            client.send_compressed(CompressionEncoding::Gzip)
-                        } else {
-                            client
-                        };
-                        (client, debug_client, channel)
-                    },
-                )
-                .await?;
-            clients.push(client);
-            debug_clients.push(debug_client);
-            channels.push(channel);
-        }
-        let client = KvRpcClient::new_with_debug_clients(clients, debug_clients, self.timeout)
-            .with_channels(channels)
-            .with_open_tracing(self.open_tracing_enable);
+        let mut client = self.connect_channels(address).await?;
         // client-go `enableBatch := req.StoreTp == tikvrpc.TiKV`: TiFlash and
         // TiDB pools never batch. The worker owns only batchable physical
         // requests; unsupported requests retain the unary path below.
         Ok(if store_type == super::EndpointType::TiKv {
+            client.point_connector = Some(Arc::new(self.clone()));
             client.with_batch_worker(&self.batch_config)
         } else {
             client
@@ -1493,6 +1502,7 @@ pub trait ClientEventListener: Send + Sync {
 /// types and abstractions of the client program into the grpc data types.
 #[derive(Clone)]
 pub struct KvRpcClient {
+    point_connector: Option<Arc<TikvConnect>>,
     rpc_clients: Arc<[TikvClient<Channel>]>,
     /// The pool's channels, for client-go's `waitConnReady`; absent for a
     /// pool built from clients alone.
@@ -1529,7 +1539,7 @@ impl StoreMetrics {
 struct ConnectionInfo {
     address: String,
     version: u64,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     /// client-go `connPool.isIdle`: the batch loop found no request for its
     /// idle timeout and retired the pool; the next lookup recycles it.
     idle: AtomicBool,
@@ -1600,6 +1610,7 @@ impl KvRpcClient {
             .collect::<Vec<_>>()
             .into();
         Self {
+            point_connector: None,
             rpc_clients: rpc_clients.into(),
             channels: None,
             debug_clients,
@@ -1841,6 +1852,11 @@ impl KvRpcClient {
                         forwarded_host,
                     )
                     .await;
+            }
+            if let Some(send) =
+                connection_thread::dispatch_point_get(self, request, timeout, forwarded_host)
+            {
+                return send.await;
             }
             self.dispatch_uncollapsed(request, timeout, forwarded_host)
                 .await
@@ -2202,7 +2218,7 @@ impl KvClient for KvRpcClient {
         *self.connection.write().unwrap() = Some(Arc::new(ConnectionInfo {
             address,
             version,
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             idle: AtomicBool::new(false),
         }));
         for index in 0..self.rpc_clients.len() {

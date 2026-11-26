@@ -85,7 +85,7 @@ impl<'a, S: PdClient> TikvSnapshot<'a, S> {
         let before = self.stats.rpc_count(tikv_client::SnapshotRpcCommand::Get);
         let value = self
             .store
-            .block_on(self.snapshot.get(key.to_vec()))
+            .block_on_point_get(self.snapshot.get(key.to_vec()))
             .map_err(TikvTxn::<S>::client_read_error)?;
         Ok(SnapshotGetResult {
             start_ts: self.version,

@@ -366,6 +366,20 @@ impl<PdC: PdClient> TikvStore<PdC> {
         )
     }
 
+    /// Drive the point Get transport on the SQL connection's thread when
+    /// called from its service loop, preserving the statement's tracing span.
+    pub fn block_on_point_get<F>(&self, operation: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        let operation = crate::rpc::trace::with_span_ctx(tidb_tracing::current_span(), operation);
+        match tikv_client::connection_thread::try_block_on(self.runtime.handle(), operation) {
+            Ok(result) => result,
+            Err(operation) => block_on_runtime(&self.runtime, operation),
+        }
+    }
+
     /// client-go `KVStore.CheckVisibility`.
     pub fn check_visibility(&self, start_ts: u64) -> Result<(), VisibilityError> {
         self.store
