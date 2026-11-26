@@ -1170,7 +1170,7 @@ fn serve_connection_work<F: QuerySessionFactory>(
     static CONNECTION_POINT_IO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let result = if *CONNECTION_POINT_IO.get_or_init(|| {
         std::env::var("TIDB_EXPERIMENTAL_CONNECTION_POINT_IO").as_deref() == Ok("1")
-    }) {
+    }) || tidb_txnkv::driver::tikv_store::connection_read_io_enabled() {
         tikv_client::connection_thread::serve(serve)
     } else {
         serve()

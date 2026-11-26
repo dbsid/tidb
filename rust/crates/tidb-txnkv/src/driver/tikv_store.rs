@@ -366,9 +366,9 @@ impl<PdC: PdClient> TikvStore<PdC> {
         )
     }
 
-    /// Drive the point Get transport on the SQL connection's thread when
+    /// Drive the read transport on the SQL connection's thread when
     /// called from its service loop, preserving the statement's tracing span.
-    pub fn block_on_point_get<F>(&self, operation: F) -> F::Output
+    pub fn block_on_connection_read<F>(&self, operation: F) -> F::Output
     where
         F: std::future::Future + Send,
         F::Output: Send,
@@ -525,6 +525,13 @@ impl StoreTimestampFuture {
             future.wait().await.map_err(|error| error.to_string())
         })
     }
+}
+
+/// Whether a SQL worker should drive its lightweight reads through client-rust
+/// on its own thread, including unary DAG requests from its index lookup.
+pub fn connection_read_io_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TIDB_EXPERIMENTAL_CONNECTION_READ_IO").as_deref() == Ok("1"))
 }
 
 /// [`TikvStore::block_on`] on the process's store runtime, for components

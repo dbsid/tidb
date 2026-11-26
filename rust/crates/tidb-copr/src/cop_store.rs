@@ -215,10 +215,17 @@ impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
             conf_ver: region.1,
             ver: region.2,
         };
+        let connection_read = request.tp == tidb_txnkv::REQ_TYPE_DAG
+            && tidb_txnkv::driver::tikv_store::connection_read_io_enabled();
         let send = self
             .store()
             .send_req_ctx_with_stats(Arc::clone(backoffer), request, &region, timeout, stats);
-        let sent = self.block_on(with_statement_kv_context(kv_context, send));
+        let send = with_statement_kv_context(kv_context, send);
+        let sent = if connection_read {
+            self.block_on_connection_read(send)
+        } else {
+            self.block_on(send)
+        };
         match sent {
             Ok((response, address)) => Ok(NativeCopSend::Response(Box::new(response), address)),
             Err(tikv_client::Error::RegionError(error)) => {

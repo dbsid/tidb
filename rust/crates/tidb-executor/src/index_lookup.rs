@@ -794,7 +794,7 @@ impl IndexLookUpExecutor {
         let inline_enabled = *INLINE_POINT_RANGES.get_or_init(|| {
             std::env::var("TIDB_EXPERIMENTAL_INLINE_INDEX_LOOKUP").as_deref() == Ok("1")
         });
-        if inline_enabled
+        if (inline_enabled || tidb_txnkv::driver::tikv_store::connection_read_io_enabled())
             && index_worker.kv_ranges.len() == 1
             && index_worker.kv_ranges[0].len() <= init_batch_size
             && !self.index_look_up_push_down

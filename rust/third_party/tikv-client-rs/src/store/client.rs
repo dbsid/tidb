@@ -340,7 +340,7 @@ impl KvConnect for TikvConnect {
         // TiDB pools never batch. The worker owns only batchable physical
         // requests; unsupported requests retain the unary path below.
         Ok(if store_type == super::EndpointType::TiKv {
-            client.point_connector = Some(Arc::new(self.clone()));
+            client.read_connector = Some(Arc::new(self.clone()));
             client.with_batch_worker(&self.batch_config)
         } else {
             client
@@ -1502,7 +1502,7 @@ pub trait ClientEventListener: Send + Sync {
 /// types and abstractions of the client program into the grpc data types.
 #[derive(Clone)]
 pub struct KvRpcClient {
-    point_connector: Option<Arc<TikvConnect>>,
+    read_connector: Option<Arc<TikvConnect>>,
     rpc_clients: Arc<[TikvClient<Channel>]>,
     /// The pool's channels, for client-go's `waitConnReady`; absent for a
     /// pool built from clients alone.
@@ -1610,7 +1610,7 @@ impl KvRpcClient {
             .collect::<Vec<_>>()
             .into();
         Self {
-            point_connector: None,
+            read_connector: None,
             rpc_clients: rpc_clients.into(),
             channels: None,
             debug_clients,
@@ -1854,7 +1854,7 @@ impl KvRpcClient {
                     .await;
             }
             if let Some(send) =
-                connection_thread::dispatch_point_get(self, request, timeout, forwarded_host)
+                connection_thread::dispatch_connection_read(self, request, timeout, forwarded_host)
             {
                 return send.await;
             }
