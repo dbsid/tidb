@@ -2,6 +2,7 @@
 
 mod batch;
 mod client;
+pub use client::connection_thread;
 mod command;
 mod endpoint;
 mod errors;

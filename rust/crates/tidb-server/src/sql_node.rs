@@ -1151,19 +1151,31 @@ fn serve_connection_work<F: QuerySessionFactory>(
         .tls
         .as_ref()
         .and_then(|manager| manager.current());
-    if let Err(error) = serve_mysql_connection_with_runtime(
-        stream,
-        peer_addr,
-        cancellation,
-        factory.as_ref(),
-        users.as_ref(),
-        tracker,
-        MysqlConnectionRuntime {
-            server_port: Some(connection.server_port),
-            max_allowed_packet: connection.max_allowed_packet,
-            tls: tls.as_ref(),
-        },
-    ) {
+    let serve = || {
+        serve_mysql_connection_with_runtime(
+            stream,
+            peer_addr,
+            cancellation,
+            factory.as_ref(),
+            users.as_ref(),
+            tracker,
+            MysqlConnectionRuntime {
+                server_port: Some(connection.server_port),
+                max_allowed_packet: connection.max_allowed_packet,
+                tls: tls.as_ref(),
+            },
+        )
+    };
+    // The experiment owns its transport only for the lifetime of this socket.
+    static CONNECTION_POINT_IO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let result = if *CONNECTION_POINT_IO.get_or_init(|| {
+        std::env::var("TIDB_EXPERIMENTAL_CONNECTION_POINT_IO").as_deref() == Ok("1")
+    }) {
+        tikv_client::connection_thread::serve(serve)
+    } else {
+        serve()
+    };
+    if let Err(error) = result {
         log_connection_error(&error, peer_addr);
     }
 }
