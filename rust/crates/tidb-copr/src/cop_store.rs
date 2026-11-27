@@ -134,20 +134,22 @@ pub async fn with_ru_details<F: std::future::Future>(
 /// `util.RUDetailsCtxKey`) on every RPC, and its `ExecDetails` (Go
 /// `util.ExecDetailsKey`) where client-go does -- KV waits and traffic per
 /// send, PD waits, backoff sleeps of the Backoffers made under it.
-pub async fn with_statement_kv_context<'a, F>(
-    kv_context: &tidb_txnkv::StatementKvContext,
+pub fn with_statement_kv_context<'a, F>(
+    kv_context: &'a tidb_txnkv::StatementKvContext,
     future: F,
-) -> F::Output
+) -> impl std::future::Future<Output = F::Output> + Send + 'a
 where
     F: std::future::Future + Send + 'a,
 {
-    // Erased, so the ctx scope does not hold the caller's (possibly large)
-    // future inline on the blocking caller's stack.
+    // Box the send before constructing the tracing future. Otherwise the
+    // unpolled wrapper carries the entire RPC state through its callers.
     let future: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + 'a>> =
         Box::pin(future);
-    match kv_context.trace_context() {
-        Some(context) => tikv_client::trace::with_trace_context(context, future).await,
-        None => future.await,
+    async move {
+        match kv_context.trace_context() {
+            Some(context) => tikv_client::trace::with_trace_context(context, future).await,
+            None => future.await,
+        }
     }
 }
 
@@ -333,6 +335,30 @@ mod tests {
     use tikv_client::mock::{MockKvClient, MockPdClient};
 
     use super::*;
+
+    #[test]
+    fn statement_context_future_size_is_independent_of_the_rpc_state() {
+        fn request<const N: usize>() -> impl std::future::Future<Output = u8> {
+            let payload = [7; N];
+            std::future::poll_fn(move |_| {
+                std::task::Poll::Ready(std::hint::black_box(&payload)[0])
+            })
+        }
+
+        let context = tidb_txnkv::StatementKvContext::default();
+        let small = with_statement_kv_context(&context, request::<8>());
+        let large = with_statement_kv_context(&context, request::<8192>());
+        assert_eq!(
+            std::mem::size_of_val(&small),
+            std::mem::size_of_val(&large),
+            "the unpolled statement context must only retain a handle to the request"
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(
+            std::future::Future::poll(std::pin::pin!(large), &mut cx),
+            std::task::Poll::Ready(7)
+        );
+    }
 
     /// Go's coprocessor sends its `copReq` through `SendReqCtx` and reads the
     /// `*coprocessor.Response` it returns: the store sends the request it is
