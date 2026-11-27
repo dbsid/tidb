@@ -340,9 +340,7 @@ mod tests {
     fn statement_context_future_size_is_independent_of_the_rpc_state() {
         fn request<const N: usize>() -> impl std::future::Future<Output = u8> {
             let payload = [7; N];
-            std::future::poll_fn(move |_| {
-                std::task::Poll::Ready(std::hint::black_box(&payload)[0])
-            })
+            std::future::poll_fn(move |_| std::task::Poll::Ready(std::hint::black_box(&payload)[0]))
         }
 
         let context = tidb_txnkv::StatementKvContext::default();
