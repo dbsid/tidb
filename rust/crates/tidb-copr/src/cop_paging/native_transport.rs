@@ -375,6 +375,7 @@ impl<S: NativeCopStore + ?Sized> QueryTransport for NativeCopTransport<S> {
             logical_order,
             active_attempts,
             logical_index: 0,
+            initial_replies: None,
             closed: false,
             backoffers: BTreeMap::new(),
             exceeds_bound: BTreeMap::new(),
@@ -440,6 +441,8 @@ pub struct NativeCopResponse<S: ?Sized> {
     logical_order: Vec<u64>,
     active_attempts: BTreeMap<u64, u64>,
     logical_index: usize,
+    // Replies of the first wave, keyed by attempt for ordered delivery and paging fallback.
+    initial_replies: Option<Vec<(u64, Result<InitialReply, NativeCopError>)>>,
     closed: bool,
     /// Go's per-task `bo`, by logical task.
     backoffers: BTreeMap<u64, CopBackoffer>,
@@ -462,7 +465,12 @@ struct CopSendAttempt {
     region: (u64, u64, u64),
     backoffer: CopBackoffer,
     stats: Arc<tikv_client::RegionRequestRuntimeStats>,
-    started: std::time::Instant,
+}
+
+struct InitialReply {
+    attempt: CopSendAttempt,
+    sent: Result<NativeCopSend, tikv_client::Error>,
+    elapsed: Duration,
 }
 
 impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
@@ -577,7 +585,6 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             region,
             backoffer,
             stats: req_stats,
-            started: std::time::Instant::now(),
         };
         Ok((attempt, wire))
     }
@@ -586,6 +593,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
         &mut self,
         attempt: CopSendAttempt,
         sent: Result<NativeCopSend, tikv_client::Error>,
+        cost_time: Duration,
     ) -> Result<(), NativeCopError> {
         let CopSendAttempt {
             logical_task_id,
@@ -594,7 +602,6 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             region,
             backoffer,
             stats: req_stats,
-            started,
         } = attempt;
         // Go `err = worker.req.RunawayChecker.CheckThresholds(nil, 0, err)`.
         let sent = match (sent, &self.metadata.runaway_checker) {
@@ -604,7 +611,6 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             },
             (sent, _) => sent?,
         };
-        let cost_time = started.elapsed();
         let (response, address) = match sent {
             NativeCopSend::Response(response, address) => (response, address.unwrap_or_default()),
             NativeCopSend::RegionError(error) => {
@@ -1034,6 +1040,15 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             let Some(&attempt_id) = self.active_attempts.get(&logical_task_id) else {
                 return self.fail("open logical task has no active attempt".to_owned());
             };
+            if let Some(reply) = self.initial_replies.as_mut().and_then(|replies| {
+                let pos = replies.iter().position(|(id, _)| *id == attempt_id)?;
+                Some(replies.swap_remove(pos).1)
+            }) {
+                let reply = reply.map_err(|error| self.send_error(error))?;
+                self.accept_send(reply.attempt, reply.sent, reply.elapsed)
+                    .map_err(|error| self.send_error(error))?;
+                continue;
+            }
             return Ok(ControlFlow::Continue((logical_task_id, attempt_id)));
         }
     }
@@ -1053,6 +1068,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             .clone()
             .map(|span| tidb_tracing::with_thread_span(Some(span)));
         let (attempt, wire) = self.prepare_send(logical, id)?;
+        let started = std::time::Instant::now();
         let sent = self.store.send(
             &attempt.backoffer,
             wire,
@@ -1061,7 +1077,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
             &self.kv_context,
             Some(Arc::clone(&attempt.stats)),
         );
-        self.accept_send(attempt, sent)
+        self.accept_send(attempt, sent, started.elapsed())
     }
 
     async fn dispatch_on_worker(&mut self, logical: u64, id: u64) -> Result<(), NativeCopError> {
@@ -1069,6 +1085,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
         let span = self.trace_parent.clone();
         let mut send = std::pin::pin!(async {
             let (attempt, wire) = self.prepare_send(logical, id)?;
+            let started = std::time::Instant::now();
             let sent = self
                 .store
                 .send_async(
@@ -1080,7 +1097,7 @@ impl<S: NativeCopStore + ?Sized> NativeCopResponse<S> {
                     Some(Arc::clone(&attempt.stats)),
                 )
                 .await;
-            self.accept_send(attempt, sent)
+            self.accept_send(attempt, sent, started.elapsed())
         });
         // A worker can resume on another thread. Restore the calling
         // thread's span on every return to the scheduler, including Pending.
@@ -1180,6 +1197,60 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopTaskSource for NativeCo
         self.logical_order.len()
     }
 
+    fn prefetch_on_connection(&mut self) -> Result<bool, QueryResponseError> {
+        let call = self.call.clone();
+        let store = Arc::clone(&self.store);
+        let trace_parent = self.trace_parent.clone();
+        let _ctx = trace_parent.map(|span| tidb_tracing::with_thread_span(Some(span)));
+        let result = store.try_connection_reads(
+            &call,
+            Box::pin(async {
+                let mut ready = Vec::with_capacity(self.active_attempts.len());
+                for index in 0..self.logical_order.len() {
+                    let logical = self.logical_order[index];
+                    if let Some(&id) = self.active_attempts.get(&logical) {
+                        ready.push((id, self.prepare_send(logical, id)));
+                    }
+                }
+                let timeout = self.timeout.min(self.call.timeout());
+                let store = self.store.as_ref();
+                let context = &self.kv_context;
+                let sends = ready.into_iter().map(|(id, ready)| async move {
+                    let reply = match ready {
+                        Ok((attempt, wire)) => {
+                            let started = std::time::Instant::now();
+                            let sent = store
+                                .send_async(
+                                    &attempt.backoffer,
+                                    wire,
+                                    attempt.region,
+                                    timeout,
+                                    context,
+                                    Some(Arc::clone(&attempt.stats)),
+                                )
+                                .await;
+                            let elapsed = started.elapsed();
+                            Ok(InitialReply {
+                                attempt,
+                                sent,
+                                elapsed,
+                            })
+                        }
+                        Err(error) => Err(error),
+                    };
+                    (id, reply)
+                });
+                self.initial_replies = Some(futures::future::join_all(sends).await);
+            }),
+        );
+        match result {
+            Some(finished) => finished
+                .map(|()| true)
+                .map_err(super::cop_iterator::completion_error),
+            None => Ok(false),
+        }
+    }
+
     fn needs_task_worker(&self) -> bool {
         // Go copIterator.Next drains buffered batch responses on the reader
         // and starts a worker only if another task still needs an RPC.
@@ -1188,7 +1259,14 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopTaskSource for NativeCo
             && self
                 .logical_order
                 .get(self.logical_index)
-                .is_some_and(|id| !self.runtime.has_queued_response(*id))
+                .is_some_and(|id| {
+                    !self.runtime.has_queued_response(*id)
+                        && !self.active_attempts.get(id).is_some_and(|attempt| {
+                            self.initial_replies
+                                .as_ref()
+                                .is_some_and(|replies| replies.iter().any(|(id, _)| id == attempt))
+                        })
+                })
     }
 
     fn call(&self) -> UnaryCallContext {
@@ -1244,6 +1322,11 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopWorkerSource for Native
         if self.logical_order.is_empty() {
             return Vec::new();
         }
+        // A fallback inherits already-fetched replies and the live cursor.
+        // Splitting here would lose the replies or replay retired Regions.
+        if self.initial_replies.is_some() {
+            return vec![self];
+        }
         if self.metadata.concurrency <= 1
             && (self.metadata.request_source.internal || !self.runtime.has_small_tasks())
         {
@@ -1274,6 +1357,7 @@ impl<S: NativeCopStore + ?Sized> super::cop_iterator::CopWorkerSource for Native
                     .into_iter()
                     .collect(),
                 logical_index: 0,
+                initial_replies: None,
                 closed: false,
                 backoffers: BTreeMap::new(),
                 exceeds_bound: self

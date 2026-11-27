@@ -842,7 +842,10 @@ impl IndexLookUpExecutor {
             && self.ranges.len() <= init_batch_size
             && self.ranges.iter().all(|range| range.is_point_non_nullable())
         {
-            self.inline = Some(Box::new(InlineIndexLookup::open(index_worker, table_request)?));
+            let lookup = tidb_copr::cop_paging::with_small_region_reads(|| {
+                InlineIndexLookup::open(index_worker, table_request)
+            })?;
+            self.inline = Some(Box::new(lookup));
             return Ok(());
         }
         let (result_tx, result_rx) = sync_channel::<TaskDone>(LOOKUP_TABLE_TASK_CHANNEL_SIZE);
@@ -869,7 +872,9 @@ impl IndexLookUpExecutor {
         }
         let start = std::time::Instant::now();
         let (rows, index_fetched) = if let Some(inline) = self.inline.as_mut() {
-            let Some(result) = inline.next_batch()? else {
+            let Some(result) =
+                tidb_copr::cop_paging::with_small_region_reads(|| inline.next_batch())?
+            else {
                 return Ok(false);
             };
             result

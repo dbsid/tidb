@@ -21,7 +21,7 @@ mod native_transport;
 mod tikv_rpc_contract;
 
 pub use cop_config::CopRuntimeConfig;
-pub use cop_iterator::CopIterator;
+pub use cop_iterator::{with_small_region_reads, CopIterator};
 pub use cop_read_task_runtime::{
     BatchedRemain, BatchedRemainCause, BucketsUpdate, CopReadAcceptedResponse,
     CopReadResponseError, CopReadTaskError, CopReadTaskReplacement, CopReadTaskResponse,

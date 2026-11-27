@@ -35,6 +35,12 @@ pub(crate) trait CopTaskSource: tidb_txnkv::Response {
     fn needs_task_worker(&self) -> bool;
     fn call(&self) -> UnaryCallContext;
     fn use_task_worker(&mut self);
+
+    /// Issue a small lookup's initial Region RPCs together on the SQL thread using the shared store transport.
+    fn prefetch_on_connection(&mut self) -> Result<bool, QueryResponseError> {
+        Ok(false)
+    }
+
     fn set_waker(&mut self, waker: Waker);
 }
 
@@ -179,8 +185,27 @@ impl tidb_memory::ActionOnExceed for RateLimitAction {
     }
 }
 
+tokio::task_local! {
+    static SMALL_INDEX_LOOKUP: ();
+}
+
+/// Mark the bounded index and table reads that may overlap their first
+/// Region RPCs on the owning SQL thread.
+pub fn with_small_region_reads<T>(read: impl FnOnce() -> T) -> T {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| {
+        std::env::var("TIDB_EXPERIMENTAL_SHARED_REGION_BATCH").as_deref() == Ok("1")
+    }) {
+        SMALL_INDEX_LOOKUP.sync_scope((), read)
+    } else {
+        read()
+    }
+}
+
 enum Driver<R> {
     Inline(R),
+    /// The connection owns the lite slot. Its first Next starts the Region reads.
+    Grouped(R),
     Concurrent(Box<dyn tidb_txnkv::Response + Send>),
     Closed,
 }
@@ -231,7 +256,15 @@ impl<R: tidb_txnkv::Response> CopIterator<R> {
         }
         // Explicitly injected workerless sources exercise the same task state
         // machine without transferring their thread-local fixture ownership.
-        let lite = if start.is_some() && source.task_count() == 1 {
+        let tasks = if start.is_some() {
+            source.task_count()
+        } else {
+            0
+        };
+        let grouped = (2..=4).contains(&tasks)
+            && SMALL_INDEX_LOOKUP.try_with(|_| ()).is_ok()
+            && tasks <= source.concurrency();
+        let lite = if tasks == 1 || grouped {
             token.filter(|token| {
                 token
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -244,6 +277,7 @@ impl<R: tidb_txnkv::Response> CopIterator<R> {
             Some(start) if lite.is_none() => {
                 Driver::Concurrent(start(source, false, action_on_exceed.clone()))
             }
+            Some(_) if grouped => Driver::Grouped(source),
             _ => Driver::Inline(source),
         };
         Self {
@@ -271,7 +305,7 @@ impl<R: tidb_txnkv::Response> CopIterator<R> {
             action.close();
         }
         match std::mem::replace(&mut self.driver, Driver::Closed) {
-            Driver::Inline(mut source) => {
+            Driver::Inline(mut source) | Driver::Grouped(mut source) => {
                 let _ = source.close();
                 self.limiter_wait.merge(source.limiter_wait_stats());
             }
@@ -287,6 +321,27 @@ impl<R: tidb_txnkv::Response> CopIterator<R> {
 impl<R: CopTaskSource> tidb_txnkv::Response for CopIterator<R> {
     fn next(&mut self) -> Result<Option<QueryResultSubset>, QueryResponseError> {
         let result = match &mut self.driver {
+            Driver::Grouped(source) => {
+                let prefetched = match recover(|| source.prefetch_on_connection()) {
+                    Ok(prefetched) => prefetched,
+                    Err(error) => {
+                        self.close_inner();
+                        return Err(error);
+                    }
+                };
+                let Driver::Grouped(source) = std::mem::replace(&mut self.driver, Driver::Closed)
+                else {
+                    unreachable!();
+                };
+                self.driver = if prefetched {
+                    Driver::Inline(source)
+                } else {
+                    self.release_lite();
+                    let start = self.start.expect("grouped reads have a worker fallback");
+                    Driver::Concurrent(start(source, false, self.action_on_exceed.clone()))
+                };
+                return self.next();
+            }
             Driver::Inline(source) => recover(|| source.next()),
             Driver::Concurrent(source) => return source.next(),
             Driver::Closed => return Ok(None),
@@ -333,7 +388,9 @@ impl<R: CopTaskSource> tidb_txnkv::Response for CopIterator<R> {
     fn limiter_wait_stats(&self) -> tidb_txnkv::LimiterWaitStats {
         let mut stats = self.limiter_wait;
         match &self.driver {
-            Driver::Inline(source) => stats.merge(source.limiter_wait_stats()),
+            Driver::Inline(source) | Driver::Grouped(source) => {
+                stats.merge(source.limiter_wait_stats());
+            }
             Driver::Concurrent(source) => stats.merge(source.limiter_wait_stats()),
             Driver::Closed => {}
         }
@@ -867,15 +924,13 @@ pub(super) fn completion_error(error: CompletionError) -> QueryResponseError {
     }
 }
 
-fn recover(
-    next: impl FnOnce() -> Result<Option<QueryResultSubset>, QueryResponseError>,
-) -> Result<Option<QueryResultSubset>, QueryResponseError> {
+fn recover<T>(
+    next: impl FnOnce() -> Result<T, QueryResponseError>,
+) -> Result<T, QueryResponseError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(next)).unwrap_or_else(worker_panic)
 }
 
-fn worker_panic(
-    panic: Box<dyn std::any::Any + Send>,
-) -> Result<Option<QueryResultSubset>, QueryResponseError> {
+fn worker_panic<T>(panic: Box<dyn std::any::Any + Send>) -> Result<T, QueryResponseError> {
     let message = panic
         .downcast_ref::<String>()
         .map(String::as_str)
@@ -965,6 +1020,236 @@ mod tests {
                 );
             }
             assert!(it.next().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn small_index_lookups_dispatch_both_regions_on_the_reader_with_the_store_runtime() {
+        use std::sync::atomic::AtomicUsize;
+
+        use crate::{
+            cop_paging::{CopRuntimeConfig, NativeCopTransport},
+            query_transport::{QueryOperation, QueryTransport},
+        };
+        use tidb_txnkv::{
+            CancelHandle, KeyRange, KvRequestMetadata, PartitionedKeyRanges, RequestType,
+            TransportBinding, TransportRequest,
+        };
+        use tikv_client::mock::{MockKvClient, MockPdClient};
+
+        let reader = std::thread::current().id();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        let first_page = AtomicBool::new(true);
+        let pd = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |request| {
+                let region = request
+                    .downcast_ref::<tidb_proto::CoprocessorRequest>()
+                    .unwrap()
+                    .context
+                    .as_ref()
+                    .unwrap()
+                    .region_id;
+                observed.lock().unwrap().push((
+                    std::thread::current().id(),
+                    tokio::runtime::Handle::current().id(),
+                ));
+                let first = region == 1 && first_page.swap(false, Ordering::Relaxed);
+                let value = if region == 1 && !first {
+                    3
+                } else {
+                    region as u8
+                };
+                Ok(Box::new(tidb_proto::CoprocessorResponse {
+                    data: vec![value].into(),
+                    range: first.then(|| tidb_proto::CoprocessorKeyRange {
+                        start: vec![1],
+                        end: vec![2],
+                    }),
+                    ..Default::default()
+                }))
+            },
+        )));
+        let runtime = tidb_txnkv::driver::tikv_store::store_runtime().unwrap();
+        let expected = (reader, runtime.handle().id());
+        let store = runtime
+            .block_on(tikv_client::tikv::KvStore::new_with_pd_client(
+                pd,
+                Arc::new(tikv_client::tikv::MockSafePointKv::new()),
+                tikv_client::Config::default(),
+            ))
+            .unwrap();
+        let store = tidb_txnkv::driver::tikv_store::TikvStore::new(runtime, store);
+        let mut transport = NativeCopTransport::new(Arc::new(store), CopRuntimeConfig::default());
+        let mut metadata = KvRequestMetadata::default();
+        metadata.request_type = RequestType::Dag;
+        metadata.start_ts = 100;
+        metadata.keep_order = true;
+        metadata.concurrency = 4;
+        metadata.paging.enabled = true;
+        metadata.paging.min_size = 1;
+        metadata.paging.max_size = 2;
+        // The mock PD boundary at 10 divides these keys between Regions 1 and 2.
+        metadata.key_ranges = Some(Arc::new(PartitionedKeyRanges::new_non_partitioned(vec![
+            KeyRange::new(vec![1].into(), vec![3].into()),
+            KeyRange::new(vec![20].into(), vec![21].into()),
+        ])));
+        // Both first-wave sends must reach the client before either receives its reply.
+        let together = Arc::new(tokio::sync::Barrier::new(2));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&overlaps);
+        let entered = AtomicUsize::new(0);
+        let interceptor = tikv_client::new_rpc_interceptor("overlap", move |_, _, next| {
+            let together = Arc::clone(&together);
+            let seen = Arc::clone(&seen);
+            let first_wave = entered.fetch_add(1, Ordering::Relaxed) < 2;
+            Box::pin(async move {
+                if first_wave
+                    && tokio::time::timeout(Duration::from_secs(5), together.wait())
+                        .await
+                        .is_ok()
+                {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
+                next().await
+            })
+        });
+        let request = TransportRequest::new(metadata, Arc::new(CancelHandle::default()))
+            .with_rpc_interceptor(tidb_txnkv::RpcInterceptorOption::new(interceptor))
+            .with_cop_lite_worker(Arc::new(AtomicBool::new(false)))
+            .bind(TransportBinding::new())
+            .unwrap();
+
+        let mut result = SMALL_INDEX_LOOKUP.sync_scope((), || {
+            transport
+                .send(&request, QueryOperation::Select)
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "opening the grouped iterator must not wait for TiKV"
+        );
+        assert_eq!(result.next().unwrap().unwrap().data.as_ref(), &[1]);
+        // A continuation of Region 1 goes through the worker. Region 2's
+        // already-fetched result must survive that transfer exactly once.
+        assert_eq!(result.next().unwrap().unwrap().data.as_ref(), &[3]);
+        assert_eq!(result.next().unwrap().unwrap().data.as_ref(), &[2]);
+        assert!(result.next().unwrap().is_none());
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the prefetched Region must not be sent again"
+        );
+        assert_eq!(
+            &calls[..2],
+            &[expected, expected],
+            "each region send must be polled on the statement thread with the shared store runtime"
+        );
+        assert_eq!(
+            overlaps.load(Ordering::Relaxed),
+            2,
+            "both Region requests must be in flight together"
+        );
+    }
+
+    #[test]
+    fn grouped_connection_reads_release_the_lite_slot_on_close_cancel_deadline_or_panic() {
+        use crate::cop_paging::{CopRuntimeConfig, NativeCopTransport};
+        use crate::query_transport::{QueryOperation, QueryTransport};
+        use tidb_txnkv::{
+            CancelHandle, KeyRange, KvRequestMetadata, PartitionedKeyRanges, RequestType,
+            TransportBinding, TransportRequest,
+        };
+        use tikv_client::mock::{MockKvClient, MockPdClient};
+
+        let runtime = tidb_txnkv::driver::tikv_store::store_runtime().unwrap();
+        let client = MockKvClient::with_dispatch_hook(|_| {
+            Ok(Box::new(tidb_proto::CoprocessorResponse::default()))
+        });
+        let store = runtime
+            .block_on(tikv_client::tikv::KvStore::new_with_pd_client(
+                Arc::new(MockPdClient::new(client)),
+                Arc::new(tikv_client::tikv::MockSafePointKv::new()),
+                tikv_client::Config::default(),
+            ))
+            .unwrap();
+        let store = tidb_txnkv::driver::tikv_store::TikvStore::new(runtime, store);
+        let mut transport = NativeCopTransport::new(Arc::new(store), CopRuntimeConfig::default());
+        for case in ["close", "cancel", "deadline", "panic"] {
+            let cancel = Arc::new(CancelHandle::default());
+            let requested = Arc::clone(&cancel);
+            let polled = Arc::new(AtomicBool::new(false));
+            let entered = Arc::clone(&polled);
+            let replied = Arc::new(AtomicBool::new(false));
+            let reply = Arc::clone(&replied);
+            let interceptor = tikv_client::new_rpc_interceptor("interrupted", move |_, _, next| {
+                entered.store(true, Ordering::Relaxed);
+                if case == "cancel" {
+                    requested.cancel();
+                } else if case == "panic" {
+                    panic!("injected grouped request panic");
+                }
+                let reply = Arc::clone(&reply);
+                Box::pin(async move {
+                    // Bound the deliberately slow reply even if the wait ignores interruption.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    reply.store(true, Ordering::Relaxed);
+                    next().await
+                })
+            });
+            let mut metadata = KvRequestMetadata::default();
+            metadata.request_type = RequestType::Dag;
+            metadata.start_ts = 100;
+            metadata.keep_order = true;
+            metadata.concurrency = 4;
+            if case == "deadline" {
+                metadata.max_execution_time_ms = 200;
+            }
+            metadata.key_ranges = Some(Arc::new(PartitionedKeyRanges::new_non_partitioned(vec![
+                KeyRange::new(vec![1].into(), vec![2].into()),
+                KeyRange::new(vec![20].into(), vec![21].into()),
+            ])));
+            let slot = Arc::new(AtomicBool::new(false));
+            let request = TransportRequest::new(metadata, cancel)
+                .with_rpc_interceptor(tidb_txnkv::RpcInterceptorOption::new(interceptor))
+                .with_cop_lite_worker(Arc::clone(&slot))
+                .bind(TransportBinding::new())
+                .unwrap();
+            let mut result = SMALL_INDEX_LOOKUP.sync_scope((), || {
+                transport
+                    .send(&request, QueryOperation::Select)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(slot.load(Ordering::Acquire));
+            assert!(
+                !polled.load(Ordering::Relaxed),
+                "opening a grouped read polled a Region"
+            );
+            if case == "close" {
+                result.close().unwrap();
+                assert!(!polled.load(Ordering::Relaxed));
+            } else {
+                let error = result
+                    .next()
+                    .expect_err("the grouped read must be interrupted");
+                assert!(polled.load(Ordering::Relaxed));
+                assert!(!replied.load(Ordering::Relaxed), "waited for a slow reply");
+                match case {
+                    "cancel" => assert!(matches!(error, QueryResponseError::Cancelled)),
+                    "deadline" => assert!(matches!(error, QueryResponseError::Source(ref message)
+                        if message == super::super::cop_config::QUERY_DEADLINE_EXCEEDED)),
+                    "panic" => assert!(matches!(error, QueryResponseError::Source(ref message)
+                        if message.contains("injected grouped request panic"))),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                !slot.load(Ordering::Acquire),
+                "{case} retained the statement's lite slot"
+            );
         }
     }
 

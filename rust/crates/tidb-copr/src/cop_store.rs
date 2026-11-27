@@ -68,6 +68,16 @@ pub trait NativeCopStore: Send + Sync + 'static {
         stats: Option<Arc<tikv_client::RegionRequestRuntimeStats>>,
     ) -> Result<NativeCopSend, tikv_client::Error>;
 
+    /// Poll a small group of reads on its synchronous caller, using the store's shared transport.
+    /// Other stores leave scheduling to their existing task workers.
+    fn try_connection_reads(
+        &self,
+        _call: &tidb_txnkv::UnaryCallContext,
+        _reads: futures::future::BoxFuture<'_, ()>,
+    ) -> Option<Result<(), tidb_txnkv::rpc::CompletionError>> {
+        None
+    }
+
     /// Sends a concurrent worker's request, allowing it to yield while TiKV
     /// answers. Synchronous store implementations use their existing sender.
     fn send_async<'a>(
@@ -261,6 +271,20 @@ impl<PdC: tikv_client::PdClient> NativeCopStore for TikvStore<PdC> {
         self.block_on(send_tikv(
             self, backoffer, request, region, timeout, kv_context, stats,
         ))
+    }
+
+    fn try_connection_reads(
+        &self,
+        call: &tidb_txnkv::UnaryCallContext,
+        reads: futures::future::BoxFuture<'_, ()>,
+    ) -> Option<Result<(), tidb_txnkv::rpc::CompletionError>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return None;
+        }
+        // The same wait as the concurrent reader wakes on cancellation or
+        // the statement deadline. Network tasks still use the store runtime.
+        let reads = tokio_util::context::TokioContext::new(reads, self.runtime().handle().clone());
+        Some(tidb_txnkv::rpc::wait_with_call(reads, call))
     }
 
     fn send_async<'a>(
